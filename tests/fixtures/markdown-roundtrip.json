@@ -1,0 +1,20 @@
+[
+  {
+    "name": "emphasis-and-escaping",
+    "current": "**bold** and *italic* with hello\\.",
+    "legacy": "__bold__ and _italic_ with hello.",
+    "plain": "bold and italic with hello."
+  },
+  {
+    "name": "code-fence-length",
+    "current": "````\nconst value = `x`;\n````",
+    "legacy": "```\nconst value = `x`;\n```",
+    "plain": "const value = `x`;"
+  },
+  {
+    "name": "telephone-link",
+    "current": "[Call](tel:+15550100)",
+    "legacy": "[Call](tel:+15550100)",
+    "plain": "Call"
+  }
+]
