@@ -45,7 +45,9 @@
     "test": "node scripts/test.ts",
     "build": "tsc -p tsconfig.json",
     "test:package": "npm run build && node --test tests/package.test.ts",
-    "test:integration": "npm run build && node --test tests/integration.test.ts"
+    "test:integration": "npm run build && node --test tests/integration.test.ts",
+    "check:private": "node scripts/check-private-terms.ts",
+    "hooks:install": "git config core.hooksPath .githooks"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
