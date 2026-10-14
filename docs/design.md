@@ -94,8 +94,11 @@ the group chat and the queue endpoint. Each queued item carries an envelope
 naming its channel, authenticated sender, authority, audience and fixed reply
 destination. The envelope is recorded with the item and shown to the model at
 the start of the turn. Local interactive input in the agent's terminal keeps
-Pi's normal behavior: it has owner authority, is answered in the terminal, and
-is not accepted while a queued item is running.
+Pi's normal behavior: it is answered in the terminal and is not accepted while
+a queued item is running. The extension cannot authenticate who typed it, so it
+carries no envelope and no channel authority; the agent judges it as it would
+without this extension. It remains a fallback path when the group is
+unavailable.
 
 Output routing is mechanical. A turn's final reply goes only to the
 destination pinned in its envelope: a private item answers in the private
