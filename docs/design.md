@@ -236,14 +236,34 @@ commands addressed to one bot (`/status@example_bot`) go to that agent; an
 unaddressed command goes to every agent, and each answers for itself.
 
 A peer message is work for an agent when it mentions that agent or replies to
-a message that agent sent with `telegram_group_send`. A final reply, which
-answers a request, does not by itself wake the agent it replies to. A
-request therefore gets one answer automatically, and further back-and-forth
-continues only when an agent deliberately sends or mentions. All other agent
-messages are context: they are in the shared journal and timeline, but nobody
-is woken. When a turn starts, its envelope says how many group entries arrived
-since the agent's previous group turn, so the agent can read the timeline if it
-needs the context.
+a request that agent sent with `telegram_group_send`. All other agent messages
+are context: they are in the shared journal and timeline, but nobody is woken.
+When a turn starts, its envelope says how many group entries arrived since the
+agent's previous group turn, so the agent can read the timeline if it needs the
+context.
+
+### Requests and answers
+
+A message sent with `telegram_group_send` is a request. The journal records it
+with the work item that was active when it was sent: the origin. A reply to a
+request is its answer, and it always wakes the agent that asked. The answer
+turn runs with the origin's reply destination, not the group. If the owner
+asked an agent something privately and that agent consulted a peer, the
+peer's answer wakes the asking agent, and its final reply goes back to the
+owner in the private chat. If the origin was itself a peer's request, the
+final reply answers that peer, which wakes the peer in turn. Work is therefore
+handed back up the chain until it reaches whoever started it. Asking, waiting
+and resuming need no special state in the agent beyond its normal session
+context.
+
+An answer turn's final reply is never a new request, so it wakes nobody
+except as an answer to an earlier request. Two agents can keep a conversation
+going only by deliberately sending or mentioning, and each of those messages is
+visible in the group. A request made with no active work item, such as from
+local interactive input, has no origin; its answer turn replies in the group.
+When an agent sends several requests from one item, each answer wakes it
+separately, and each answer turn replies to the origin, saying what is still
+outstanding when it is not yet complete.
 
 ### Election
 
@@ -273,9 +293,10 @@ envelope includes the original request.
 
 ### Tools
 
-- `telegram_group_send`: posts text to the group, optionally as a reply to a
-  journaled message. Mentions in the text are Telegram mentions and route as
-  described above. It returns the journaled message ID.
+- `telegram_group_send`: posts a request to the group, optionally as a reply
+  to a journaled message. Mentions in the text are Telegram mentions and route
+  as described above. The request records the active work item as its origin.
+  It returns the journaled message ID.
 - `telegram_group_timeline`: bounded chronological reads of the shared journal,
   before or after a message.
 - `telegram_group_recall`: datastore search over the group store.
