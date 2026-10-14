@@ -138,7 +138,7 @@ the shared journal lock, so running agents need not be stopped.
 ## CLIs
 
 `pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]` reconciles the
-five-command owner menu using protected config. This contacts Telegram. Tests
+five-command owner menu for private chats using protected config. This contacts Telegram. Tests
 intercept fetch with a synthetic fixture; no test contacts the service.
 
 `pi-telegram-archive-import` accepts named arguments only:

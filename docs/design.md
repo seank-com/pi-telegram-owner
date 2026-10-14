@@ -89,11 +89,13 @@ and a separate output archive; see [setup](setup.md).
 
 Each agent has one continuous Pi session and one serialized work queue. Every
 turn, whatever its source, runs in that session with the agent's normal
-identity, tools and prior context. Work arrives from four channels: the private
-owner chat, the group chat, the queue endpoint and local interactive input.
-Each queued item carries an envelope naming its channel, authenticated sender,
-authority, audience and fixed reply destination. The envelope is recorded with
-the item and shown to the model at the start of the turn.
+identity, tools and prior context. Work arrives from the private owner chat,
+the group chat and the queue endpoint. Each queued item carries an envelope
+naming its channel, authenticated sender, authority, audience and fixed reply
+destination. The envelope is recorded with the item and shown to the model at
+the start of the turn. Local interactive input in the agent's terminal keeps
+Pi's normal behavior: it has owner authority, is answered in the terminal, and
+is not accepted while a queued item is running.
 
 Output routing is mechanical. A turn's final reply goes only to the
 destination pinned in its envelope: a private item answers in the private
@@ -119,21 +121,46 @@ The queue has two tiers. Owner-authority items run before peer items; items
 are first in, first out within a tier. An active turn is never interrupted.
 Context-only group messages are not queued.
 
+An agent is idle when no turn is running, nothing is queued, and no owner
+message is being collected in the quiet window. Idle is the condition for
+claiming group work in an election. An agent reserves its queue before it
+claims, so nothing else can start between the claim and the turn.
+
 ## Activity and queued notices
 
-When an owner item is accepted while the agent is busy, the agent immediately
-sends a short queued notice as a Telegram reply to that message, so the owner
-can see it was received. When the item starts, the same message is edited into
-the activity display (`Thinking (NN%)` and tool intents). Activity messages are
-Telegram replies to the message being worked on, in both the private chat and
-the group, so concurrent work is attributable. Group items from peers get the
-same activity display; queue endpoint items get it in their reply destination,
-when they have one.
+When an item is accepted while the agent is busy, the agent immediately sends
+a short queued notice as a Telegram reply to the message that delivered it, so
+the sender can see it was received. This applies to owner messages in the
+private chat and the group, and to peer requests in the group, where the
+owner can see the request arrived. When the item starts, the same message is
+edited into the activity display (`Thinking (NN%)` and tool intents). Activity
+messages are Telegram replies to the message being worked on, in both the
+private chat and the group, so concurrent work is attributable. Queue endpoint
+items show activity in their reply destination, when they have one. Queued
+notices and activity are transient: they are not recorded in either archive
+and never wake another agent.
 
 The final reply is sent and its Telegram acceptance is recorded before the
 activity message is deleted. If the final send fails or is uncertain, the
 activity message is edited into a short failure notice and kept. A failed
 activity deletion never invalidates an accepted final.
+
+## Archives
+
+Each archive records exactly one Telegram conversation, so either can be
+rebuilt from a Telegram Desktop export of that conversation alone:
+
+- The private archive (`messages/` under the configured projection root) holds
+  the private chat between the owner and this agent. Every message the agent
+  posts in the private chat is recorded there, including replies to queue
+  endpoint instructions and answers returned from group consultations.
+- The shared journal under `groupChat.sharedRoot` holds the group chat. Every
+  message posted in the group by the owner or any agent is recorded there.
+
+Queue endpoint instructions are recorded in the agent's transport journal.
+They are not Telegram messages, so neither archive holds them. Turns started by
+group or queue endpoint items carry their own session marker, and the private
+projector treats them as turn boundaries, never as private-chat turns.
 
 ## Group chat
 
@@ -141,20 +168,28 @@ The group is an owner-controlled Telegram supergroup whose members are exactly
 the owner and the configured agents' bots. It is a visible, auditable
 workroom: agents ask each other for help, hand off work and report results
 there, and the owner can address one agent, several, or whoever is free.
-Seeing a message never obliges an agent to answer it.
+Seeing a message never obliges an agent to answer it. Bot commands work only
+in the private chat. The command menu is registered for private chats, and
+command text in the group is an ordinary message.
 
 ### Membership
 
 Every agent bot is a group administrator. Administrator bots receive all group
-messages, and Telegram reports membership changes to them. At startup an agent
-checks that the configured chat is a supergroup, that it is an administrator
-with permission to ban members and delete messages, that every configured
-identity is a member, and that the member count equals the owner plus the
-configured agents. When any account outside that roster joins, every agent
-that observes the join removes it; removal is idempotent. While membership
-cannot be verified or does not match, the agent sends nothing to the group and
+messages, and Telegram reports membership changes to them. The poller requests
+`message`, `chat_member` and `my_chat_member` updates. Edits are not requested:
+each message is recorded and routed as first sent.
+
+At startup, and on every membership update, an agent checks that the
+configured chat is a supergroup, that it is an administrator with permission
+to ban members and delete messages, that every configured identity is a
+member, and that the member count equals the owner plus the configured agents.
+When any account outside that roster joins, every agent that observes the join
+removes it; removal is idempotent. While membership cannot be verified or does
+not match, the agent sends nothing to the group, keeps group items queued, and
 reports the problem in the private chat. Private transport is unaffected. An
-agent leaves any other group or channel it is added to.
+agent leaves any other group or channel it is added to. A group message whose
+sender is not the owner's user account, such as one posted anonymously as the
+group, has no owner authority; it is recorded but not routed.
 
 ### Transport
 
@@ -164,23 +199,33 @@ created for a token. Agent messages reach other agents through the shared
 journal and the queue endpoint:
 
 1. An agent posts to the group, either with `telegram_group_send` or as the
-   final reply of a group turn.
+   final reply of a group turn. A message Telegram must split into several
+   parts is recorded as one journal entry listing every part's message ID.
 2. When Telegram accepts the message, the agent appends Telegram's returned
    message, including its mention entities and reply target, to the shared
-   journal.
-3. For each agent the message addresses, it posts a wake-up to that agent's
-   queue endpoint naming the journal entry.
+   journal, and records a pending wake-up for each agent it addresses.
+3. It posts each wake-up to that agent's queue endpoint, naming the journal
+   entry, and retries with backoff until the recipient answers `202`. Pending
+   wake-ups survive the sender's restart. A recipient that is down receives
+   its work when it returns.
 4. The recipient reads the message from the shared journal, checks that it is
    from a configured agent in the configured group and addresses the
-   recipient, and queues it.
+   recipient, and durably queues it before answering `202`.
 
-The wake-up only makes delivery prompt; the journal makes it reliable. Each
-agent keeps its own cursor over the shared journal, and at startup and whenever
-it becomes idle it scans new entries for work addressed to it. An endpoint that
-is down therefore delays work instead of losing it, and the sender does not
-retry indefinitely. Uncertain group sends follow the private rule: they are
-recorded in the sending agent's transport journal and never resent
-automatically.
+Uncertain group sends follow the private rule: they are recorded in the
+sending agent's transport journal and never resent automatically. Startup
+recovery of an accepted send completes its journal append and wake-ups.
+
+When a message replies to another message, Telegram includes a copy of the
+replied-to message in the update. An agent that receives an owner reply to a
+message missing from the shared journal records the copy, so the owner can
+repair a lost entry by replying to it and mentioning the agent that should act.
+
+Group updates are recorded in the agent's transport journal before its cursor
+advances, as private updates are. Publication to the shared journal is a
+separate step retried from that record. A shared journal failure pauses group
+behavior and is reported in the private chat; it never holds the private
+cursor or private work.
 
 ### Shared journal
 
@@ -191,23 +236,25 @@ Telegram. It has the same properties as the private archive: a forward-only
 JSONL event log is authoritative, canonical Markdown under `messages/` is its
 projection, and indexes are disposable.
 
-Writers take a short-lived exclusive lock with the same PID and boot-identity
-recovery as the poller lock, assign the next sequence number, append, flush,
-and update the Markdown projection. Each message revision is identified by
-chat ID, message ID and Telegram edit date. Every agent observes the owner's
-group messages, so the first agent to record a revision writes it and later
-identical observations are no-ops. A conflicting observation of an existing
-revision is recorded as a conflict and never overwrites it. Edits are new
-revisions; history is never rewritten. Agent messages are recorded by their
-sender from Telegram's acceptance response. Elections, claims and queued
-notices are journaled alongside messages. Transient activity messages are not.
+Writers take an exclusive lock with the same PID and boot-identity recovery as
+the poller lock, assign the next sequence number, append, flush, and update the
+Markdown projection. A writer that finds an incomplete final line left by a
+writer whose lock was recovered terminates it with a newline, so the fragment
+is kept but ignored by readers. Messages are identified by chat ID and message
+ID. Every agent observes the owner's group messages, so the first agent to
+record a message writes it and later identical observations are no-ops. A
+conflicting observation of an existing message is recorded as a conflict and
+never overwrites it. Agent messages are recorded by their sender from
+Telegram's acceptance response. Elections, claims, queued election notices and
+roster checks are journaled alongside messages.
 
-Photos are downloaded once, by the agent that records the message, into the
-shared media directory with the existing media lifecycle records. Other
-attachments are recorded as metadata with their captions and are not
-downloaded. Captions route exactly like message text. When routed work
-contains an attachment the agent cannot use, its reply says so; nothing is
-silently dropped.
+Routing reads Telegram's entities against the untrimmed `text` or `caption`,
+using Telegram's UTF-16 offsets. Photos are downloaded once, by the agent that
+records the message, into the shared media directory with the existing media
+lifecycle records. Other attachments are recorded as metadata with their
+captions and are not downloaded. Captions route exactly like message text.
+When routed work contains an attachment the agent cannot use, its reply says
+so; nothing is silently dropped.
 
 A Telegram Desktop export of the group can be imported into the shared root with
 the archive importer. Its speaker map assigns each exported sender to the owner
@@ -220,8 +267,8 @@ journal directly, and searched with `telegram_group_recall` through the
 datastore store named in `groupChat.datastore`, with the same optional,
 required and off modes as private recall. The Markdown source is shared; any
 index the datastore builds for it belongs to the datastore. Each agent requests
-coalesced lexical refreshes when its cursor advances past entries written by
-others, since those changes do not come from its own publication.
+coalesced lexical refreshes when it reads entries written by others, since
+those changes do not come from its own publication.
 
 ### Routing
 
@@ -229,11 +276,13 @@ Routing uses Telegram mention entities, text mentions and reply targets
 matched against configured usernames and numeric bot IDs. Literal names in
 message text do not route.
 
-An owner message is work for an agent when it mentions that agent or replies
-to one of its messages. It may address several agents; each handles it
-independently. An owner message that addresses no agent goes to election. Bot
-commands addressed to one bot (`/status@example_bot`) go to that agent; an
-unaddressed command goes to every agent, and each answers for itself.
+Consecutive owner messages within the quiet window are one item, as in the
+private chat, so a long message Telegram split into parts routes once. The
+item routes by the mentions and reply target of all its messages.
+
+An owner item is work for an agent when it mentions that agent or replies to
+one of its messages. It may address several agents; each handles it
+independently. An owner item that addresses no agent goes to election.
 
 A peer message is work for an agent when it mentions that agent or replies to
 a request that agent sent with `telegram_group_send`. All other agent messages
@@ -244,52 +293,70 @@ context.
 
 ### Requests and answers
 
-A message sent with `telegram_group_send` is a request. The journal records it
-with the work item that was active when it was sent: the origin. A reply to a
-request is its answer, and it always wakes the agent that asked. The answer
-turn runs with the origin's reply destination, not the group. If the owner
-asked an agent something privately and that agent consulted a peer, the
+A message sent with `telegram_group_send` is a request. Any other message an
+agent posts in the group is an answer. The journal records each request with
+the work item that was active when it was sent: the origin.
+
+A request wakes the agents it addresses, and the final reply of the turn it
+starts answers it. A reply to a request always wakes the agent that asked. That
+answer turn runs with the origin's reply destination, not the group. If the
+owner asked an agent something privately and that agent consulted a peer, the
 peer's answer wakes the asking agent, and its final reply goes back to the
 owner in the private chat. If the origin was itself a peer's request, the
 final reply answers that peer, which wakes the peer in turn. Work is therefore
-handed back up the chain until it reaches whoever started it. Asking, waiting
-and resuming need no special state in the agent beyond its normal session
-context.
+handed back up the chain until it reaches whoever started it.
 
-An answer turn's final reply is never a new request, so it wakes nobody
-except as an answer to an earlier request. Two agents can keep a conversation
-going only by deliberately sending or mentioning, and each of those messages is
-visible in the group. A request made with no active work item, such as from
-local interactive input, has no origin; its answer turn replies in the group.
-When an agent sends several requests from one item, each answer wakes it
-separately, and each answer turn replies to the origin, saying what is still
-outstanding when it is not yet complete.
+The answer turn's envelope carries the request text, the origin's sender and
+destination, and the journal or private-chat message IDs of both. The agent can
+read more with `telegram_group_timeline` or `telegram_timeline`, so resuming
+does not depend on what remains in the session after compaction or `/new`.
+
+An answer never starts a new request. Two agents can keep a conversation going
+only by deliberately sending requests, and each request is visible in the
+group. A clarifying question sent with `telegram_group_send` as a reply to a
+request is itself a request: it wakes the asker, whose reply answers the
+question, and the original request is still answered by the turn it started. A
+request made with no active work item, such as from local interactive input,
+has no origin; its answer turn replies in the group. When an agent sends
+several requests from one item, each answer wakes it separately, and each
+answer turn replies to the origin, saying what is still outstanding when it is
+not yet complete.
+
+`/new` in the private chat ends the agent's queued group and queue endpoint
+items. Each ended group item gets a reply saying the owner reset the agent's
+session; that reply answers the item, so a requesting agent is woken and can
+tell its own origin. Requests the agent was waiting on are closed. Their later
+answers are recorded as context and wake nobody.
 
 ### Election
 
-Each unaddressed owner message is claimed by exactly one agent, preferring
+Each unaddressed owner item is claimed by exactly one agent, preferring
 whoever is free:
 
-1. All agents order the roster by numeric bot ID and rotate it by the message
-   ID modulo the roster size. An agent's position is its rank.
+1. All agents order the roster by numeric bot ID and rotate it by the item's
+   first message ID modulo the roster size. An agent's position is its rank.
 2. Each agent records the candidate and waits `rank × electionStepMs`.
-3. When its wait has elapsed and it is idle, an agent takes the shared journal
-   lock and appends a claim if no claim exists. The journal lock makes the
-   claim atomic: the first claim wins.
+3. When its wait has elapsed and it is idle, an agent reserves its queue,
+   takes the shared journal lock and appends a claim if no claim exists. The
+   journal lock makes the claim atomic: the first claim wins.
 4. The winner notifies the other agents through their coordination endpoints
    and starts the item with its normal activity reply. Others drop the
    candidate when notified, and again when they see the claim in the journal.
-5. A busy agent does not claim. If nobody has claimed after every agent's wait
-   has elapsed, the rank-0 agent posts a queued notice replying to the message
-   and records it. The first agent to become idle claims the message and
+5. A busy agent does not claim. If nobody has claimed once the last rank's
+   wait has elapsed, the first agent to reach that point posts a queued notice
+   replying to the message and records it, so one notice is posted even if
+   some agents are down. The first agent to become idle claims the item and
    deletes that notice as it starts.
 
-An owner edit to an unclaimed message re-runs routing for the new revision. An
-edit to a claimed message goes to the claiming agent as a new revision of that
-item. When the owner asks for something from everyone without mentioning
-them, the elected agent answers for itself and uses `telegram_group_send` to
-ask the others, replying to the owner's message so that each recipient's
-envelope includes the original request.
+When the owner asks for something from everyone without mentioning them, the
+elected agent answers for itself and uses `telegram_group_send` to ask the
+others, replying to the owner's message so that each recipient's envelope
+includes the original request.
+
+Election ranks depend on every agent having the same roster and
+`electionStepMs`. Agents exchange a roster check through their coordination
+endpoints at startup. A mismatch pauses group behavior on the agents that
+detect it and is reported in the private chat.
 
 ### Tools
 
@@ -307,22 +374,22 @@ diagnostic while membership is unverified.
 ### Failure and recovery
 
 Every piece of routed group work ends with a visible disposition: a final
-reply, or a reply saying the work failed with a short static reason. A model or
-provider failure before any tool call or send is retried once; failures after
-an effect boundary, uncertain sends and exhausted retries are reported, not
-replayed. Diagnostic codes and bounded detail are recorded in the agent's
-transport journal and shown by `/status`. Startup recovery uses the same
+reply, or a reply saying the work failed with a short static reason. A final
+counts only when the model stopped normally with text; output cut off by a
+length limit or an abort is reported as a failure. Failures are not retried
+automatically. The owner or requesting agent decides whether to ask again.
+Diagnostic codes and detail are recorded in the agent's transport journal and
+shown by `/status` in the private chat. Startup recovery uses the same
 distinctions as the private bridge: received, queued, claimed, started,
-send-planned, accepted or uncertain. The shared journal and each agent's cursor
-make restart safe without replaying public sends.
+send-planned, accepted or uncertain. Work that was started is not replayed.
 
 ## Queue endpoint
 
 Each configured agent listens on `127.0.0.1:<queuePort>`. The endpoint has no
 token: it is reachable only from the local host, and the operating-system
 account that runs the agents is their security boundary. Requests and
-responses are JSON, request bodies are at most 64 KiB, and `202` means the
-item was durably recorded in the agent's transport journal.
+responses are JSON. `202` means the item was durably recorded in the agent's
+transport journal; senders retry until they receive it.
 
 - `POST /queue` accepts work.
   - `{"kind": "group-message", "messageId": N}` from another agent: a wake-up
@@ -332,9 +399,12 @@ item was durably recorded in the agent's transport journal.
     automation: an owner-authority instruction. The final reply goes to the
     private chat, the group, or nowhere. Repeating an `id` returns the original
     item instead of queuing a duplicate.
-- `POST /coordinate` carries coordination between agents. Currently it accepts
-  `{"kind": "claimed", "messageId": N, "agent": "username"}`; the receiver
-  confirms the claim in the shared journal before acting on it.
+- `POST /coordinate` carries coordination between agents:
+  - `{"kind": "claimed", "messageId": N, "agent": "username"}`: the receiver
+    confirms the claim in the shared journal before acting on it.
+  - `{"kind": "roster", "agent": "username", "roster": [...], "electionStepMs": N}`:
+    the receiver compares the roster and step with its own and answers with
+    its own values.
 - `GET /status` returns `idle` or `busy`, queue depth by tier, and whether the
   group is verified.
 
