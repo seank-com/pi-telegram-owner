@@ -31,6 +31,7 @@ Optional roleSlugs defines user, assistant and command filenames. Projection may
 be false; the mandatory media-event stream still records photo provenance.
 Journal/lock paths remain project-local to the selected Telegram config directory.
 Do not share another agent's journal, archive, session root or configured stores.
+The group chat's shared root is the one deliberately shared location.
 
 For retrieval, configure the independent datastore extension with the exact
 selected store, pointing to this archive root and including messages/**/*.md.
@@ -45,6 +46,94 @@ required mode through the factory override rather than changing live settings.
 Observability is optional: valid persisted tool-intent records enrich activity,
 otherwise basic tool-name activity works. This package does not discover private
 credentials or install observability automatically.
+
+## Queue endpoint
+
+Set `"queuePort"` in config.json to a free local port (1024–65535) to accept
+local work on `127.0.0.1`. Automation running under the same account can then
+queue an owner-authority instruction:
+
+```bash
+curl -s -X POST http://127.0.0.1:7351/queue -H 'Content-Type: application/json' \
+  -d '{"kind":"instruction","source":"nightly-calendar","id":"2026-01-01-alarm","reply":"private","text":"Tell the owner tomorrow starts with an 8:00 meeting."}'
+```
+
+`reply` selects the private chat, the group or no reply. Use a stable `id` per
+logical request so retries do not queue duplicates. `GET /status` reports
+whether the agent is idle. The endpoint never listens on other interfaces. A
+group chat requires a queue port.
+
+## Group chat
+
+A group joins several agents, each with its own project, bot and private chat
+with the same owner, in one Telegram supergroup with the owner.
+
+1. Create the group in Telegram, add every agent bot, and promote each bot to
+   administrator with permission to delete messages and ban users. Add nobody
+   else. Telegram converts the group to a supergroup when needed; use the
+   supergroup's ID.
+2. In BotFather, disable "Allow Groups" for each bot after adding it, so it
+   cannot be added elsewhere.
+3. Choose a shared root directory owned by the agents' account, mode 0700, for
+   example outside every agent's project. Every agent must name the same
+   absolute path.
+4. Give each agent a distinct `queuePort` and add a `groupChat` object to its
+   config.json. Each agent lists every other agent, never itself:
+
+```json
+{
+  "ownerUserId": 10001,
+  "privateChatId": 10001,
+  "tokenEnv": "TELEGRAM_BOT_TOKEN",
+  "agentLabel": "Agent A",
+  "queuePort": 7351,
+  "groupChat": {
+    "chatId": -1001234567890,
+    "sharedRoot": "/absolute/path/to/group-chat",
+    "datastore": { "mode": "auto", "store": "telegram-group" },
+    "electionStepMs": 2000,
+    "otherAgents": [
+      {
+        "telegramAccount": "example_agent_b_bot",
+        "telegramName": "Agent B",
+        "botUserId": 200000002,
+        "queuePort": 7352
+      },
+      {
+        "telegramAccount": "example_agent_c_bot",
+        "telegramName": "Agent C",
+        "botUserId": 200000003,
+        "queuePort": 7353
+      }
+    ]
+  }
+}
+```
+
+`chatId` is the negative supergroup ID. `telegramAccount` is the bot username
+without `@` and `botUserId` its numeric ID (the digits before the colon in that
+bot's token). `telegramName` is how the agent is named to the others.
+`electionStepMs` (default 2000, 250–30000) is the delay between election ranks.
+`datastore` uses the same modes as the private `datastore` setting and names
+the store for the shared Markdown. The agent's own username and ID come from
+Telegram at startup. Usernames, bot IDs and ports must be unique and must not
+match the owner or the running bot. All agents must describe the same roster;
+election ranks depend on it.
+
+For group recall, add a store to each agent's datastore configuration rooted at
+`<sharedRoot>/messages` with the same name as `groupChat.datastore.store`,
+including `**/*.md`. Exclude journal state and media as for the private archive.
+
+After starting the agents, `/status` in the private chat reports group
+verification. If membership does not match, the agent names the mismatch and
+sends nothing to the group until it is fixed. To check routing, mention one
+agent in the group and confirm only that agent shows activity; then send an
+unaddressed question and confirm exactly one agent claims it.
+
+An existing Telegram Desktop export of the group can be imported with
+`pi-telegram-archive-import --output-root <sharedRoot>`, using a speaker map
+that assigns each sender to the owner or a configured agent. The importer takes
+the shared journal lock, so running agents need not be stopped.
 
 ## CLIs
 
@@ -74,7 +163,8 @@ Use synthetic fixtures in tests; do not commit personal exports or mappings.
 
 All archive/control schemas use `pi-telegram-owner/<kind>/v1`: `source-set`,
 `first-pi-boundary`, `speaker-map`, `import-report`, `import-checkpoint`,
-`archive-manifest`, `media-event`, and `message`. Earlier names and boundary
+`archive-manifest`, `media-event`, `message`, and the shared group journal's
+`group-event`. Earlier names and boundary
 shapes have no aliases in this unpublished package. Existing Telegram Desktop
 HTML and media exports can be reused. Regenerate the source manifest, speaker
 map and explicit boundary, then create a fresh dry-run checkpoint and publish

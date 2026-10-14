@@ -22,6 +22,13 @@ bot token environment variable. Never commit a token. Configuration absence
 registers tools/commands but starts no poller and writes no state.
 See [setup](docs/setup.md) for configuration and CLI arguments.
 
+Optionally, an agent can share an owner-controlled Telegram group with other
+agents. Every message in the room is recorded in one shared journal; agents
+address each other with mentions, and an unaddressed owner message is claimed
+by whichever agent is free. A local queue endpoint on `127.0.0.1` lets
+automation running under the same account queue owner-authority instructions.
+See [design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
+
 The optional `datastore` object selects `mode: "auto"` (default), `"off"`, or
 `"required"`, and an exact `store` (default `"telegram"`). Auto enables recall
 and lexical refresh only when the active datastore advertises that store.
