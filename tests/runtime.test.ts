@@ -83,7 +83,7 @@ async function writeGuardOwner(
 	return path;
 }
 
-test("Telegram owner menu reconciliation sends the exact five-command registry payload", async () => {
+test("Telegram owner menu reconciliation registers five private-chat commands and clears the group fallback", async () => {
 	const calls: Array<{ url: string; init: RequestInit }> = [];
 	const api = new TelegramApiClient("menu-secret", CHAT, async (url, init) => {
 		calls.push({ url, init: init as RequestInit });
@@ -92,10 +92,12 @@ test("Telegram owner menu reconciliation sends the exact five-command registry p
 	assert.equal(calls.length, 0, "client construction alone must not contact Telegram");
 
 	await api.setOwnerCommandMenu();
-	assert.equal(calls.length, 1);
+	assert.equal(calls.length, 2);
 	assert.equal(calls[0].url.endsWith("/setMyCommands"), true);
 	assert.equal(calls[0].init.method, "POST");
-	assert.deepEqual(JSON.parse(String(calls[0].init.body)), { commands: telegramOwnerMenuCommands() });
+	assert.deepEqual(JSON.parse(String(calls[0].init.body)), { commands: telegramOwnerMenuCommands(), scope: { type: "all_private_chats" } });
+	assert.equal(calls[1].url.endsWith("/deleteMyCommands"), true);
+	assert.deepEqual(JSON.parse(String(calls[1].init.body)), {});
 	assert.deepEqual(telegramOwnerMenuCommands(), [
 		{ command: "help", description: "Show available commands." },
 		{ command: "status", description: "Show runtime and context status." },
@@ -147,7 +149,7 @@ test("configured extension startup reconciles its menu once before polling", asy
 	globalThis.fetch = ((url: string | URL | Request, init?: RequestInit) => {
 		const request = { url: String(url), init };
 		calls.push(request);
-		if (request.url.endsWith("/setMyCommands")) {
+		if (request.url.endsWith("/setMyCommands") || request.url.endsWith("/deleteMyCommands")) {
 			return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, result: true }) } as Response);
 		}
 		return new Promise((_resolve, reject) => {
@@ -184,7 +186,8 @@ test("configured extension startup reconciles its menu once before polling", asy
 	await waitFor(() => calls.some(({ url }) => url.endsWith("/getUpdates")));
 	const menuCalls = calls.filter(({ url }) => url.endsWith("/setMyCommands"));
 	assert.equal(menuCalls.length, 1, "one startup must perform exactly one idempotent reconciliation");
-	assert.deepEqual(JSON.parse(String(menuCalls[0]?.init?.body)), { commands: telegramOwnerMenuCommands() });
+	assert.deepEqual(JSON.parse(String(menuCalls[0]?.init?.body)), { commands: telegramOwnerMenuCommands(), scope: { type: "all_private_chats" } });
+	assert.equal(calls.filter(({ url }) => url.endsWith("/deleteMyCommands")).length, 1);
 	assert.equal(calls[0]?.url.endsWith("/setMyCommands"), true);
 	assert.equal(calls.some(({ url }) => url.endsWith("/getMe")), false, "configured override must skip identity lookup");
 	await emit("session_shutdown", { type: "session_shutdown", reason: "exit" });
@@ -1374,7 +1377,7 @@ test("equivalent outbound photo is not resent under a new tool ID after receipt 
 	assert.deepEqual(await mediaProjector.readMediaEvents(), [], "a failed receipt append cannot publish a delivered occurrence");
 });
 
-test("activity cleanup precedes the durable reply and delete failure is best effort and locally visible", async () => {
+test("the durable reply precedes activity cleanup and delete failure is best effort and locally visible", async () => {
 	const journal = new MemoryJournal();
 	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
 	let injectedPrompt = "";
@@ -1441,7 +1444,7 @@ test("activity cleanup precedes the durable reply and delete failure is best eff
 	assert.equal(calls.some((call) => call.includes("do-not-leak") || call.includes("hidden")), false);
 	await emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: "done" }] });
 	await emit("agent_settled", { type: "agent_settled" });
-	assert.deepEqual(calls.slice(-2), ["delete:60", "reply:400:done"]);
+	assert.deepEqual(calls.slice(-2), ["reply:400:done", "delete:60"]);
 	assert.equal(statusMessage.includes("activityError=delete: mock delete unavailable"), true);
 	assert.equal(journal.records.filter((record) => record.type === "reply_sent").length, 1);
 	assert.equal(journal.records.some((record) => record.type === "activity_cleared"), false);

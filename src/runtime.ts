@@ -308,19 +308,28 @@ export class TelegramApiClient {
 		}
 	}
 
-	/** Idempotently reconciles the configured bot's server-side command menu. */
+	/**
+	 * Idempotently reconciles the configured bot's server-side command menu.
+	 * Commands are private-chat only, so the default scope that groups fall
+	 * back to is cleared.
+	 */
 	async setOwnerCommandMenu(signal?: AbortSignal): Promise<void> {
+		await this.callBotMethod("setMyCommands", { commands: telegramOwnerMenuCommands(), scope: { type: "all_private_chats" } }, signal);
+		await this.callBotMethod("deleteMyCommands", {}, signal);
+	}
+
+	private async callBotMethod(method: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
 		try {
-			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/setMyCommands`, {
+			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/${method}`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ commands: telegramOwnerMenuCommands() }),
+				body: JSON.stringify(body),
 				signal: deadline.signal,
 			});
 			const payload = (await response.json()) as { ok?: boolean };
 			if (!response.ok || payload.ok !== true) {
-				throw new Error(`Telegram setMyCommands failed (HTTP ${response.status ?? "unknown"})`);
+				throw new Error(`Telegram ${method} failed (HTTP ${response.status ?? "unknown"})`);
 			}
 		} catch (error) {
 			throw new Error(sanitizeError(error, this.#token));
@@ -617,6 +626,8 @@ export interface TelegramActivityMessageOptions {
 	sleep?: Sleep;
 	now?: () => number;
 	minimumEditIntervalMs?: number;
+	/** An already journaled message for this job, such as its queued notice, to edit instead of sending. */
+	existingMessageId?: string;
 }
 
 /** Owns the single ephemeral activity message for one confirmed Telegram job. */
@@ -637,6 +648,7 @@ export class TelegramActivityMessage {
 		this.options = options;
 		this.initialText = boundedActivityText(initialText);
 		this.desired = this.initialText;
+		this.messageId = options.existingMessageId;
 	}
 
 	start(): void {
@@ -649,13 +661,28 @@ export class TelegramActivityMessage {
 		this.ensureWorker();
 	}
 
-	async stopAndDelete(): Promise<void> {
-		if (!this.acceptingUpdates && !this.worker) return;
+	/** Stops further updates and leaves the message in place. Returns its ID, if one was sent. */
+	async halt(): Promise<string | undefined> {
 		this.acceptingUpdates = false;
 		this.controller.abort(new Error("Telegram activity stopped"));
 		await this.worker?.catch(() => undefined);
 		this.worker = undefined;
-		const messageId = this.messageId;
+		return this.messageId;
+	}
+
+	/** Best-effort final text for a halted activity that must stay visible. */
+	async annotate(text: string): Promise<void> {
+		if (this.acceptingUpdates || !this.messageId) return;
+		try {
+			await this.options.edit(this.messageId, boundedActivityText(text), new AbortController().signal);
+		} catch (error) {
+			this.fail("edit", error);
+		}
+	}
+
+	async stopAndDelete(): Promise<void> {
+		if (!this.acceptingUpdates && !this.worker && !this.messageId) return;
+		const messageId = await this.halt();
 		if (!messageId) return;
 		try {
 			await this.options.delete(messageId, new AbortController().signal);

@@ -711,6 +711,41 @@ export class TelegramOwnerBridge {
 		await this.append({ type: "activity_cleared", jobId, messageId });
 	}
 
+	private openActivities(): Array<{ jobId: string; messageId: string }> {
+		const open = new Map<string, { jobId: string; messageId: string }>();
+		for (const record of this.records) {
+			if (record.type === "activity_started") open.set(`${record.jobId}:${record.messageId}`, { jobId: record.jobId, messageId: record.messageId });
+			else if (record.type === "activity_cleared") open.delete(`${record.jobId}:${record.messageId}`);
+		}
+		return [...open.values()];
+	}
+
+	/** The open activity or queued-notice message for a job, if any. */
+	openActivity(jobId: string): string | undefined {
+		return this.openActivities().find((activity) => activity.jobId === jobId)?.messageId;
+	}
+
+	/** Open activities whose job no longer needs them: its reply was sent, or it ended without one. */
+	finishedActivities(): Array<{ jobId: string; messageId: string }> {
+		const sent = new Set<string>();
+		const ready = new Set<string>();
+		const interrupted = new Set<string>();
+		for (const record of this.records) {
+			if (record.type === "reply_sent") sent.add(record.jobId);
+			else if (record.type === "reply_ready") ready.add(record.jobId);
+			else if (record.type === "interrupted") interrupted.add(record.jobId);
+		}
+		return this.openActivities().filter((activity) => sent.has(activity.jobId) || (interrupted.has(activity.jobId) && !ready.has(activity.jobId)));
+	}
+
+	/** Queued jobs waiting behind other work that have no queued notice yet, with their queue position. */
+	jobsAwaitingQueuedNotice(): Array<{ job: Job; position: number }> {
+		const noticed = new Set(this.openActivities().map((activity) => activity.jobId));
+		return recover(this.records, this.now()).queued
+			.map((job, position) => ({ job, position }))
+			.filter(({ job }) => job.jobId !== this.active?.jobId && !noticed.has(job.jobId));
+	}
+
 	async interruptUncertain(reason: string, notice?: string): Promise<Job[]> {
 		const uncertain = recover(this.records, this.now()).uncertain;
 		for (const job of uncertain) {
@@ -848,11 +883,14 @@ export class TelegramOwnerBridge {
 	async settle(send: SendReply): Promise<boolean> {
 		if (!this.active || !this.dispatchConfirmed || this.assistantText === undefined) return false;
 		const job = this.active;
-		await this.append({ type: "reply_ready", jobId: job.jobId, text: this.assistantText, timestamp: new Date().toISOString() });
-		await this.deliverPlan(job, this.assistantText, send);
+		const text = this.assistantText;
+		await this.append({ type: "reply_ready", jobId: job.jobId, text, timestamp: new Date().toISOString() });
+		// The durable ready reply is retried by retryReadyReplies if delivery
+		// fails, so the job no longer holds the queue.
 		this.active = undefined;
 		this.dispatchConfirmed = false;
 		this.assistantText = undefined;
+		await this.deliverPlan(job, text, send);
 		return true;
 	}
 
