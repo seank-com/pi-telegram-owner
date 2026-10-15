@@ -7,6 +7,7 @@ import { parse } from "parse5";
 import { parse as parseYaml } from "yaml";
 
 import { TelegramMarkdownProjector, type PublicationResult } from "./markdown-projector.ts";
+import { GroupJournal, type GroupJournalOptions, type GroupMessage } from "./group-journal.ts";
 import { markdownCompatibilityKey, markdownToPlainText, TELEGRAM_FORMAT_COMPAT_VERSION, telegramSafeHref } from "./format.ts";
 
 export const IMPORTER_VERSION = "telegram-desktop-pi-v2" as const;
@@ -740,4 +741,119 @@ export class TelegramArchiveImporter {
 		report.publication = publication;
 		return report;
 	}
+}
+
+export interface GroupSpeakerMap {
+	schema: "pi-telegram-owner/group-speaker-map/v1";
+	/** Keyed by the SHA-256 of the trimmed sender name as the export shows it. */
+	speakers: Record<string, { kind: "owner" | "agent" | "other"; userId: number; name: string }>;
+}
+
+export interface GroupImportOptions {
+	exportRoot: string;
+	sourceSetManifestPath: string;
+	speakerMapPath: string;
+	chatId: number;
+	/** Shared group root; required for commit. */
+	sharedRoot: string;
+	commit?: boolean;
+	journalOptions?: GroupJournalOptions;
+}
+
+export interface GroupImportReport {
+	schema: "pi-telegram-owner/group-import-report/v1";
+	mode: "dry-run" | "commit";
+	messages: number;
+	alreadyPresent: number;
+	imported: number;
+	photos: number;
+}
+
+function imageMime(bytes: Buffer): "image/jpeg" | "image/png" | "image/webp" | undefined {
+	if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "image/png";
+	if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+	if (bytes.length > 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+	return undefined;
+}
+
+function validateGroupSpeakerMap(value: unknown): GroupSpeakerMap {
+	const map = value as GroupSpeakerMap;
+	if (!map || typeof map !== "object" || map.schema !== "pi-telegram-owner/group-speaker-map/v1" || !exactKeys(map as unknown as Record<string, unknown>, ["schema", "speakers"]) || !map.speakers || typeof map.speakers !== "object") throw new ImportValidationError("MANIFEST_INVALID", "Group speaker map is invalid");
+	for (const [key, speaker] of Object.entries(map.speakers)) {
+		if (!validHash(key) || !speaker || !["owner", "agent", "other"].includes(speaker.kind) || !Number.isSafeInteger(speaker.userId) || typeof speaker.name !== "string" || !speaker.name.trim()) throw new ImportValidationError("MANIFEST_INVALID", "Group speaker map entry is invalid");
+	}
+	return map;
+}
+
+/**
+ * Imports a Telegram Desktop HTML export of the group into the shared journal.
+ * Messages already journaled are left as they are, so an export restores only
+ * missing history. Dry run is the default.
+ */
+export async function importTelegramGroupExport(options: GroupImportOptions): Promise<GroupImportReport> {
+	const sourceManifest = await protectedJson(options.sourceSetManifestPath);
+	const source = sourceManifest.value as SourceSetManifest;
+	if (!source || source.schema !== "pi-telegram-owner/source-set/v1" || !Array.isArray(source.pages) || !Number.isSafeInteger(source.messageCount)) throw new ImportValidationError("MANIFEST_INVALID", "Source set manifest is invalid");
+	const speakers = validateGroupSpeakerMap((await protectedJson(options.speakerMapPath)).value);
+	if (!Number.isSafeInteger(options.chatId) || options.chatId >= 0) throw new ImportValidationError("MANIFEST_INVALID", "chatId must be the negative supergroup ID");
+	const journal = new GroupJournal(options.sharedRoot, options.journalOptions);
+	const messages: Array<GroupMessage & { photoPath?: string; pagePath: string }> = [];
+	for (const page of source.pages) {
+		const file = await safeSource(options.exportRoot, page.path, MAX_PAGE_BYTES);
+		if (file.info.size !== page.size || hash(file.bytes) !== page.sha256) throw new ImportValidationError("SOURCE_CHANGED");
+		const html = file.bytes.toString("utf8");
+		if (html.includes("�")) throw new ImportValidationError("HTML_INVALID_UTF8");
+		const document = parse(html) as any;
+		let speaker: GroupSpeakerMap["speakers"][string] | undefined;
+		for (const block of descendants(document, (node) => element(node, "div", "message"))) {
+			if (classes(block).has("service")) continue;
+			const idMatch = /^message(\d+)$/.exec(attrs(block).id ?? "");
+			if (!idMatch) throw new ImportValidationError("HTML_STRUCTURE_UNSUPPORTED", "Group message has no message ID");
+			const senderNode = first(block, (node) => element(node, "div", "from_name"));
+			if (senderNode) speaker = speakers.speakers[fingerprint(textContent(senderNode))];
+			else if (!classes(block).has("joined")) speaker = undefined;
+			if (!speaker) throw new ImportValidationError("DIRECTION_UNKNOWN", `Sender of message ${idMatch[1]} is not in the speaker map`);
+			const date = attrs(first(block, (node) => element(node, "div", "date")) ?? {}).title;
+			if (!date) throw new ImportValidationError("HTML_DATE_INVALID");
+			const textNode = first(block, (node) => element(node, "div", "text"));
+			const replyLink = first(block, (node) => element(node, "a") && /^#go_to_message\d+$/.test(attrs(node).href ?? ""));
+			const photoLink = first(block, (node) => element(node, "a") && classes(node).has("photo_wrap"));
+			const otherMedia = !photoLink ? first(block, (node) => (element(node, "div") || element(node, "a")) && [...classes(node)].some((name) => name.startsWith("media_") && name !== "media_wrap")) : undefined;
+			const otherTitle = otherMedia ? first(otherMedia, (node) => element(node, "div", "title")) : undefined;
+			messages.push({
+				chatId: options.chatId,
+				messageId: Number(idMatch[1]),
+				senderId: speaker.userId,
+				sender: speaker.kind === "owner" ? "Owner" : speaker.name,
+				senderKind: speaker.kind,
+				date: Math.floor(new Date(telegramExportTimestamp(date)).valueOf() / 1000),
+				text: textNode ? normalized(semanticText(textNode)).trim() : "",
+				entities: [],
+				...(replyLink ? { replyToMessageId: Number(/\d+$/.exec(attrs(replyLink).href!)![0]) } : {}),
+				...(otherMedia ? { media: { kind: "document" as const, ...(otherTitle ? { fileName: textContent(otherTitle).trim() } : {}) } } : {}),
+				...(photoLink ? { photoPath: join(dirname(page.path), decodeURIComponent(attrs(photoLink).href ?? "")) } : {}),
+				pagePath: page.path,
+			});
+		}
+	}
+	if (messages.length !== source.messageCount) throw new ImportValidationError("SOURCE_SET_INVALID", "Validated message count differs from manifest");
+	let alreadyPresent = 0;
+	let imported = 0;
+	let photos = 0;
+	for (const { photoPath, pagePath: _page, ...message } of messages) {
+		if (await journal.message(options.chatId, message.messageId)) {
+			alreadyPresent += 1;
+			continue;
+		}
+		if (photoPath) {
+			const bytes = (await safeSource(options.exportRoot, photoPath, 10 * 1024 * 1024)).bytes;
+			const mimeType = imageMime(bytes);
+			if (!mimeType) throw new ImportValidationError("ATTACHMENT_UNSAFE");
+			photos += 1;
+			if (options.commit) message.media = { kind: "photo", mimeType, attachment: await journal.storeAttachment(bytes, mimeType) };
+		}
+		if (options.commit) await journal.recordMessage(message, "import");
+		imported += 1;
+	}
+	return { schema: "pi-telegram-owner/group-import-report/v1", mode: options.commit ? "commit" : "dry-run", messages: messages.length, alreadyPresent, imported, photos };
 }

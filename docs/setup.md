@@ -128,10 +128,30 @@ sends nothing to the group until it is fixed. To check routing, mention one
 agent in the group and confirm only that agent shows activity; then send an
 unaddressed question and confirm exactly one agent claims it.
 
-An existing Telegram Desktop export of the group can be imported with
-`pi-telegram-archive-import --output-root <sharedRoot>`, using a speaker map
-that assigns each sender to the owner or a configured agent. The importer takes
-the shared journal lock, so running agents need not be stopped.
+To restore group history, export the group from Telegram Desktop as HTML and
+write two protected (0600) control files: a `source-set` manifest pinning each
+export page's path, size and SHA-256 with the message count, and a
+`group-speaker-map`:
+
+```json
+{
+  "schema": "pi-telegram-owner/group-speaker-map/v1",
+  "speakers": {
+    "<sha256 of the sender name as the export shows it>": { "kind": "owner", "userId": 10001, "name": "Owner" },
+    "<sha256 of another sender name>": { "kind": "agent", "userId": 200000002, "name": "Agent B" }
+  }
+}
+```
+
+Then run a dry run and review the counts before committing:
+
+```bash
+pi-telegram-group-import --export-root EXPORT --source-set-manifest SOURCE.json --speaker-map GROUP-SPEAKERS.json --chat-id -1001234567890 --shared-root /absolute/path/to/group-chat
+```
+
+Add `--commit` to write. Only messages missing from the shared journal are
+added, so repeating an import changes nothing. The importer takes the shared
+journal lock, so running agents need not be stopped.
 
 ## CLIs
 
@@ -162,7 +182,8 @@ Use synthetic fixtures in tests; do not commit personal exports or mappings.
 All archive/control schemas use `pi-telegram-owner/<kind>/v1`: `source-set`,
 `first-pi-boundary`, `speaker-map`, `import-report`, `import-checkpoint`,
 `archive-manifest`, `media-event`, `message`, and for the shared group root
-`group-event` (journal entries) and `group-message` (notes). Earlier names and boundary
+`group-event` (journal entries), `group-message` (notes), `group-speaker-map`
+and `group-import-report`. Earlier names and boundary
 shapes have no aliases in this unpublished package. Existing Telegram Desktop
 HTML and media exports can be reused. Regenerate the source manifest, speaker
 map and explicit boundary, then create a fresh dry-run checkpoint and publish

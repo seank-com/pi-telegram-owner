@@ -41,19 +41,22 @@ No companion npm dependency or ambient namespace discovery is used.
 Observability enriches activity from validated persisted v1 `tool-intent` entries.
 Without them activity shows `Using <tool>…`; raw arguments are never used.
 
-Two compiled CLIs are included:
+Three compiled CLIs are included:
 
 ```bash
 pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]
 pi-telegram-archive-import --export-root EXPORT --source-set-manifest SOURCE.json \
   --first-pi-anchor BOUNDARY.json --speaker-map SPEAKERS.json \
   --pi-session-root SESSIONS --checkpoint CHECKPOINT.json --dry-run
+pi-telegram-group-import --export-root EXPORT --source-set-manifest SOURCE.json \
+  --speaker-map GROUP-SPEAKERS.json --chat-id CHAT_ID --shared-root ROOT --dry-run
 ```
 
 Menu registration contacts Telegram and is an explicit operator action. Archive
 import defaults to dry-run; commit requires the matching checkpoint and explicit
-`--commit --output-root ROOT`. Both CLIs run as native Node programs without
-loading Pi. Pure helpers are exported as `/format`, `/markdown-projector` and `/importer`.
+`--commit --output-root ROOT`. Group import also defaults to dry-run and adds
+only messages missing from the shared journal with `--commit`. The CLIs run as
+native Node programs without loading Pi. Pure helpers are exported as `/format`, `/markdown-projector` and `/importer`.
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
 `npm pack --dry-run`, `npm run test:package`. Run `npm run hooks:install` once per

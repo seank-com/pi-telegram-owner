@@ -73,6 +73,7 @@
   },
   "bin": {
     "pi-telegram-register-menu": "./dist/cli/register-telegram-owner-menu.js",
-    "pi-telegram-archive-import": "./dist/cli/telegram-archive-import.js"
+    "pi-telegram-archive-import": "./dist/cli/telegram-archive-import.js",
+    "pi-telegram-group-import": "./dist/cli/telegram-group-import.js"
   }
 }
