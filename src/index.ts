@@ -361,6 +361,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					void pi.sendUserMessage(content, { expandPromptTemplates: false });
 				},
 				runtimeDependencies?.resolveImages,
+				async (item) => {
+					if (!groupJournal) throw new Error("Group images are unavailable without the group chat");
+					const journal = groupJournal;
+					return Promise.all((item.images ?? []).map(async (image) => ({ data: (await journal.readAttachment(image.path)).toString("base64"), mimeType: image.mimeType })));
+				},
 			);
 			updateStatus();
 		};

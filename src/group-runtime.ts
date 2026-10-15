@@ -6,8 +6,10 @@ import {
 	type JournalRecord,
 	type TelegramChatMemberUpdate,
 	type TelegramMessage,
+	type TelegramImageRef,
 	type TelegramOwnerBridge,
 	type WorkItem,
+	MAX_IMAGE_BYTES,
 } from "./core.ts";
 import type { EndpointResponse } from "./endpoint.ts";
 import type { GroupJournal, GroupMessage, TelegramEntity } from "./group-journal.ts";
@@ -22,6 +24,7 @@ export interface GroupTelegramApi {
 	removeChatMember(userId: number, signal?: AbortSignal): Promise<void>;
 	leaveChat(chatId: number, signal?: AbortSignal): Promise<void>;
 	sendMessage(text: string, replyToMessageId?: number, signal?: AbortSignal, format?: "HTML" | "plain"): Promise<string>;
+	downloadImage(image: TelegramImageRef, signal?: AbortSignal): Promise<{ data: string; mimeType: string }>;
 	editMessageText(messageId: string, text: string, signal?: AbortSignal): Promise<void>;
 	deleteMessage(messageId: string, signal?: AbortSignal): Promise<void>;
 }
@@ -365,7 +368,15 @@ export class GroupRuntime {
 			// Telegram's copy of the replied-to message repairs an entry missing from the shared journal.
 			await this.options.journal.recordMessage(this.toGroupMessage({ ...reply, chat: message.chat }), this.self!.username);
 		}
-		const result = await this.options.journal.recordMessage(this.toGroupMessage(message), this.self!.username);
+		const recorded = this.toGroupMessage(message);
+		const image = imageOf(message);
+		if (image && !(await this.options.journal.message(this.config.chatId, message.message_id))) {
+			// Downloaded once, by the agent that records the message.
+			const downloaded = await this.options.api.downloadImage(image);
+			const attachment = await this.options.journal.storeAttachment(Buffer.from(downloaded.data, "base64"), image.mimeType);
+			recorded.media = { ...(recorded.media ?? { kind: "photo" }), mimeType: image.mimeType, attachment };
+		}
+		const result = await this.options.journal.recordMessage(recorded, this.self!.username);
 		if (result.outcome !== "conflict") this.options.onJournalChanged?.();
 	}
 
@@ -428,6 +439,8 @@ export class GroupRuntime {
 		const first = messages[0]!;
 		const last = messages.at(-1)!;
 		const text = messages.map((message) => message.text || (message.media ? `[${message.media.kind}]` : "")).filter(Boolean).join("\n\n");
+		const images = messages.flatMap((message) => message.media?.attachment && message.media.mimeType ? [{ path: message.media.attachment, mimeType: message.media.mimeType as "image/jpeg" | "image/png" | "image/webp" }] : []);
+		const unusable = messages.filter((message) => message.media && !message.media.attachment).map((message) => message.media!.fileName ? `a ${message.media!.kind} named ${message.media!.fileName}` : `a ${message.media!.kind}`);
 		return ({
 			itemId: groupItemId(this.config.chatId, first.messageId),
 			channel: "group",
@@ -435,7 +448,11 @@ export class GroupRuntime {
 			sender: "the owner",
 			text: text || "[empty message]",
 			reply: { kind: "group", chatId: this.config.chatId, messageId: last.messageId },
-			context: await this.contextFor(first),
+			context: [
+				...(await this.contextFor(first)),
+				...(unusable.length ? [`The owner's message includes ${unusable.join(" and ")} that you cannot open; say so in your reply if it matters.`] : []),
+			],
+			...(images.length ? { images } : {}),
 		});
 	}
 
@@ -753,6 +770,14 @@ export class GroupRuntime {
 			return this.options.api.sendMessage(text, undefined, signal, format);
 		}
 	}
+}
+
+function imageOf(message: TelegramMessage): (TelegramImageRef & { mimeType: "image/jpeg" | "image/png" | "image/webp" }) | undefined {
+	const photo = message.photo?.at(-1);
+	if (photo && (!photo.file_size || photo.file_size <= MAX_IMAGE_BYTES)) return { fileId: photo.file_id, mimeType: "image/jpeg", fileSize: photo.file_size };
+	const document = message.document;
+	if (document && (document.mime_type === "image/jpeg" || document.mime_type === "image/png" || document.mime_type === "image/webp") && (!document.file_size || document.file_size <= MAX_IMAGE_BYTES)) return { fileId: document.file_id, mimeType: document.mime_type, fileSize: document.file_size };
+	return undefined;
 }
 
 /** A group message becomes at most one work item per agent. */

@@ -145,6 +145,8 @@ export interface WorkItem {
 	context?: string[];
 	/** Caller-supplied key; repeating it returns the original item. */
 	idempotencyKey?: string;
+	/** Images for the model, as paths relative to the group's shared root. */
+	images?: Array<{ path: string; mimeType: "image/jpeg" | "image/png" | "image/webp" }>;
 	timestamp: string;
 }
 
@@ -277,7 +279,7 @@ function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>)
 	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
 	const validMessageId = reply?.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0);
 	const validReply = (reply?.kind === "private" && validMessageId) || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)));
-	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
+	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || (record.images !== undefined && (!Array.isArray(record.images) || record.images.some((image) => !/^_attachments\/[0-9a-f]{64}\.(jpg|png|webp)$/.test(image?.path) || !["image/jpeg", "image/png", "image/webp"].includes(image?.mimeType)))) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
 }
 
 export class StateCorruptionError extends Error {}
@@ -1073,6 +1075,7 @@ export class TelegramOwnerBridge {
 		sessionId: string,
 		sendUserMessage: (text: string, images?: ResolvedImage[]) => void,
 		resolveImages?: (images: TelegramImageRef[], archived: readonly ArchivedTelegramAttachment[]) => Promise<ResolvedArchivedImage[]>,
+		resolveItemImages?: (item: WorkItem) => Promise<ResolvedImage[]>,
 	): Promise<Job | undefined> {
 		if (this.active || this.stopped) return undefined;
 		await this.sealReadyBatches();
@@ -1082,7 +1085,7 @@ export class TelegramOwnerBridge {
 		const captured = job.images.length ? await resolveImages?.(job.images, archived) : undefined;
 		if (job.images.length && !captured) throw new Error("No Telegram image resolver configured");
 		if (captured) await this.recordInboundMedia(job, captured);
-		const images = captured?.map((item) => item.image);
+		const images = job.item?.images?.length && resolveItemImages ? await resolveItemImages(job.item) : captured?.map((item) => item.image);
 		this.active = job;
 		this.dispatchConfirmed = false;
 		this.sawOwnInput = false;

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -78,12 +78,12 @@ function key(chatId: number, messageId: number): string {
 	return `${chatId}:${messageId}`;
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
+async function atomicWrite(path: string, content: string | Buffer): Promise<void> {
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const temporary = join(dirname(path), `.${randomBytes(8).toString("hex")}.tmp`);
 	const file = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
 	try {
-		await file.writeFile(content, "utf8");
+		await file.writeFile(content);
 		await file.sync();
 	} finally {
 		await file.close();
@@ -218,6 +218,20 @@ export class GroupJournal {
 			await append({ kind: "claim", chatId, messageId, agent });
 			return { agent, won: true };
 		});
+	}
+
+	/** Stores an image once by content hash; returns its path relative to the shared root. */
+	async storeAttachment(bytes: Buffer, mimeType: "image/jpeg" | "image/png" | "image/webp"): Promise<string> {
+		const extension = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/png" ? "png" : "webp";
+		const relativePath = `${GROUP_ATTACHMENTS_DIRECTORY}/${createHash("sha256").update(bytes).digest("hex")}.${extension}`;
+		const path = join(this.root, relativePath);
+		if (!(await lstat(path).catch(() => undefined))) await atomicWrite(path, bytes);
+		return relativePath;
+	}
+
+	async readAttachment(relativePath: string): Promise<Buffer> {
+		if (!/^_attachments\/[0-9a-f]{64}\.(jpg|png|webp)$/.test(relativePath)) throw new Error("Group attachment path is invalid");
+		return readFile(join(this.root, relativePath));
 	}
 
 	/** Posts and records at most one election notice per message; returns the notice's message ID. */

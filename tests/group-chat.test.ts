@@ -61,7 +61,15 @@ class FakeGroupApi implements GroupTelegramApi {
 	}
 	async editMessageText(messageId: string, text: string) { this.calls.push(`edit:${messageId}:${text}`); }
 	async deleteMessage(messageId: string) { this.calls.push(`delete:${messageId}`); }
+	downloads = 0;
+	async downloadImage() {
+		this.downloads += 1;
+		return { data: PNG.toString("base64"), mimeType: "image/png" };
+	}
 }
+
+// A 1x1 PNG.
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 
 function peerConfig(key: AgentKey, port = 7000): GroupAgentConfig {
 	return { telegramAccount: AGENTS[key].username, telegramName: AGENTS[key].name, botUserId: AGENTS[key].id, queuePort: port };
@@ -72,6 +80,7 @@ interface Agent {
 	journal: MemoryJournal;
 	api: FakeGroupApi;
 	prompts: string[];
+	promptImages: Array<Array<{ data: string; mimeType: string }>>;
 	privateReplies: string[];
 	privateSends: Array<{ text: string; replyTo?: number }>;
 	tools: Map<string, any>;
@@ -91,6 +100,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 	const journal = new MemoryJournal();
 	const api = new FakeGroupApi(self, ids);
 	const prompts: string[] = [];
+	const promptImages: Array<Array<{ data: string; mimeType: string }>> = [];
 	const privateReplies: string[] = [];
 	const privateSends: Array<{ text: string; replyTo?: number }> = [];
 	const tools = new Map<string, any>();
@@ -104,7 +114,11 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 		on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
 		registerCommand() {},
 		registerTool(definition: any) { tools.set(definition.name, definition); },
-		sendUserMessage(text: string) { prompts.push(text); },
+		sendUserMessage(content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>) {
+			if (typeof content === "string") { prompts.push(content); promptImages.push([]); return; }
+			prompts.push(content.find((part) => part.type === "text")?.text ?? "");
+			promptImages.push(content.filter((part) => part.type === "image").map((part) => ({ data: part.data!, mimeType: part.mimeType! })));
+		},
 	} as unknown as ExtensionAPI;
 	const config: GroupChatConfig = { chatId: GROUP, sharedRoot, datastore: extra.datastore ?? { mode: "off", store: "telegram-group" }, electionStepMs: extra.electionStepMs ?? 250, otherAgents: [peerConfig(other)] };
 	createTelegramOwnerExtension({ dependencies: {
@@ -134,7 +148,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 		await emit("agent_settled", { type: "agent_settled" });
 	};
 	return {
-		key, journal, api, prompts, privateReplies, privateSends, tools, emit, startTurn, finishTurn,
+		key, journal, api, prompts, promptImages, privateReplies, privateSends, tools, emit, startTurn, finishTurn,
 		status: () => status,
 		port: () => Number(/endpoint=127\.0\.0\.1:(\d+)/.exec(status)?.[1]),
 		batch: (updates) => onBatch!(updates),
@@ -550,4 +564,33 @@ test("agents that disagree on the roster or election step pause the group", asyn
 	const paused = agents.b.status().includes("group=unverified") ? agents.b : agents.a;
 	assert.match(paused.privateReplies.at(-1)!, /group configuration differs/);
 	assert.ok((await shared.events()).some((event) => event.kind === "roster_check" && event.result === "mismatch"));
+});
+
+test("an owner photo is stored once in the shared root and given to the addressed agent as an image", async (t) => {
+	const { agents, shared, sharedRoot } = await twoAgents(t);
+	await verified(agents);
+	const caption = "@example_agent_a_bot what is in this picture?";
+	const update = ownerGroupMessage(90, "", { text: undefined, caption, caption_entities: [mention(caption, AGENTS.a.username)], photo: [{ file_id: "small", file_size: 10 }, { file_id: "large", file_size: PNG.length }] });
+	await agents.a.batch([update]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.b.batch([update]);
+	await waitFor(() => agents.b.journal.records.some((record) => record.type === "group_handled" && record.stage === "routed"));
+	assert.equal(agents.a.api.downloads + agents.b.api.downloads, 1, "the agent that records the photo downloads it; the other does not");
+	const recorded = await shared.message(GROUP, 90);
+	assert.match(recorded?.media?.attachment ?? "", /^_attachments\/[0-9a-f]{64}\.jpg$/, "Telegram photos are JPEG");
+	const { readFile } = await import("node:fs/promises");
+	assert.deepEqual(await readFile(join(sharedRoot, recorded!.media!.attachment!)), PNG);
+	assert.ok(agents.a.prompts[0]!.endsWith(caption), "the caption routes and is the item text");
+	assert.deepEqual(agents.a.promptImages[0], [{ data: PNG.toString("base64"), mimeType: "image/jpeg" }]);
+});
+
+test("an attachment the agent cannot open is recorded and the agent is told to say so", async (t) => {
+	const { agents, shared } = await twoAgents(t);
+	await verified(agents);
+	const caption = "@example_agent_a_bot please review";
+	await agents.a.batch([ownerGroupMessage(91, "", { text: undefined, caption, caption_entities: [mention(caption, AGENTS.a.username)], document: { file_id: "doc", file_name: "report.json", mime_type: "application/json", file_size: 1200 } })]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	assert.match(agents.a.prompts[0]!, /The owner's message includes a document named report\.json that you cannot open; say so in your reply if it matters\./);
+	assert.equal(agents.a.api.downloads, 0);
+	assert.deepEqual((await shared.message(GROUP, 91))?.media, { kind: "document", fileName: "report.json", mimeType: "application/json", size: 1200 });
 });
