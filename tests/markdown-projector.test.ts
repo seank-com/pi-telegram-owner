@@ -512,3 +512,43 @@ test("projector rejects insecure archive roots and session path escape", async (
 	await persistSession(join(base, "other"), outsideEntries);
 	await assert.rejects(() => projector.reconcile(records(), session(join(base, "other"), outsideEntries), async () => undefined), ArchiveSafetyError);
 });
+
+test("private-chat replies to work items are archived as outbound messages; group items are not", async (t) => {
+	const base = await mkdtemp(join(tmpdir(), "telegram-item-archive-"));
+	t.after(() => rm(base, { recursive: true, force: true }));
+	const archiveRoot = join(base, "archive"); const sessionRoot = join(base, "sessions");
+	const itemId = "11111111-2222-4333-8444-555555555555";
+	const groupItemId = "66666666-7777-4888-8999-000000000000";
+	const item = { itemId, channel: "endpoint" as const, authority: "owner" as const, sender: "nightly-calendar", text: "Tell the owner about the early meeting.", reply: { kind: "private" as const }, timestamp: "2026-09-22T01:30:00.000Z" };
+	const groupItem = { itemId: groupItemId, channel: "group" as const, authority: "peer" as const, sender: "Agent B", text: "Status?", reply: { kind: "group" as const, chatId: -100, messageId: 5 }, timestamp: "2026-09-22T01:40:00.000Z" };
+	const { renderWorkItemPrompt } = await import("../src/core.ts");
+	const entries = [
+		message("user0001", null, "user", "[telegram-job:job-1]\nhello", "2026-09-22T01:00:01.000Z"),
+		message("asst0001", "user0001", "assistant", "**world**", "2026-09-22T01:00:02.000Z"),
+		message("user0002", "asst0001", "user", `[telegram-item:${itemId}]\n${renderWorkItemPrompt(item)}`, "2026-09-22T01:30:01.000Z"),
+		message("asst0002", "user0002", "assistant", "You have an 8:00 meeting; set an early alarm.", "2026-09-22T01:30:02.000Z"),
+		message("user0003", "asst0002", "user", `[telegram-item:${groupItemId}]\n${renderWorkItemPrompt(groupItem)}`, "2026-09-22T01:40:01.000Z"),
+		message("asst0003", "user0003", "assistant", "All green.", "2026-09-22T01:40:02.000Z"),
+	];
+	await persistSession(sessionRoot, entries);
+	const journal: JournalRecord[] = [
+		...records(),
+		{ type: "work_item", schemaVersion: 1, ...item },
+		{ type: "dispatched", jobId: itemId, sessionId: "session-1" },
+		{ type: "reply_ready", jobId: itemId, text: "You have an 8:00 meeting; set an early alarm.", timestamp: "2026-09-22T01:30:03.000Z" },
+		{ type: "reply_sent", jobId: itemId, messageIds: ["13"], timestamp: "2026-09-22T01:30:03.000Z" },
+		{ type: "work_item", schemaVersion: 1, ...groupItem },
+		{ type: "dispatched", jobId: groupItemId, sessionId: "session-1" },
+		{ type: "reply_ready", jobId: groupItemId, text: "All green.", timestamp: "2026-09-22T01:40:03.000Z" },
+		{ type: "reply_sent", jobId: groupItemId, messageIds: ["14"], timestamp: "2026-09-22T01:40:03.000Z" },
+	];
+	const append = async (record: JournalRecord) => { journal.push(record); };
+	const projector = createProjector(archiveRoot, sessionRoot);
+	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 3, unchanged: 0, deferred: 0 });
+	const recent = await projector.timeline({ operation: "recent", limit: 3 });
+	assert.deepEqual(recent.messages!.map((item) => item.content), ["You have an 8:00 meeting; set an early alarm.", "**world**", "hello"]);
+	assert.equal(recent.messages![0].direction, "out");
+	assert.equal(recent.messages![0].messageId, "tgmsg:v1:pi:session-1:asst0002");
+	assert.equal(journal.some((record) => record.type === "projection_deferred"), false);
+	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 3, deferred: 0 });
+});

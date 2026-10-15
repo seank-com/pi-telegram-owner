@@ -24,6 +24,7 @@ import {
 	type TelegramImageRef,
 	type TelegramUpdate,
 } from "./core.ts";
+import { parseQueueRequest, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
 import { registerTelegramRecallTool } from "./recall.ts";
 import { registerTelegramTimelineTool } from "./timeline.ts";
 import {
@@ -74,11 +75,14 @@ export interface PrototypeDependencies {
 	sendTyping?(signal: AbortSignal): Promise<void>;
 	/** Transport for replies and transient messages in the group chat, when one is configured. */
 	group?: ChatTransport;
+	/** Local queue endpoint port on 127.0.0.1; 0 selects a free port. */
+	queuePort?: number;
 	close?(): Promise<void>;
 }
 
 /** Sends, edits and deletes messages in one chat. */
 export interface ChatTransport {
+	chatId: number;
 	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
 	sendActivity(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
 	editActivity(messageId: string, text: string, signal: AbortSignal): Promise<void>;
@@ -140,6 +144,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		let lastTypingError: string | undefined;
 		let lastActivityError: string | undefined;
 		let lastIndexError: string | undefined;
+		let lastEndpointError: string | undefined;
+		let endpoint: QueueEndpoint | undefined;
 		let compacting = false;
 		let switching = false;
 		let agentLabel = GENERIC_AGENT_LABEL;
@@ -163,6 +169,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			if (lastTypingError) details.push(`typingError=${lastTypingError}`);
 			if (lastActivityError) details.push(`activityError=${lastActivityError}`);
 			if (lastIndexError) details.push(`indexError=${lastIndexError}`);
+			if (endpoint) details.push(`endpoint=${QUEUE_ENDPOINT_HOST}:${endpoint.port}`);
+			if (lastEndpointError) details.push(`endpointError=${lastEndpointError}`);
 			return details.join(" ");
 		};
 
@@ -179,6 +187,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			if (!deps.sendActivity && !deps.editActivity && !deps.deleteActivity) return undefined;
 			const missing = (operation: string) => async (): Promise<never> => { throw new Error(`Telegram activity ${operation} is not configured`); };
 			return {
+				chatId: deps.privateChatId,
 				sendReply: deps.sendReply,
 				sendActivity: deps.sendActivity ?? missing("send"),
 				editActivity: deps.editActivity ?? missing("edit"),
@@ -519,6 +528,51 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			}
 		};
 
+		const isBusy = (): boolean => Boolean(bridge?.activeJob) || compacting || switching || (currentContext ? !currentContext.isIdle() : false);
+
+		const endpointHandlers = (ownGeneration: number): QueueEndpointHandlers => ({
+			queue: async (body) => {
+				const parsed = parseQueueRequest(body);
+				if (!parsed.ok) return { status: 400, body: { error: parsed.error } };
+				if (generation !== ownGeneration || !bridge) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
+				const request = parsed.value;
+				const group = runtimeDependencies?.group;
+				if (request.kind === "group-message" || (request.reply === "group" && !group)) return { status: 409, body: { error: "The group chat is not configured" } };
+				const reply = request.reply === "group" ? { kind: "group" as const, chatId: group!.chatId } : { kind: request.reply };
+				const admitted = await serialized(async () => {
+					if (generation !== ownGeneration || !bridge) return undefined;
+					const result = await bridge.admitItem({ channel: "endpoint", authority: "owner", sender: request.source, text: request.text, reply, ...(request.id ? { idempotencyKey: request.id } : {}) });
+					try {
+						if (currentContext) {
+							await dispatchIfIdle(currentContext);
+							await postQueuedNotices();
+						}
+					} catch (error) {
+						noteError(error);
+					}
+					updateStatus();
+					return result;
+				});
+				if (!admitted) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
+				return { status: 202, body: { itemId: admitted.item.itemId, duplicate: admitted.duplicate } };
+			},
+			coordinate: async () => ({ status: 409, body: { error: "The group chat is not configured" } }),
+			status: async () => ({
+				status: 200,
+				body: {
+					state: isBusy() ? "busy" : "idle",
+					queue: bridge?.queueDepthByTier ?? { owner: 0, peer: 0 },
+					group: runtimeDependencies?.group ? "configured" : "unconfigured",
+				},
+			}),
+		});
+
+		const stopEndpoint = async (): Promise<void> => {
+			const current = endpoint;
+			endpoint = undefined;
+			await current?.close();
+		};
+
 		const makeDefaultDependencies = async (): Promise<PrototypeDependencies | undefined> => {
 			let loaded;
 			try {
@@ -557,6 +611,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				agentLabel: config.agentLabel,
 				formattedDelivery: config.formattedDelivery,
 				inboundQuietWindowMs: config.inboundQuietWindowMs,
+				queuePort: config.queuePort,
 				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
 				mediaProjector,
 				requestLexicalRefresh: async (signal) => { if (integration.available()) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
@@ -762,6 +817,15 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}),
 					recovered.cursor,
 				);
+				if (runtimeDependencies.queuePort !== undefined) {
+					lastEndpointError = undefined;
+					try {
+						endpoint = await startQueueEndpoint(runtimeDependencies.queuePort, endpointHandlers(ownGeneration));
+					} catch (error) {
+						lastEndpointError = sanitizeError(error);
+					}
+					updateStatus();
+				}
 				await serialized(async () => {
 					await retryPendingReplies();
 					await processPendingCommands(ctx);
@@ -771,6 +835,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				});
 			} catch (error) {
 				noteError(error);
+				await stopEndpoint().catch((endpointError) => noteError(endpointError));
 				await stopReceiptTyping();
 				await stopTyping();
 				typing = undefined;
@@ -861,6 +926,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			projectionRefreshInFlight = undefined;
 			connection = { phase: "stopping" };
 			updateStatus();
+			await stopEndpoint().catch((error) => noteError(error));
 			const receiptTypingStopped = stopReceiptTyping();
 			const typingStopped = stopTyping();
 			const stop = stopSource;

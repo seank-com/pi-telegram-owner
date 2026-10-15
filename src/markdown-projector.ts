@@ -10,7 +10,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { PollerLock, systemBootIdentity, systemPidState, type BootIdentity, type PidState } from "./runtime.ts";
 
-import { MAX_IMAGE_BYTES, validateMediaLifecycle, type ArchivedTelegramAttachment, type JournalRecord, type ResolvedImage } from "./core.ts";
+import { MAX_IMAGE_BYTES, renderWorkItemPrompt, validateMediaLifecycle, WORK_ITEM_MARKER_PREFIX, type ArchivedTelegramAttachment, type JournalRecord, type ResolvedImage, type WorkItem } from "./core.ts";
 
 export interface TelegramMarkdownProjectorConfig {
 	enabled: true;
@@ -496,12 +496,20 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 	const photoPlans = records.filter((record): record is Extract<JournalRecord, { type: "photo_send_planned" }> => record.type === "photo_send_planned");
 	const photoReceipts = new Map(records.filter((record): record is Extract<JournalRecord, { type: "photo_sent" }> => record.type === "photo_sent").map((record) => [record.photoId, record]));
 	for (const plan of photoPlans) validateArchivedAttachment(plan.attachment);
-	const logical: Array<{ jobId: string; text: string; command?: string; timestamp: string; telegramDate?: number; updateId: number; messageId?: number; batch?: Extract<JournalRecord, { type: "inbound_batch" }>; order: number }> = updates.filter((update) => update.command || !batchMembers.has(update.jobId!)).map((update) => ({ jobId: update.jobId!, text: update.text!, command: update.command, timestamp: update.timestamp, telegramDate: update.telegramDate, updateId: update.updateId, messageId: update.messageId, order: update.updateId }));
+	// Journal position orders private jobs (as Telegram update order does) and work items together.
+	const position = new Map<JournalRecord, number>(records.map((record, index) => [record, index]));
+	const logical: Array<{ jobId: string; text: string; command?: string; timestamp: string; telegramDate?: number; updateId: number | null; messageId?: number; batch?: Extract<JournalRecord, { type: "inbound_batch" }>; item?: WorkItem; order: number }> = updates.filter((update) => update.command || !batchMembers.has(update.jobId!)).map((update) => ({ jobId: update.jobId!, text: update.text!, command: update.command, timestamp: update.timestamp, telegramDate: update.telegramDate, updateId: update.updateId, messageId: update.messageId, order: position.get(update)! }));
 	for (const batch of latestBatches.values()) {
 		const members = batch.memberJobIds.map((jobId) => updates.find((update) => update.jobId === jobId));
 		if (members.some((member) => !member)) throw new ArchiveCorruptionError("Inbound batch member update is missing");
 		const first = members[0]!; const last = members.at(-1)!;
-		logical.push({ jobId: batch.batchId, text: batch.text, timestamp: last.timestamp, telegramDate: first.telegramDate, updateId: last.updateId, messageId: batch.finalMessageId, batch, order: first.updateId });
+		logical.push({ jobId: batch.batchId, text: batch.text, timestamp: last.timestamp, telegramDate: first.telegramDate, updateId: last.updateId, messageId: batch.finalMessageId, batch, order: position.get(first)! });
+	}
+	// Work items answered in the private chat contribute only their outbound reply; the instruction is not a Telegram message.
+	for (const record of records) {
+		if (record.type !== "work_item" || record.reply.kind !== "private") continue;
+		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
 	}
 	logical.sort((a, b) => a.order - b.order || a.jobId.localeCompare(b.jobId));
 	for (const update of logical) {
@@ -519,32 +527,34 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 		const dispatched = [...records].reverse().find((record): record is Extract<JournalRecord, { type: "dispatched" }> => record.type === "dispatched" && record.jobId === jobId);
 		if (!dispatched) continue;
 		if (dispatched.sessionId !== sessionId || !persisted) {
-			deferred.push({ jobId, direction: "in", code: "PI_SESSION_NOT_SUPPLIED" });
+			if (!update.item) deferred.push({ jobId, direction: "in", code: "PI_SESSION_NOT_SUPPLIED" });
 			if (reply) deferred.push({ jobId, direction: "out", code: "PI_SESSION_NOT_SUPPLIED" });
 			continue;
 		}
-		const marker = update.batch ? `[telegram-batch:${jobId}]\n` : `[telegram-job:${jobId}]\n`;
+		const marker = update.item ? `${WORK_ITEM_MARKER_PREFIX}${jobId}]\n` : update.batch ? `[telegram-batch:${jobId}]\n` : `[telegram-job:${jobId}]\n`;
 		const markerUsers = branch.map((entry, index) => ({ entry, index })).filter(({ entry }) => messageText(entry)?.startsWith(marker));
 		const userMatches = markerUsers.filter(({ entry }) => messageText(entry)!.slice(marker.length) === update.text);
 		if (userMatches.length !== 1) {
 			if (markerUsers.length === 1 && userMatches.length === 0) throw new ArchiveCorruptionError("Canonical Pi user content changed under a stable job marker");
 			const code = userMatches.length ? "PI_USER_ENTRY_AMBIGUOUS" : "PI_USER_ENTRY_MISSING";
-			deferred.push({ jobId, direction: "in", code }); if (reply) deferred.push({ jobId, direction: "out", code }); continue;
+			if (!update.item) deferred.push({ jobId, direction: "in", code }); if (reply) deferred.push({ jobId, direction: "out", code }); continue;
 		}
 		const { entry: user, index: userIndex } = userMatches[0]!;
 		const storedUser = persisted!.entries.get(user.id);
 		if (!storedUser || messageText(storedUser.entry) !== messageText(user)) throw new ArchiveCorruptionError("Persisted Pi user entry disagrees with branch");
-		const body = messageText(storedUser.entry)!.slice(marker.length);
-		const batchProvenance = update.batch ? { schemaVersion: 1 as const, batchId: update.batch.batchId, memberJobIds: update.batch.memberJobIds, messageIds: update.batch.messageIds, segmentSha256: update.batch.segmentSha256, boundaries: update.batch.boundaries } : undefined;
-		const memberIds = update.batch?.memberJobIds ?? [jobId];
-		const inboundAttachments = mediaEvents.filter((event) => event.provenance.kind === "live-inbound" && memberIds.includes(event.provenance.jobId)).map((event) => event.attachment);
-		candidates.push({ jobId, direction: "in", identityKind: "pi-session-entry", messageId: `tgmsg:v1:pi:${sessionId}:${user.id}`, body, role: "user", occurredAt: update.telegramDate ? new Date(update.telegramDate * 1000).toISOString() : safeTimestamp(user.timestamp), observedAt: safeTimestamp(update.timestamp), updateId: update.updateId, telegramMessageIds: update.batch ? update.batch.messageIds.map(String) : update.messageId === undefined ? [] : [String(update.messageId)], sessionId, sessionEntryId: user.id, sessionPath: persisted.path, sessionEntrySha256: storedUser.sha256, sessionEntryLine: storedUser.line, sessionEntryByteOffset: storedUser.byteOffset, sessionEntryByteLength: storedUser.byteLength, transportCount: update.batch?.messageIds.length ?? 1, transportCompleteness: "complete", batch: batchProvenance, ...(inboundAttachments.length ? { attachments: inboundAttachments } : {}) });
-		for (const plan of photoPlans.filter((item) => item.jobId === jobId)) {
-			const receipt = photoReceipts.get(plan.photoId);
-			if (!receipt) continue;
-			const media = mediaEvents.find((event) => event.provenance.kind === "live-outbound" && event.provenance.photoId === plan.photoId);
-			if (!media) throw new ArchiveCorruptionError("Outbound photo media event is missing");
-			candidates.push({ jobId: plan.photoId, direction: "out", identityKind: "telegram-live-photo", messageId: `tgmsg:v1:telegram-photo:${plan.photoId}`, body: plan.caption, role: "assistant", occurredAt: safeTimestamp(receipt.timestamp), observedAt: safeTimestamp(plan.timestamp), updateId: update.updateId, telegramMessageIds: [receipt.messageId], sessionId: null, sessionEntryId: null, sessionPath: null, sessionEntrySha256: null, sessionEntryLine: null, sessionEntryByteOffset: null, sessionEntryByteLength: null, transportCount: 1, transportCompleteness: "complete", attachments: [media.attachment] });
+		if (!update.item) {
+			const body = messageText(storedUser.entry)!.slice(marker.length);
+			const batchProvenance = update.batch ? { schemaVersion: 1 as const, batchId: update.batch.batchId, memberJobIds: update.batch.memberJobIds, messageIds: update.batch.messageIds, segmentSha256: update.batch.segmentSha256, boundaries: update.batch.boundaries } : undefined;
+			const memberIds = update.batch?.memberJobIds ?? [jobId];
+			const inboundAttachments = mediaEvents.filter((event) => event.provenance.kind === "live-inbound" && memberIds.includes(event.provenance.jobId)).map((event) => event.attachment);
+			candidates.push({ jobId, direction: "in", identityKind: "pi-session-entry", messageId: `tgmsg:v1:pi:${sessionId}:${user.id}`, body, role: "user", occurredAt: update.telegramDate ? new Date(update.telegramDate * 1000).toISOString() : safeTimestamp(user.timestamp), observedAt: safeTimestamp(update.timestamp), updateId: update.updateId, telegramMessageIds: update.batch ? update.batch.messageIds.map(String) : update.messageId === undefined ? [] : [String(update.messageId)], sessionId, sessionEntryId: user.id, sessionPath: persisted.path, sessionEntrySha256: storedUser.sha256, sessionEntryLine: storedUser.line, sessionEntryByteOffset: storedUser.byteOffset, sessionEntryByteLength: storedUser.byteLength, transportCount: update.batch?.messageIds.length ?? 1, transportCompleteness: "complete", batch: batchProvenance, ...(inboundAttachments.length ? { attachments: inboundAttachments } : {}) });
+			for (const plan of photoPlans.filter((item) => item.jobId === jobId)) {
+				const receipt = photoReceipts.get(plan.photoId);
+				if (!receipt) continue;
+				const media = mediaEvents.find((event) => event.provenance.kind === "live-outbound" && event.provenance.photoId === plan.photoId);
+				if (!media) throw new ArchiveCorruptionError("Outbound photo media event is missing");
+				candidates.push({ jobId: plan.photoId, direction: "out", identityKind: "telegram-live-photo", messageId: `tgmsg:v1:telegram-photo:${plan.photoId}`, body: plan.caption, role: "assistant", occurredAt: safeTimestamp(receipt.timestamp), observedAt: safeTimestamp(plan.timestamp), updateId: update.updateId, telegramMessageIds: [receipt.messageId], sessionId: null, sessionEntryId: null, sessionPath: null, sessionEntrySha256: null, sessionEntryLine: null, sessionEntryByteOffset: null, sessionEntryByteLength: null, transportCount: 1, transportCompleteness: "complete", attachments: [media.attachment] });
+			}
 		}
 		if (!reply) continue;
 		// The bridge records interruption notices after `interrupted`; they are not Pi assistant text.

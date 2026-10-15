@@ -85,7 +85,7 @@ export async function fetchUpdateBatch(
 /** Where a work item's final reply goes. */
 export type ReplyDestination =
 	| { kind: "private" }
-	| { kind: "group"; chatId: number; messageId: number }
+	| { kind: "group"; chatId: number; messageId?: number }
 	| { kind: "none" };
 
 /** Non-private work admitted to the queue: group messages and queue endpoint items. */
@@ -175,7 +175,7 @@ export function renderWorkItemPrompt(item: WorkItem): string {
 	const destination = item.reply.kind === "private"
 		? "the private chat with the owner"
 		: item.reply.kind === "group"
-			? `the group chat, as a reply to message ${item.reply.messageId}`
+			? item.reply.messageId ? `the group chat, as a reply to message ${item.reply.messageId}` : "the group chat"
 			: "nowhere; this turn sends no reply";
 	const lines = [
 		`Channel: ${channel}`,
@@ -227,7 +227,7 @@ export class ReplyDestinationUnavailableError extends Error {}
 
 function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>): void {
 	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
-	const validReply = reply?.kind === "private" || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && Number.isSafeInteger(reply.messageId) && reply.messageId! > 0);
+	const validReply = reply?.kind === "private" || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)));
 	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
 }
 
@@ -415,7 +415,7 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 		if (record.type === "work_item") {
 			validateWorkItem(record);
 			const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
-			const anchor = item.reply.kind === "group" ? item.reply.messageId : 0;
+			const anchor = item.reply.kind === "group" ? item.reply.messageId ?? 0 : 0;
 			items.push({ jobId: item.itemId, updateId: 0, messageId: anchor, text: renderWorkItemPrompt(item), images: [], item, tier: item.authority, order });
 		} else if (record.type === "update") {
 			cursor = record.updateId;

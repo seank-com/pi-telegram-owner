@@ -37,6 +37,8 @@ export interface TelegramOwnerConfig {
 	formattedDelivery: boolean;
 	inboundQuietWindowMs: number;
 	markdownProjection?: TelegramMarkdownProjectorConfig;
+	/** Local queue endpoint port on 127.0.0.1, when configured. */
+	queuePort?: number;
 	baseDir: string;
 	journalPath: string;
 	lockPath: string;
@@ -144,6 +146,7 @@ export async function loadTelegramOwnerConfig(
 		formattedDelivery?: unknown;
 		inboundQuietWindowMs?: unknown;
 		markdownProjection?: unknown;
+		queuePort?: unknown;
 	};
 	for (const [name, id] of [
 		["ownerUserId", value.ownerUserId],
@@ -171,6 +174,8 @@ export async function loadTelegramOwnerConfig(
 	const formattedDelivery = value.formattedDelivery !== false;
 	const inboundQuietWindowMs = value.inboundQuietWindowMs ?? DEFAULT_INBOUND_QUIET_WINDOW_MS;
 	if (!Number.isSafeInteger(inboundQuietWindowMs) || Number(inboundQuietWindowMs) < 100 || Number(inboundQuietWindowMs) > 5_000) throw new ConfigurationError("inboundQuietWindowMs must be an integer from 100 through 5000");
+	const queuePort = value.queuePort;
+	if (queuePort !== undefined && (!Number.isSafeInteger(queuePort) || (queuePort as number) < 1024 || (queuePort as number) > 65_535)) throw new ConfigurationError("queuePort must be an integer from 1024 through 65535");
 	let markdownProjection: TelegramMarkdownProjectorConfig | undefined;
 	const projectionValue = value.markdownProjection ?? { enabled: true };
 	if (projectionValue !== false) {
@@ -201,6 +206,7 @@ export async function loadTelegramOwnerConfig(
 			formattedDelivery,
 			inboundQuietWindowMs: Number(inboundQuietWindowMs),
 			markdownProjection,
+			...(queuePort === undefined ? {} : { queuePort: queuePort as number }),
 			baseDir,
 			journalPath: join(baseDir, "state.jsonl"),
 			lockPath: join(baseDir, "poller.lock"),
