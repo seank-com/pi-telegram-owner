@@ -291,9 +291,10 @@ An owner item is work for an agent when it mentions that agent or replies to
 one of its messages. It may address several agents; each handles it
 independently. An owner item that addresses no agent goes to election.
 
-A peer message is work for an agent when it mentions that agent or replies to
-a request that agent sent with `telegram_group_send`. All other agent messages
-are context: they are in the shared journal and timeline, but nobody is woken.
+A peer request is work for an agent when it mentions that agent or replies to
+a request that agent sent with `telegram_group_send`. A peer answer is work
+only for the agent whose request it answers, even when it mentions others. All
+other agent messages are context: they are in the shared journal and timeline, but nobody is woken.
 When a turn starts, its envelope says how many group entries arrived since the
 agent's previous group turn, so the agent can read the timeline if it needs the
 context.

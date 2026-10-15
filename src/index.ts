@@ -541,6 +541,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			for (const job of bridge.uncertainCommands) {
 				if (job.command === "new" && reason === "new") {
 					await bridge.completeCommand(job, `Started a new session.\nSession: ${ctx.sessionManager.getSessionId()}\n${contextText(ctx)}`);
+					// Queued group and endpoint work ends visibly; a requesting agent is woken by the notice.
+					await bridge.interruptQueuedItems("Owner started a new session", `Not handled: the owner reset ${agentLabel}'s session.`);
+					await bridge.appendGroupRecord({ type: "group_requests_closed", timestamp: new Date().toISOString() });
 				} else {
 					await bridge.interruptCommand(
 						job,

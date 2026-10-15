@@ -85,7 +85,9 @@ export type GroupProgressRecord =
 	| { type: "group_send_accepted"; sendId: string; messageIds: number[]; date: number; timestamp: string }
 	| { type: "group_post_recorded"; postId: string; messageId: number; timestamp: string }
 	| { type: "group_wake"; messageId: number; peer: string; timestamp: string }
-	| { type: "group_wake_done"; messageId: number; peer: string; outcome: "accepted" | "rejected"; timestamp: string };
+	| { type: "group_wake_done"; messageId: number; peer: string; outcome: "accepted" | "rejected"; timestamp: string }
+	/** /new closes requests this agent was waiting on; later answers become context. */
+	| { type: "group_requests_closed"; timestamp: string };
 
 export interface FetchLike {
 	(input: string, init: { method: string; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal }): Promise<{
@@ -123,7 +125,7 @@ export async function fetchUpdateBatch(
 
 /** Where a work item's final reply goes. */
 export type ReplyDestination =
-	| { kind: "private" }
+	| { kind: "private"; messageId?: number }
 	| { kind: "group"; chatId: number; messageId?: number }
 	| { kind: "none" };
 
@@ -214,7 +216,7 @@ export const WORK_ITEM_MARKER_PREFIX = "[telegram-item:";
 export function renderWorkItemPrompt(item: WorkItem): string {
 	const channel = item.channel === "group" ? "group chat" : "queue endpoint";
 	const destination = item.reply.kind === "private"
-		? "the private chat with the owner"
+		? item.reply.messageId ? `the private chat with the owner, as a reply to message ${item.reply.messageId}` : "the private chat with the owner"
 		: item.reply.kind === "group"
 			? item.reply.messageId ? `the group chat, as a reply to message ${item.reply.messageId}` : "the group chat"
 			: "nowhere; this turn sends no reply";
@@ -270,7 +272,8 @@ export class ReplyDestinationUnavailableError extends Error {}
 
 function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>): void {
 	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
-	const validReply = reply?.kind === "private" || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)));
+	const validMessageId = reply?.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0);
+	const validReply = (reply?.kind === "private" && validMessageId) || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)));
 	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
 }
 
@@ -458,7 +461,7 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 		if (record.type === "work_item") {
 			validateWorkItem(record);
 			const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
-			const anchor = item.reply.kind === "group" ? item.reply.messageId ?? 0 : 0;
+			const anchor = item.reply.kind === "none" ? 0 : item.reply.messageId ?? 0;
 			items.push({ jobId: item.itemId, updateId: 0, messageId: anchor, text: renderWorkItemPrompt(item), images: [], item, tier: item.authority, order });
 		} else if (record.type === "update") {
 			cursor = record.updateId;
@@ -890,6 +893,26 @@ export class TelegramOwnerBridge {
 			else if (record.type === "activity_cleared") open.delete(`${record.jobId}:${record.messageId}`);
 		}
 		return [...open.values()];
+	}
+
+	/** A private-chat job's anchor message and text, for answers that return to it. */
+	privateJobFor(jobId: string): { messageId: number; text: string } | undefined {
+		const batch = this.latestBatch(jobId);
+		if (batch) return { messageId: batch.finalMessageId, text: batch.text };
+		const update = this.updateForJob(jobId);
+		return update?.messageId !== undefined && update.text !== undefined ? { messageId: update.messageId, text: update.text } : undefined;
+	}
+
+	/** Ends queued non-private items, giving each a notice as its reply. Returns the ended items. */
+	async interruptQueuedItems(reason: string, notice: string): Promise<WorkItem[]> {
+		const ended: WorkItem[] = [];
+		for (const job of recover(this.records, this.now()).queued) {
+			if (!job.item || job.jobId === this.active?.jobId) continue;
+			await this.append({ type: "interrupted", jobId: job.jobId, reason });
+			await this.append({ type: "reply_ready", jobId: job.jobId, text: notice, timestamp: new Date(this.now()).toISOString() });
+			ended.push(job.item);
+		}
+		return ended;
 	}
 
 	/** The work item behind a job ID, if the job is not a private-chat job. */

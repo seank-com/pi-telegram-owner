@@ -1,5 +1,6 @@
 import {
 	ReplyDestinationUnavailableError,
+	workItemIdForKey,
 	type GroupProgressRecord,
 	type GroupUpdatePayload,
 	type JournalRecord,
@@ -431,12 +432,13 @@ export class GroupRuntime {
 		if (!message) return { status: 404, body: { error: `Group message ${messageId} is not in the shared journal` } };
 		const peer = this.agentById(message.senderId);
 		if (message.senderKind !== "agent" || !peer) return { status: 400, body: { error: "Only messages from configured agents can be delivered" } };
-		let addressed = this.mentionedIds(message).has(this.self.id) || mentionedAccounts(message.text).includes(this.self.username.toLowerCase());
-		if (!addressed && message.replyToMessageId) {
-			const target = await this.options.journal.message(this.config.chatId, message.replyToMessageId);
-			addressed = Boolean(target && target.senderId === this.self.id && target.posting?.kind === "request");
-		}
-		if (!addressed) return { status: 400, body: { error: "The message does not address this agent" } };
+		const target = message.replyToMessageId ? await this.options.journal.message(this.config.chatId, message.replyToMessageId) : undefined;
+		const repliesToOwnRequest = Boolean(target && target.senderId === this.self.id && target.posting?.kind === "request");
+		const mentioned = this.mentionedIds(message).has(this.self.id) || mentionedAccounts(message.text).includes(this.self.username.toLowerCase());
+		if (message.posting?.kind === "answer" && !repliesToOwnRequest) return { status: 400, body: { error: "An answer wakes only the agent whose request it answers" } };
+		if (!mentioned && !repliesToOwnRequest) return { status: 400, body: { error: "The message does not address this agent" } };
+		// An answer to this agent's request returns to the work that asked; a new request is answered in the group.
+		if (repliesToOwnRequest && message.posting?.kind === "answer") return this.admitAnswer(message, peer, target!);
 		const result = await this.options.admit({
 			itemId: groupItemId(this.config.chatId, message.messageId),
 			channel: "group",
@@ -447,6 +449,47 @@ export class GroupRuntime {
 			context: await this.contextFor(message),
 		}) as { item: WorkItem; duplicate: boolean } | undefined;
 		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
+	}
+
+	private async admitAnswer(message: GroupMessage, peer: GroupAgentConfig, request: GroupMessage): Promise<EndpointResponse> {
+		const records = this.records();
+		const closed = records.findLast((record): record is Extract<GroupProgressRecord, { type: "group_requests_closed" }> => record.type === "group_requests_closed");
+		if (closed && request.date <= Math.floor(new Date(closed.timestamp).valueOf() / 1000)) {
+			// The owner reset this agent's session after the request; the answer stays in the journal as context.
+			return { status: 202, body: { context: true } };
+		}
+		const bridge = this.options.bridge();
+		const originId = request.posting?.originItemId;
+		const originItem = originId ? bridge?.itemFor(originId) : undefined;
+		const originPrivate = originId && !originItem ? bridge?.privateJobFor(originId) : undefined;
+		const context = [`This answers your request ${request.messageId} in the group chat: ${request.text}`];
+		let reply: WorkItem["reply"];
+		if (originItem) {
+			reply = originItem.reply;
+			const where = originItem.reply.kind === "group" && originItem.reply.messageId ? `group message ${originItem.reply.messageId}` : originItem.channel === "endpoint" ? "a queue endpoint instruction" : "the group chat";
+			context.push(`You sent that request while working on ${where} from ${originItem.sender}: ${originItem.text}`);
+		} else if (originPrivate) {
+			reply = { kind: "private", messageId: originPrivate.messageId };
+			context.push(`You sent that request while working on the owner's private message ${originPrivate.messageId}: ${originPrivate.text}`);
+		} else {
+			reply = { kind: "group", chatId: this.config.chatId, messageId: message.messageId };
+		}
+		context.push("Use telegram_group_timeline or telegram_timeline if you need more of that conversation.");
+		const result = await this.options.admit({
+			itemId: groupItemId(this.config.chatId, message.messageId),
+			channel: "group",
+			authority: "peer",
+			sender: `${peer.telegramName} (@${peer.telegramAccount})`,
+			text: message.text || "[empty message]",
+			reply,
+			context,
+		}) as { item: WorkItem; duplicate: boolean } | undefined;
+		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
+	}
+
+	/** After /new, answers to requests sent before now no longer start work. */
+	async closeRequests(): Promise<void> {
+		await this.append({ type: "group_requests_closed", timestamp: this.timestamp() });
 	}
 
 	/** Journals group replies Telegram accepted for this agent, then queues wake-ups for the agents they address. */
@@ -494,9 +537,12 @@ export class GroupRuntime {
 		await this.options.journal.recordMessage(message, this.self!.username);
 		this.options.onJournalChanged?.();
 		const peers = new Set<GroupAgentConfig>();
-		for (const account of mentionedAccounts(post.text)) {
-			const agent = this.agentByAccount(account);
-			if (agent) peers.add(agent);
+		// A request wakes the agents it mentions; an answer never starts new work.
+		if (post.posting.kind === "request") {
+			for (const account of mentionedAccounts(post.text)) {
+				const agent = this.agentByAccount(account);
+				if (agent) peers.add(agent);
+			}
 		}
 		if (post.replyToMessageId) {
 			const target = await this.options.journal.message(this.config.chatId, post.replyToMessageId);
@@ -562,8 +608,7 @@ export class GroupRuntime {
 
 /** A group message becomes at most one work item per agent. */
 export function groupItemId(chatId: number, messageId: number): string {
-	const hex = Buffer.from(`${chatId}:${messageId}`).toString("hex").padEnd(32, "0").slice(0, 32);
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+	return workItemIdForKey("group", `${chatId}:${messageId}`);
 }
 
 function splitForGroup(text: string, limit = 4_000): string[] {

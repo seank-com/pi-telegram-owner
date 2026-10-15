@@ -73,7 +73,10 @@ interface Agent {
 	api: FakeGroupApi;
 	prompts: string[];
 	privateReplies: string[];
+	privateSends: Array<{ text: string; replyTo?: number }>;
 	tools: Map<string, any>;
+	startTurn(): Promise<string>;
+	finishTurn(answer: string): Promise<void>;
 	status(): string;
 	port(): number;
 	emit(name: string, event: object): Promise<void>;
@@ -89,6 +92,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 	const api = new FakeGroupApi(self, ids);
 	const prompts: string[] = [];
 	const privateReplies: string[] = [];
+	const privateSends: Array<{ text: string; replyTo?: number }> = [];
 	const tools = new Map<string, any>();
 	let status = "";
 	let idle = true;
@@ -106,7 +110,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 	createTelegramOwnerExtension({ dependencies: {
 		journal, ownerUserId: OWNER, privateChatId: self.privateChat, agentLabel: self.name, queuePort: 0,
 		source: { async start(handler) { onBatch = handler; return async () => {}; } },
-		async sendReply(text) { privateReplies.push(text); return "1"; },
+		async sendReply(text, replyTo) { privateReplies.push(text); privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
 		groupChat: { config, api, journalOptions, wake },
 	} })(pi);
 	const ctx = {
@@ -117,8 +121,20 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 	const emit = async (name: string, event: object) => {
 		for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
 	};
+	const startTurn = async () => {
+		const prompt = prompts.at(-1)!;
+		await emit("input", { type: "input", source: "extension", text: prompt });
+		await emit("before_agent_start", { type: "before_agent_start", prompt });
+		idle = false;
+		return prompt;
+	};
+	const finishTurn = async (answer: string) => {
+		await emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: answer }] });
+		idle = true;
+		await emit("agent_settled", { type: "agent_settled" });
+	};
 	return {
-		key, journal, api, prompts, privateReplies, tools, emit,
+		key, journal, api, prompts, privateReplies, privateSends, tools, emit, startTurn, finishTurn,
 		status: () => status,
 		port: () => Number(/endpoint=127\.0\.0\.1:(\d+)/.exec(status)?.[1]),
 		batch: (updates) => onBatch!(updates),
@@ -342,4 +358,110 @@ test("journal changes request a coalesced lexical refresh of the group store whe
 	await waitFor(() => requests.length > 0);
 	await new Promise((resolve) => setTimeout(resolve, 400));
 	assert.deepEqual(requests, [{ operation: "refresh", input: { action: "start", store: "telegram-group", mode: "lexical" } }], "two new messages coalesce into one refresh");
+});
+
+function ownerPrivate(agent: AgentKey, messageId: number, text: string): TelegramUpdate {
+	return { update_id: updateId++, message: { message_id: messageId, date: 1_790_000_000 + messageId, text, chat: { id: AGENTS[agent].privateChat, type: "private" }, from: { id: OWNER } } };
+}
+
+async function verified(agents: Record<AgentKey, Agent>): Promise<void> {
+	await waitFor(() => agents.a.status().includes("group=verified") && agents.b.status().includes("group=verified"));
+}
+
+test("a consultation started privately returns its answer to the owner's private message", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	await agents.a.batch([ownerPrivate("a", 300, "Ask the other agent whether the deploy finished.")]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.a.startTurn();
+	const request = await agents.a.tools.get("telegram_group_send").execute("consult-1", { text: "@example_agent_b_bot did the deploy finish?" });
+	await agents.a.finishTurn("I asked Agent B and will report back.");
+	assert.deepEqual(agents.a.privateSends.at(-1), { text: "I asked Agent B and will report back.", replyTo: 300 });
+
+	await waitFor(() => agents.b.prompts.length === 1);
+	await agents.b.runTurn("Yes, at noon.");
+	await waitFor(() => agents.a.prompts.length === 2);
+	const prompt = agents.a.prompts[1]!;
+	assert.match(prompt, /Your final reply goes to the private chat with the owner, as a reply to message 300./);
+	assert.match(prompt, new RegExp(`This answers your request ${request.details.messageId} in the group chat: @example_agent_b_bot did the deploy finish\\?`));
+	assert.match(prompt, /You sent that request while working on the owner's private message 300: Ask the other agent whether the deploy finished./);
+	await agents.a.runTurn("The deploy finished at noon.");
+	assert.deepEqual(agents.a.privateSends.at(-1), { text: "The deploy finished at noon.", replyTo: 300 });
+});
+
+test("an answer to a request made for the owner's group message returns there and wakes nobody else", async (t) => {
+	const { agents, shared } = await twoAgents(t);
+	await verified(agents);
+	const text = "@example_agent_a_bot I need everyone's status";
+	await Promise.all([agents.a.batch([ownerGroupMessage(60, text, { entities: [mention(text, AGENTS.a.username)] })]), agents.b.batch([ownerGroupMessage(60, text, { entities: [mention(text, AGENTS.a.username)] })])]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.a.startTurn();
+	await agents.a.tools.get("telegram_group_send").execute("fanout-1", { text: "@example_agent_b_bot the owner needs your status", replyToMessageId: 60 });
+	await agents.a.finishTurn("Mine: reviewing the build. Asked Agent B.");
+	await waitFor(() => agents.b.prompts.length === 1);
+	assert.match(agents.b.prompts[0]!, /This replies to the owner's message 60: @example_agent_a_bot I need everyone's status/);
+	await agents.b.runTurn("Mine: idle. @example_agent_a_bot thanks!");
+	await waitFor(() => agents.a.prompts.length === 2);
+	assert.match(agents.a.prompts[1]!, /Your final reply goes to the group chat, as a reply to message 60./);
+	await agents.a.runTurn("Both statuses are in.");
+	await waitFor(() => agents.a.api.sent.some((message) => message.text === "Both statuses are in." && message.replyTo === 60));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(agents.b.prompts.length, 1, "neither the answer's mention nor the final summary wakes the other agent");
+	assert.equal((await shared.timeline({ chatId: GROUP, limit: 1 }))[0]!.posting?.kind, "answer");
+});
+
+test("a clarifying question is a request: it wakes the asker, and answers unwind back to the original origin", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const text = "@example_agent_a_bot fix the flaky test";
+	await agents.a.batch([ownerGroupMessage(70, text, { entities: [mention(text, AGENTS.a.username)] })]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.a.startTurn();
+	const ask = await agents.a.tools.get("telegram_group_send").execute("ask-1", { text: "@example_agent_b_bot which test was flaky for you?" });
+	await agents.a.finishTurn("Looking into it.");
+
+	await waitFor(() => agents.b.prompts.length === 1);
+	await agents.b.startTurn();
+	const clarify = await agents.b.tools.get("telegram_group_send").execute("clarify-1", { text: "Do you mean the unit or the package tests?", replyToMessageId: ask.details.messageId });
+	await agents.b.finishTurn("Waiting on your answer.");
+
+	await waitFor(() => agents.a.prompts.length === 2);
+	assert.match(agents.a.prompts[1]!, new RegExp(`Your final reply goes to the group chat, as a reply to message ${clarify.details.messageId}\\.`));
+	await agents.a.runTurn("The package tests.");
+
+	await waitFor(() => agents.b.prompts.length === 2);
+	assert.match(agents.b.prompts[1]!, new RegExp(`Your final reply goes to the group chat, as a reply to message ${ask.details.messageId}\\.`), "the answer to the clarifying question returns to the original request");
+	await agents.b.runTurn("The package test timed out on CI twice.");
+
+	await waitFor(() => agents.a.prompts.length === 3);
+	assert.match(agents.a.prompts[2]!, /Your final reply goes to the group chat, as a reply to message 70./, "and that answer returns to the owner's message");
+});
+
+test("/new ends queued group work with a notice that wakes the requester, and closes outstanding requests", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	agents.b.setIdle(false);
+	const queued = await agents.a.tools.get("telegram_group_send").execute("queued-1", { text: "@example_agent_b_bot please summarize" });
+	await waitFor(() => agents.b.api.sent.some((message) => message.text.startsWith("Queued:") && message.replyTo === queued.details.messageId));
+	assert.equal(agents.b.prompts.length, 0, "the request waits behind B's other work");
+
+	const outstanding = await agents.b.tools.get("telegram_group_send").execute("pending-1", { text: "@example_agent_a_bot can you check logs?" });
+	await waitFor(() => agents.a.prompts.length === 1);
+	assert.match(agents.a.prompts[0]!, /can you check logs\?$/);
+
+	agents.b.setIdle(true);
+	await agents.b.batch([ownerPrivate("b", 400, "/new")]);
+	await waitFor(() => agents.b.journal.records.some((record) => record.type === "command_started"));
+	await agents.b.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
+	await agents.b.emit("session_start", { type: "session_start", reason: "new" });
+	await waitFor(() => agents.b.api.sent.some((message) => message.text === "Not handled: the owner reset Agent B's session." && message.replyTo === queued.details.messageId));
+	assert.match(agents.b.privateReplies.at(-1)!, /^Started a new session\./);
+
+	await agents.a.runTurn("Logs are clean.");
+	await waitFor(() => agents.a.prompts.length === 2);
+	assert.match(agents.a.prompts[1]!, /Not handled: the owner reset Agent B's session\.$/, "the notice answers A's request and wakes A");
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal(agents.b.prompts.some((prompt) => prompt.includes("Logs are clean.")), false, "an answer to a request closed by /new does not start work");
+	assert.ok(agents.b.journal.records.some((record) => record.type === "group_requests_closed"));
+	assert.ok(outstanding.details.messageId);
 });

@@ -143,3 +143,11 @@ test("malformed work item records fail closed", async () => {
 	await assert.rejects(bridge.admitItem({ ...automation("", { kind: "private" }) }), StateCorruptionError);
 	await assert.rejects(bridge.admitItem({ ...peerRequest("x", 0) }), StateCorruptionError);
 });
+
+test("group item IDs are distinct for every message in a chat", async () => {
+	const { groupItemId } = await import("../src/group-runtime.ts");
+	const ids = new Set(Array.from({ length: 2_000 }, (_unused, index) => groupItemId(-1001234567890, 5_000 + index)));
+	assert.equal(ids.size, 2_000);
+	assert.equal(groupItemId(-1001234567890, 5001), groupItemId(-1001234567890, 5001));
+	assert.match(groupItemId(-1, 1), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+});
