@@ -236,8 +236,12 @@ The group has one authoritative record, the shared journal under the
 configured `sharedRoot`, contributed to by every agent. It is the only place
 that holds the whole room, since no agent can receive everything through
 Telegram. It has the same properties as the private archive: a forward-only
-JSONL event log is authoritative, canonical Markdown under `messages/` is its
-projection, and indexes are disposable.
+JSONL event log is authoritative, canonical Markdown is its projection, and
+indexes are disposable. The shared root is dedicated to the group, so notes
+sit directly under it by month (`YYYY/MM/`), photos under `_attachments/`,
+and the event log, lock and archive state under `.telegram-archive/`. The
+private archive keeps the same layout under `messages/` because its
+projection root is the agent's whole workspace.
 
 Writers take an exclusive lock with the same PID and boot-identity recovery as
 the poller lock, assign the next sequence number, append, flush, and update the

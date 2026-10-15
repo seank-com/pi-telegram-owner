@@ -609,7 +609,7 @@ test("project config path follows Pi's default and non-default config directory 
 	await assert.rejects(() => stat(join(root, CONFIG_DIR_NAME)), { code: "ENOENT" });
 });
 
-test("project configuration is absent without writes and validates protected token sources", async (t) => {
+test("project configuration is absent without writes and validates the protected token source", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "telegram-config-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const base = join(root, CONFIG_DIR_NAME, "telegram-owner");
@@ -630,13 +630,8 @@ test("project configuration is absent without writes and validates protected tok
 	await writeFile(configPath, JSON.stringify({ ownerUserId: 0, privateChatId: CHAT, tokenEnv: "FIXTURE_TELEGRAM_BOT_TOKEN" }), { mode: 0o600 });
 	await assert.rejects(() => loadTelegramOwnerConfig(configPath, { FIXTURE_TELEGRAM_BOT_TOKEN: "test-only" }), /ownerUserId/);
 
-	for (const source of [
-		{},
-		{ tokenEnv: "FIXTURE_TELEGRAM_BOT_TOKEN", tokenFile: join(base, "bot-token") },
-	]) {
-		await writeFile(configPath, JSON.stringify({ ownerUserId: OWNER, privateChatId: CHAT, ...source }), { mode: 0o600 });
-		await assert.rejects(() => loadTelegramOwnerConfig(configPath, {}), /exactly one/);
-	}
+	await writeFile(configPath, JSON.stringify({ ownerUserId: OWNER, privateChatId: CHAT }), { mode: 0o600 });
+	await assert.rejects(() => loadTelegramOwnerConfig(configPath, {}), /conventional environment variable name/);
 	for (const tokenEnv of ["", "9TOKEN", "TOKEN-NAME", "TOKEN NAME", "TOKEN.NAME"]) {
 		await writeFile(configPath, JSON.stringify({ ownerUserId: OWNER, privateChatId: CHAT, tokenEnv }), { mode: 0o600 });
 		await assert.rejects(() => loadTelegramOwnerConfig(configPath, {}), /conventional environment variable name/);
@@ -690,16 +685,10 @@ test("project configuration is absent without writes and validates protected tok
 		assert.equal(optedOut.config?.markdownProjection, undefined);
 	}
 
-	const tokenPath = join(base, "bot-token");
-	await writeFile(tokenPath, "migration-only-token\n", { mode: 0o644 });
-	await writeFile(configPath, JSON.stringify({ ownerUserId: OWNER, privateChatId: CHAT, tokenFile: tokenPath }), { mode: 0o600 });
-	await assert.rejects(() => loadTelegramOwnerConfig(configPath, {}), /token file permissions/);
-	await chmod(tokenPath, 0o600);
-	const migrated = await loadTelegramOwnerConfig(configPath, {});
-	assert.equal(migrated.kind, "configured");
-	assert.equal(JSON.stringify(migrated).includes("migration-only-token"), false);
+	const configured = await loadTelegramOwnerConfig(configPath, { FIXTURE_TELEGRAM_BOT_TOKEN: "test-only-token" });
+	assert.equal(configured.kind, "configured");
+	assert.equal(JSON.stringify(configured).includes("test-only-token"), false);
 	assert.equal((await stat(configPath)).mode & 0o777, 0o600);
-	assert.equal((await stat(tokenPath)).mode & 0o777, 0o600);
 });
 
 test("independent project roots keep configuration and durable state isolated", async (t) => {

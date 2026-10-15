@@ -57,9 +57,10 @@ loading Pi. Pure helpers are exported as `/format`, `/archive` and `/importer`.
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
 `npm pack --dry-run`, `npm run test:package`. Run `npm run hooks:install` once per
-checkout to refuse commits and pushes that add any line of `~/.pii` (matched
+clone to refuse commits and pushes that add any line of `~/.pii` (matched
 case-insensitively) or any value of 8 or more characters from `~/.env`;
-`npm run check:private -- --all` checks every tracked file. Default tests need no companion or
+`npm run check:private -- --all` checks every tracked file. The setting
+persists across branches but has no effect on a branch without `.githooks/`. Default tests need no companion or
 real Telegram. Explicit composition checks use actual candidate tarballs:
 
 ```bash

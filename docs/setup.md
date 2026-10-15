@@ -21,9 +21,7 @@ Create a protected project configuration directory (0700) and config.json (0600)
 
 Place it at <project>/.pi/telegram-owner/config.json (or the selected Pi config
 directory). Load the named environment variable through the operator's existing
-launch mechanism. Deprecated tokenFile and archive configuration are retained
-for migration compatibility; new configurations use tokenEnv and markdownProjection.
-The extension validates one owner and private chat before accepting updates.
+launch mechanism. The extension validates one owner and private chat before accepting updates.
 
 Projection defaults to the project root. An absolute markdownProjection.root and
 sessionRoot may be supplied; rootId is a safe stable namespace identifier.
@@ -121,8 +119,8 @@ match the owner or the running bot. All agents must describe the same roster;
 election ranks depend on it.
 
 For group recall, add a store to each agent's datastore configuration rooted at
-`<sharedRoot>/messages` with the same name as `groupChat.datastore.store`,
-including `**/*.md`. Exclude journal state and media as for the private archive.
+`<sharedRoot>` with the same name as `groupChat.datastore.store`, including
+`**/*.md` and excluding `.telegram-archive/**` and `_attachments/**`.
 
 After starting the agents, `/status` in the private chat reports group
 verification. If membership does not match, the agent names the mismatch and

@@ -112,10 +112,7 @@ async function requireProtectedDirectory(path: string): Promise<void> {
 	}
 }
 
-/**
- * Loads one project-local configuration. `tokenFile` is deprecated migration
- * compatibility; new configurations must use `tokenEnv`.
- */
+/** Loads one project-local configuration. */
 export async function loadTelegramOwnerConfig(
 	configPath: string,
 	environment: NodeJS.ProcessEnv = process.env,
@@ -147,9 +144,6 @@ export async function loadTelegramOwnerConfig(
 		formattedDelivery?: unknown;
 		inboundQuietWindowMs?: unknown;
 		markdownProjection?: unknown;
-		archive?: unknown;
-		/** @deprecated Migration compatibility only. Use tokenEnv. */
-		tokenFile?: unknown;
 	};
 	for (const [name, id] of [
 		["ownerUserId", value.ownerUserId],
@@ -159,31 +153,15 @@ export async function loadTelegramOwnerConfig(
 			throw new ConfigurationError(`${name} must be a positive integer`);
 		}
 	}
-	const hasTokenEnv = value.tokenEnv !== undefined;
-	const hasTokenFile = value.tokenFile !== undefined;
-	if (hasTokenEnv === hasTokenFile) {
-		throw new ConfigurationError("Telegram owner config must specify exactly one of tokenEnv or deprecated tokenFile");
+	if (typeof value.tokenEnv !== "string" || !ENVIRONMENT_IDENTIFIER.test(value.tokenEnv)) {
+		throw new ConfigurationError("tokenEnv must be a conventional environment variable name");
 	}
-	let token: string;
-	if (hasTokenEnv) {
-		if (typeof value.tokenEnv !== "string" || !ENVIRONMENT_IDENTIFIER.test(value.tokenEnv)) {
-			throw new ConfigurationError("tokenEnv must be a conventional environment variable name");
-		}
-		const selected = environment[value.tokenEnv];
-		if (selected === undefined || selected.length === 0) {
-			throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} is not set or empty`);
-		}
-		token = selected;
-		if (/\s/.test(token)) {
-			throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} must contain one non-empty token`);
-		}
-	} else {
-		if (typeof value.tokenFile !== "string" || !isAbsolute(value.tokenFile)) {
-			throw new ConfigurationError("deprecated tokenFile must be an absolute path");
-		}
-		await requireProtectedFile(value.tokenFile, "Telegram bot token file");
-		token = (await readFile(value.tokenFile, "utf8")).trim();
-		if (!token || /\s/.test(token)) throw new ConfigurationError("Telegram bot token file must contain one non-empty token");
+	const token = environment[value.tokenEnv];
+	if (token === undefined || token.length === 0) {
+		throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} is not set or empty`);
+	}
+	if (/\s/.test(token)) {
+		throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} must contain one non-empty token`);
 	}
 	const datastore = parseDatastorePolicy(value.datastore);
 	const ownerUserId = value.ownerUserId as number;
@@ -193,9 +171,8 @@ export async function loadTelegramOwnerConfig(
 	const formattedDelivery = value.formattedDelivery !== false;
 	const inboundQuietWindowMs = value.inboundQuietWindowMs ?? DEFAULT_INBOUND_QUIET_WINDOW_MS;
 	if (!Number.isSafeInteger(inboundQuietWindowMs) || Number(inboundQuietWindowMs) < 100 || Number(inboundQuietWindowMs) > 5_000) throw new ConfigurationError("inboundQuietWindowMs must be an integer from 100 through 5000");
-	if (value.markdownProjection !== undefined && value.archive !== undefined) throw new ConfigurationError("Configure markdownProjection, not both markdownProjection and deprecated archive");
 	let markdownProjection: TelegramMarkdownProjectorConfig | undefined;
-	const projectionValue = value.markdownProjection ?? value.archive ?? { enabled: true };
+	const projectionValue = value.markdownProjection ?? { enabled: true };
 	if (projectionValue !== false) {
 		if (!projectionValue || typeof projectionValue !== "object" || Array.isArray(projectionValue)) throw new ConfigurationError("markdownProjection must be false or an object");
 		const item = projectionValue as { enabled?: unknown; root?: unknown; sessionRoot?: unknown; rootId?: unknown; roleSlugs?: unknown };
