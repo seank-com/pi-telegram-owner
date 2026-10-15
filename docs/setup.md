@@ -161,8 +161,8 @@ Use synthetic fixtures in tests; do not commit personal exports or mappings.
 
 All archive/control schemas use `pi-telegram-owner/<kind>/v1`: `source-set`,
 `first-pi-boundary`, `speaker-map`, `import-report`, `import-checkpoint`,
-`archive-manifest`, `media-event`, `message`, and the shared group journal's
-`group-event`. Earlier names and boundary
+`archive-manifest`, `media-event`, `message`, and for the shared group root
+`group-event` (journal entries) and `group-message` (notes). Earlier names and boundary
 shapes have no aliases in this unpublished package. Existing Telegram Desktop
 HTML and media exports can be reused. Regenerate the source manifest, speaker
 map and explicit boundary, then create a fresh dry-run checkpoint and publish
