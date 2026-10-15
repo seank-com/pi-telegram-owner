@@ -11,6 +11,8 @@ export const GROUP_EVENT_SCHEMA = "pi-telegram-owner/group-event/v1";
 export const GROUP_MESSAGE_NOTE_SCHEMA = "pi-telegram-owner/group-message/v1";
 export const GROUP_STATE_DIRECTORY = ".telegram-archive";
 export const GROUP_ATTACHMENTS_DIRECTORY = "_attachments";
+/** How the owner appears as a sender in the group journal. */
+export const GROUP_OWNER_SENDER = "Owner";
 
 export interface TelegramEntity {
 	type: string;
@@ -37,6 +39,8 @@ export interface GroupMessage {
 	replyToMessageId?: number;
 	/** Agent posts: a request sent with telegram_group_send, or an answer. */
 	posting?: { kind: "request" | "answer"; originItemId?: string };
+	/** Recorded from Telegram's copy inside a reply; the sender's own record supersedes it. */
+	source?: "reply-copy";
 	media?: { kind: "photo" | "document" | "other"; fileName?: string; mimeType?: string; size?: number; attachment?: string };
 }
 
@@ -71,8 +75,28 @@ export interface RecordResult {
 
 /** Identity used to decide whether two observations describe the same message. */
 function fingerprint(message: GroupMessage): string {
-	return JSON.stringify([message.chatId, message.messageId, message.senderId, message.date, message.text, message.replyToMessageId ?? null]);
+	return JSON.stringify([message.chatId, message.messageId, message.senderId, message.text]);
 }
+
+/** The latest recorded version of each message; an agent's own post supersedes a reply copy. */
+function latestMessages(events: readonly GroupEvent[], chatId?: number): Map<string, GroupMessage> {
+	const messages = new Map<string, GroupMessage>();
+	for (const event of events) {
+		if (event.kind === "message" && (chatId === undefined || event.message.chatId === chatId)) messages.set(key(event.message.chatId, event.message.messageId), event.message);
+	}
+	return messages;
+}
+
+function findClaim(events: readonly GroupEvent[], chatId: number, messageIds: readonly number[]): string | undefined {
+	return events.find((event): event is Extract<GroupEvent, { kind: "claim" }> => event.kind === "claim" && event.chatId === chatId && messageIds.includes(event.messageId))?.agent;
+}
+
+/** Contention that resolves when another agent finishes; anything else is a broken lock. */
+function lockBusy(error: PollerLockError): boolean {
+	return /already in progress|is held or owner cannot be proven dead/.test(error.message);
+}
+
+export class GroupJournalClosedError extends Error {}
 
 function key(chatId: number, messageId: number): string {
 	return `${chatId}:${messageId}`;
@@ -139,6 +163,7 @@ export class GroupJournal {
 	private readonly lockPath: string;
 	private readonly options: GroupJournalOptions;
 	private tail: Promise<unknown> = Promise.resolve();
+	private closed = false;
 
 	constructor(root: string, options: GroupJournalOptions = {}) {
 		this.root = root;
@@ -149,6 +174,18 @@ export class GroupJournal {
 
 	private now(): string {
 		return new Date((this.options.now ?? Date.now)()).toISOString();
+	}
+
+	/** Stops waiting for the lock; pending and later writes fail. */
+	close(): void {
+		this.closed = true;
+	}
+
+	/** The shared root must be a directory owned by this account with no group or other access. */
+	async checkRoot(): Promise<void> {
+		const info = await lstat(this.root).catch(() => undefined);
+		if (!info || !info.isDirectory() || info.isSymbolicLink()) throw new Error(`the shared root ${this.root} is not a directory`);
+		if ((process.getuid && info.uid !== process.getuid()) || (info.mode & 0o077) !== 0) throw new Error(`the shared root ${this.root} must be owned by this account with mode 0700`);
 	}
 
 	/** Reads every complete event. A fragment left by a crashed writer is skipped. */
@@ -173,49 +210,68 @@ export class GroupJournal {
 		return events;
 	}
 
+	/** A message by its ID, or by any part ID of a split agent post. */
 	async message(chatId: number, messageId: number): Promise<GroupMessage | undefined> {
-		const wanted = key(chatId, messageId);
-		for (const event of await this.events()) {
-			if (event.kind === "message" && (key(event.message.chatId, event.message.messageId) === wanted || event.message.partIds?.some((part) => key(event.message.chatId, part) === wanted))) return event.message;
-		}
-		return undefined;
+		const messages = latestMessages(await this.events(), chatId);
+		return messages.get(key(chatId, messageId)) ?? [...messages.values()].find((message) => message.partIds?.includes(messageId));
 	}
 
-	async claimFor(chatId: number, messageId: number): Promise<string | undefined> {
-		return (await this.events()).find((event): event is Extract<GroupEvent, { kind: "claim" }> => event.kind === "claim" && event.chatId === chatId && event.messageId === messageId)?.agent;
+	/** Every journaled message ID in a chat, including split-post parts. */
+	async messageIds(chatId: number): Promise<Set<number>> {
+		const ids = new Set<number>();
+		for (const message of latestMessages(await this.events(), chatId).values()) {
+			ids.add(message.messageId);
+			for (const part of message.partIds ?? []) ids.add(part);
+		}
+		return ids;
+	}
+
+	/** The agent that claimed any of these messages, if one has. */
+	async claimFor(chatId: number, messageIds: number | readonly number[]): Promise<string | undefined> {
+		return findClaim(await this.events(), chatId, typeof messageIds === "number" ? [messageIds] : messageIds);
 	}
 
 	/** Messages in Telegram order, optionally before or after a message ID. */
 	async timeline(input: { chatId: number; before?: number; after?: number; limit: number }): Promise<GroupMessage[]> {
-		const messages = (await this.events())
-			.filter((event): event is Extract<GroupEvent, { kind: "message" }> => event.kind === "message" && event.message.chatId === input.chatId)
-			.map((event) => event.message)
+		const messages = [...latestMessages(await this.events(), input.chatId).values()]
 			.filter((message) => (input.before === undefined || message.messageId < input.before) && (input.after === undefined || message.messageId > input.after))
 			.sort((a, b) => a.messageId - b.messageId);
 		return input.after !== undefined ? messages.slice(0, input.limit) : messages.slice(-input.limit);
 	}
 
-	/** Records a message once. Identical observations are no-ops; a different one is recorded as a conflict. */
+	/**
+	 * Records a message once. Identical observations are no-ops and a different
+	 * one is recorded as a conflict, except that the sender's own record of a
+	 * message supersedes Telegram's reply copy of it.
+	 */
 	recordMessage(message: GroupMessage, recordedBy: string): Promise<RecordResult> {
 		return this.withLock(async (events, append) => {
-			const existing = events.find((event): event is Extract<GroupEvent, { kind: "message" }> => event.kind === "message" && event.message.chatId === message.chatId && event.message.messageId === message.messageId);
-			if (!existing) {
+			const existing = latestMessages(events, message.chatId).get(key(message.chatId, message.messageId));
+			if (!existing || (existing.source === "reply-copy" && message.source !== "reply-copy")) {
 				const event = await append({ kind: "message", message, recordedBy });
 				await this.project(message);
 				return { outcome: "recorded", event };
 			}
-			if (fingerprint(existing.message) === fingerprint(message)) return { outcome: "duplicate", event: existing };
+			const recorded = events.findLast((event) => event.kind === "message" && event.message.chatId === message.chatId && event.message.messageId === message.messageId)!;
+			if (fingerprint(existing) === fingerprint(message) || message.source === "reply-copy") return { outcome: "duplicate", event: recorded };
 			const event = await append({ kind: "conflict", chatId: message.chatId, messageId: message.messageId, observed: message, recordedBy });
 			return { outcome: "conflict", event };
 		});
 	}
 
-	/** Atomically claims a message for one agent. Returns the winning agent. */
-	claim(chatId: number, messageId: number, agent: string): Promise<{ agent: string; won: boolean }> {
+	/**
+	 * Atomically claims messages for one agent. Without force, a claim by
+	 * another agent on any of them wins; with force, the unclaimed ones are
+	 * claimed regardless.
+	 */
+	claim(chatId: number, messageIds: number | readonly number[], agent: string, options: { force?: boolean } = {}): Promise<{ agent: string; won: boolean }> {
+		const ids = typeof messageIds === "number" ? [messageIds] : [...messageIds];
 		return this.withLock(async (events, append) => {
-			const existing = events.find((event): event is Extract<GroupEvent, { kind: "claim" }> => event.kind === "claim" && event.chatId === chatId && event.messageId === messageId);
-			if (existing) return { agent: existing.agent, won: existing.agent === agent };
-			await append({ kind: "claim", chatId, messageId, agent });
+			const other = events.find((event): event is Extract<GroupEvent, { kind: "claim" }> => event.kind === "claim" && event.chatId === chatId && ids.includes(event.messageId) && event.agent !== agent);
+			if (other && !options.force) return { agent: other.agent, won: false };
+			for (const messageId of ids) {
+				if (!events.some((event) => event.kind === "claim" && event.chatId === chatId && event.messageId === messageId)) await append({ kind: "claim", chatId, messageId, agent });
+			}
 			return { agent, won: true };
 		});
 	}
@@ -234,34 +290,35 @@ export class GroupJournal {
 		return readFile(join(this.root, relativePath));
 	}
 
-	/** Posts and records at most one election notice per message; returns the notice's message ID. */
-	reserveNotice(chatId: number, messageId: number, agent: string, send: () => Promise<number>): Promise<number> {
+	/**
+	 * Posts and records at most one election notice per item, and none once any
+	 * of its messages is claimed. Returns the notice's message ID, if one exists.
+	 */
+	reserveNotice(chatId: number, messageIds: readonly number[], agent: string, send: () => Promise<number>): Promise<number | undefined> {
 		return this.withLock(async (events, append) => {
-			const existing = events.find((event): event is Extract<GroupEvent, { kind: "election_notice" }> => event.kind === "election_notice" && event.chatId === chatId && event.messageId === messageId);
+			const existing = events.find((event): event is Extract<GroupEvent, { kind: "election_notice" }> => event.kind === "election_notice" && event.chatId === chatId && messageIds.includes(event.messageId));
 			if (existing) return existing.noticeMessageId;
+			if (findClaim(events, chatId, messageIds)) return undefined;
 			const noticeMessageId = await send();
-			await append({ kind: "election_notice", chatId, messageId, noticeMessageId, agent });
+			await append({ kind: "election_notice", chatId, messageId: messageIds[0]!, noticeMessageId, agent });
 			return noticeMessageId;
 		});
 	}
 
-	async noticeFor(chatId: number, messageId: number): Promise<number | undefined> {
-		return (await this.events()).find((event): event is Extract<GroupEvent, { kind: "election_notice" }> => event.kind === "election_notice" && event.chatId === chatId && event.messageId === messageId)?.noticeMessageId;
+	async noticeFor(chatId: number, messageIds: number | readonly number[]): Promise<number | undefined> {
+		const ids = typeof messageIds === "number" ? [messageIds] : messageIds;
+		return (await this.events()).find((event): event is Extract<GroupEvent, { kind: "election_notice" }> => event.kind === "election_notice" && event.chatId === chatId && ids.includes(event.messageId))?.noticeMessageId;
 	}
 
-	/** Records an event that needs no deduplication beyond what the caller checks under the lock. */
-	appendEvent<T>(decide: (events: readonly GroupEvent[]) => GroupEventInput | undefined, result: (event: GroupEvent | undefined) => T): Promise<T> {
-		return this.withLock(async (events, append) => {
-			const input = decide(events);
-			return result(input ? await append(input) : undefined);
-		});
+	async appendEvent(input: GroupEventInput): Promise<GroupEvent> {
+		return this.withLock((_events, append) => append(input));
 	}
 
 	/** Rewrites any missing or outdated note from the event log. */
 	async rebuildProjection(): Promise<number> {
 		let written = 0;
-		for (const event of await this.events()) {
-			if (event.kind === "message" && await this.project(event.message)) written += 1;
+		for (const message of latestMessages(await this.events()).values()) {
+			if (await this.project(message)) written += 1;
 		}
 		return written;
 	}
@@ -275,7 +332,7 @@ export class GroupJournal {
 		return true;
 	}
 
-	private withLock<T>(work: (events: readonly GroupEvent[], append: (input: GroupEventInput) => Promise<GroupEvent>) => Promise<T>): Promise<T> {
+	private withLock<T>(work: (events: GroupEvent[], append: (input: GroupEventInput) => Promise<GroupEvent>) => Promise<T>): Promise<T> {
 		const run = this.tail.then(async () => {
 			const lock = await this.acquire();
 			try {
@@ -334,14 +391,22 @@ export class GroupJournal {
 		return this.retryWhileBusy(() => lock.release());
 	}
 
-	/** Another agent holds the lock or its guard briefly; a dead holder is reclaimed by PollerLock. */
+	/**
+	 * Waits while another agent holds the lock or its guard; a dead holder is
+	 * reclaimed by PollerLock. A lock that stays unreadable or unsafe is
+	 * reported instead of waited on, so an operator can inspect it.
+	 */
 	private async retryWhileBusy<T>(operation: () => Promise<T>): Promise<T> {
 		const sleep = this.options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+		let unsafeAttempts = 0;
 		for (let attempt = 0; ; attempt++) {
+			if (this.closed) throw new GroupJournalClosedError("The group journal is closed");
 			try {
 				return await operation();
 			} catch (error) {
 				if (!(error instanceof PollerLockError) || /boot identity/.test(error.message)) throw error;
+				// A lock being created is briefly unreadable; one that stays that way is broken.
+				if (!lockBusy(error) && ++unsafeAttempts > 50) throw new Error(`The shared journal lock ${this.lockPath} is unreadable or unsafe; check that no agent is writing, then remove it (${error.message})`);
 				await sleep(Math.min(1_000, 10 * 2 ** Math.min(attempt, 7)) * (0.5 + Math.random() / 2));
 			}
 		}

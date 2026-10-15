@@ -7,7 +7,7 @@ import { parse } from "parse5";
 import { parse as parseYaml } from "yaml";
 
 import { TelegramMarkdownProjector, type PublicationResult } from "./markdown-projector.ts";
-import { GroupJournal, type GroupJournalOptions, type GroupMessage } from "./group-journal.ts";
+import { GROUP_OWNER_SENDER, GroupJournal, type GroupJournalOptions, type GroupMessage } from "./group-journal.ts";
 import { markdownCompatibilityKey, markdownToPlainText, TELEGRAM_FORMAT_COMPAT_VERSION, telegramSafeHref } from "./format.ts";
 
 export const IMPORTER_VERSION = "telegram-desktop-pi-v2" as const;
@@ -848,15 +848,7 @@ async function exportPages(exportRoot: string): Promise<string[]> {
 }
 
 async function writeControlFile(path: string, value: unknown): Promise<void> {
-	const temporary = `${path}.${randomBytes(6).toString("hex")}.tmp`;
-	const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-	try {
-		await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await rename(temporary, path);
+	await atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function placeholderEntries(map: { speakers: Record<string, Record<string, unknown>> }): string[] {
@@ -930,7 +922,7 @@ export async function importTelegramGroupExport(options: GroupImportOptions): Pr
 				chatId: options.chatId,
 				messageId: block.messageId,
 				senderId: speaker.userId,
-				sender: speaker.kind === "owner" ? "Owner" : block.senderName,
+				sender: speaker.kind === "owner" ? GROUP_OWNER_SENDER : block.senderName,
 				senderKind: speaker.kind,
 				date: Math.floor(new Date(telegramExportTimestamp(block.date)).valueOf() / 1000),
 				text: block.text,
@@ -945,8 +937,9 @@ export async function importTelegramGroupExport(options: GroupImportOptions): Pr
 	let alreadyPresent = 0;
 	let imported = 0;
 	let photos = 0;
+	const journaled = await journal.messageIds(options.chatId);
 	for (const { photoPath, ...message } of messages) {
-		if (await journal.message(options.chatId, message.messageId)) {
+		if (journaled.has(message.messageId)) {
 			alreadyPresent += 1;
 			continue;
 		}

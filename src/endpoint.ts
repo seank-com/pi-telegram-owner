@@ -119,3 +119,13 @@ export async function startQueueEndpoint(port: number, handlers: QueueEndpointHa
 		}),
 	};
 }
+
+/** Posts JSON to another agent's endpoint on this host; undefined when it cannot be reached in time. */
+export async function postToPeer(port: number, path: "/queue" | "/coordinate", body: unknown, timeoutMs = 10_000): Promise<EndpointResponse | undefined> {
+	try {
+		const response = await fetch(`http://${QUEUE_ENDPOINT_HOST}:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+		return { status: response.status, body: await response.json().catch(() => undefined) };
+	} catch {
+		return undefined;
+	}
+}

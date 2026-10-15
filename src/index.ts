@@ -26,7 +26,7 @@ import {
 	type TelegramImageRef,
 	type TelegramUpdate,
 } from "./core.ts";
-import { parseQueueRequest, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
+import { parseQueueRequest, postToPeer, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
 import { GroupJournal, type GroupJournalOptions } from "./group-journal.ts";
 import { GroupRuntime, type GroupRuntimeOptions, type GroupTelegramApi } from "./group-runtime.ts";
 import { GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, registerGroupRecallTool, registerGroupTimelineTool } from "./group-tools.ts";
@@ -86,6 +86,7 @@ export interface PrototypeDependencies {
 		journalOptions?: GroupJournalOptions;
 		wake?: GroupRuntimeOptions["wake"];
 		coordinate?: GroupRuntimeOptions["coordinate"];
+		retryDelayMs?: GroupRuntimeOptions["retryDelayMs"];
 	};
 	/** Local queue endpoint port on 127.0.0.1; 0 selects a free port. */
 	queuePort?: number;
@@ -340,9 +341,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				try {
 					messageId = await transport.sendActivity(queuedNoticeText(agentLabel, position), new AbortController().signal, anchorOf(job));
 				} catch (error) {
+					// One unavailable destination, such as a paused group, must not hide private notices.
 					lastActivityError = `queued: ${sanitizeError(error)}`;
 					updateStatus();
-					return;
+					continue;
 				}
 				await bridge.recordActivityStarted(job.jobId, messageId);
 			}
@@ -374,10 +376,19 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				},
 				runtimeDependencies?.resolveImages,
 				async (item) => {
-					if (!groupJournal) throw new Error("Group images are unavailable without the group chat");
-					const journal = groupJournal;
-					return Promise.all((item.images ?? []).map(async (image) => ({ data: (await journal.readAttachment(image.path)).toString("base64"), mimeType: image.mimeType })));
+					// An image that cannot be read is left out rather than holding the queue.
+					const images = [];
+					for (const image of item.images ?? []) {
+						try {
+							if (!groupJournal) throw new Error("the group chat is not configured");
+							images.push({ data: (await groupJournal.readAttachment(image.path)).toString("base64"), mimeType: image.mimeType });
+						} catch (error) {
+							lastGroupError = `image: ${sanitizeError(error)}`;
+						}
+					}
+					return images;
 				},
+				(job) => job.item?.reply.kind !== "group" || Boolean(groupRuntime?.verified),
 			);
 			updateStatus();
 		};
@@ -585,7 +596,23 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			return !bridge.activeJob && queued.owner + queued.peer === 0 && bridge.nextBatchReadyDelayMs === undefined && bridge.pendingReplyCount === 0;
 		};
 
-		const isBusy = (): boolean => Boolean(bridge?.activeJob) || compacting || switching || (currentContext ? !currentContext.isIdle() : false);
+		const isBusy = (): boolean => !electionIdle();
+
+		/** Durably admits a work item, then dispatches it or posts its queued notice. */
+		const admitAndDispatch = async (input: Parameters<TelegramOwnerBridge["admitItem"]>[0]) => {
+			if (!bridge) throw new Error("The agent's Telegram transport is not running");
+			const result = await bridge.admitItem(input);
+			try {
+				if (currentContext) {
+					await dispatchIfIdle(currentContext);
+					await postQueuedNotices();
+				}
+			} catch (error) {
+				noteError(error);
+			}
+			updateStatus();
+			return result;
+		};
 
 		const endpointHandlers = (ownGeneration: number): QueueEndpointHandlers => ({
 			queue: async (body) => {
@@ -597,20 +624,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				if (!group && (request.kind === "group-message" || request.reply === "group")) return { status: 409, body: { error: "The group chat is not configured" } };
 				if (request.kind === "group-message") return group!.acceptWakeUp(request.messageId);
 				const reply = request.reply === "group" ? { kind: "group" as const, chatId: group!.config.chatId } : { kind: request.reply };
-				const admitted = await serialized(async () => {
-					if (generation !== ownGeneration || !bridge) return undefined;
-					const result = await bridge.admitItem({ channel: "endpoint", authority: "owner", sender: request.source, text: request.text, reply, ...(request.id ? { idempotencyKey: request.id } : {}) });
-					try {
-						if (currentContext) {
-							await dispatchIfIdle(currentContext);
-							await postQueuedNotices();
-						}
-					} catch (error) {
-						noteError(error);
-					}
-					updateStatus();
-					return result;
-				});
+				const admitted = await serialized(async () => (generation === ownGeneration && bridge ? admitAndDispatch({ channel: "endpoint", authority: "owner", sender: request.source, text: request.text, reply, ...(request.id ? { idempotencyKey: request.id } : {}) }) : undefined));
 				if (!admitted) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
 				return { status: 202, body: { itemId: admitted.item.itemId, duplicate: admitted.duplicate } };
 			},
@@ -663,47 +677,15 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				journal: groupJournal,
 				bridge: () => (generation === ownGeneration ? bridge : undefined),
 				admit: (input) => serialized(async () => {
-					if (generation !== ownGeneration || !bridge) throw new Error("The agent's Telegram transport is not running");
-					const result = await bridge.admitItem(input);
-					try {
-						if (currentContext) {
-							await dispatchIfIdle(currentContext);
-							await postQueuedNotices();
-						}
-					} catch (error) {
-						noteError(error);
-					}
-					updateStatus();
-					return result;
+					if (generation !== ownGeneration) throw new Error("The agent's Telegram transport is not running");
+					return admitAndDispatch(input);
 				}),
 				// The same window the bridge applies to private messages.
 				quietWindowMs: deps.inboundQuietWindowMs ?? (options.dependencies ? 0 : DEFAULT_INBOUND_QUIET_WINDOW_MS),
 				wake: group.wake,
-				coordinate: group.coordinate ?? (async (peer, body) => {
-					try {
-						const response = await fetch(`http://${QUEUE_ENDPOINT_HOST}:${peer.queuePort}/coordinate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-						return { status: response.status, body: await response.json() };
-					} catch {
-						return undefined;
-					}
-				}),
-				claimWhenIdle: (claim) => serialized(async () => {
-					if (generation !== ownGeneration || !bridge || !electionIdle()) return "busy" as const;
-					const input = await claim();
-					if (input) {
-						await bridge.admitItem(input);
-						try {
-							if (currentContext) {
-								await dispatchIfIdle(currentContext);
-								await postQueuedNotices();
-							}
-						} catch (error) {
-							noteError(error);
-						}
-						updateStatus();
-					}
-					return "done" as const;
-				}),
+				...(group.retryDelayMs ? { retryDelayMs: group.retryDelayMs } : {}),
+				coordinate: group.coordinate ?? ((peer, body) => postToPeer(peer.queuePort, "/coordinate", body)),
+				isIdle: () => generation === ownGeneration && electionIdle(),
 				report: (text) => { void deps.sendReply(text).catch((error) => noteError(error)); },
 				onError: (error) => { lastGroupError = sanitizeError(error); updateStatus(); },
 				onStatus: updateStatus,

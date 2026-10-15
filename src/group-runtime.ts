@@ -11,8 +11,8 @@ import {
 	type WorkItem,
 	MAX_IMAGE_BYTES,
 } from "./core.ts";
-import type { EndpointResponse } from "./endpoint.ts";
-import type { GroupJournal, GroupMessage, TelegramEntity } from "./group-journal.ts";
+import { postToPeer, type EndpointResponse } from "./endpoint.ts";
+import { GROUP_OWNER_SENDER, type GroupJournal, type GroupMessage, type TelegramEntity } from "./group-journal.ts";
 import { TelegramReplyAnchorError, type GroupAgentConfig, type GroupChatConfig } from "./runtime.ts";
 
 /** The Telegram calls the group runtime makes against the configured group. */
@@ -49,11 +49,8 @@ export interface GroupRuntimeOptions {
 	onStatus?(): void;
 	/** The shared journal gained entries; group search indexes may need a refresh. */
 	onJournalChanged?(): void;
-	/**
-	 * Runs claim inside the agent's queue reservation when the agent is idle, then
-	 * admits the item it returns. Resolves "busy" without calling claim otherwise.
-	 */
-	claimWhenIdle?(claim: () => Promise<(Omit<WorkItem, "itemId" | "timestamp"> & { itemId: string }) | undefined>): Promise<"busy" | "done">;
+	/** True when nothing is running, queued, being collected or awaiting delivery. */
+	isIdle?(): boolean;
 	/** Posts a coordination message to a peer; undefined when it cannot be reached. */
 	coordinate?(peer: GroupAgentConfig, body: unknown): Promise<{ status: number; body: unknown } | undefined>;
 	now?: () => number;
@@ -64,17 +61,12 @@ export interface GroupRuntimeOptions {
 export type MembershipState = { state: "verifying" } | { state: "verified" } | { state: "unverified"; reason: string };
 
 const MEMBER_STATUSES = new Set(["creator", "administrator", "member", "restricted"]);
-const OWNER_SENDER = "Owner";
 
 async function defaultWake(peer: GroupAgentConfig, messageId: number): Promise<WakeResult> {
-	try {
-		const response = await fetch(`http://127.0.0.1:${peer.queuePort}/queue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: "group-message", messageId }) });
-		if (response.status === 202) return "accepted";
-		if (response.status === 409 || response.status === 400) return "rejected";
-		return "retry";
-	} catch {
-		return "retry";
-	}
+	const response = await postToPeer(peer.queuePort, "/queue", { kind: "group-message", messageId });
+	if (response?.status === 202) return "accepted";
+	if (response?.status === 409 || response?.status === 400) return "rejected";
+	return "retry";
 }
 
 /** Agent usernames mentioned as @username in text, as Telegram detects them. */
@@ -85,7 +77,7 @@ export function mentionedAccounts(text: string): string[] {
 /** Group chat behavior for one agent: publication, routing, membership and peer delivery. */
 export class GroupRuntime {
 	private readonly options: GroupRuntimeOptions;
-	private self?: { id: number; username: string };
+	private self?: { id: number; username: string; firstName: string };
 	private membership: MembershipState = { state: "verifying" };
 	private chain: Promise<void> = Promise.resolve();
 	private stopped = false;
@@ -93,6 +85,8 @@ export class GroupRuntime {
 	private retryTimer?: ReturnType<typeof setTimeout>;
 	private retryAttempt = 0;
 	private lastReported?: string;
+	private lastErrorReported?: string;
+	private readonly wakeAttempts = new Map<string, number>();
 
 	/** Replies and transient messages in the group; sends are unavailable while membership is unverified. */
 	readonly transport: {
@@ -151,13 +145,18 @@ export class GroupRuntime {
 			return;
 		}
 		await this.run(async () => {
-			await this.verify();
-			if (this.verified) await this.exchangeRoster();
-			await this.processUpdates();
-			await this.recordAgentPosts();
-			await this.deliverWakes();
-			await this.electionTick();
+			await this.options.journal.rebuildProjection();
+			await this.catchUp();
 		});
+	}
+
+	/** Verifies when needed and processes everything left to do; safe to repeat. */
+	private async catchUp(): Promise<void> {
+		if (this.membership.state !== "verified") await this.verify();
+		await this.processUpdates();
+		await this.recordAgentPosts();
+		await this.deliverWakes();
+		await this.electionTick();
 	}
 
 	async stop(): Promise<void> {
@@ -165,6 +164,8 @@ export class GroupRuntime {
 		if (this.quietTimer) clearTimeout(this.quietTimer);
 		if (this.retryTimer) clearTimeout(this.retryTimer);
 		if (this.electionTimer) clearTimeout(this.electionTimer);
+		// Interrupts a wait on the shared journal lock so shutdown cannot hang.
+		this.options.journal.close();
 		await this.chain;
 	}
 
@@ -186,8 +187,15 @@ export class GroupRuntime {
 			if (this.stopped) return;
 			try {
 				await work();
+				this.lastErrorReported = undefined;
 			} catch (error) {
+				if (this.stopped) return;
 				this.options.onError(error);
+				const text = `Group chat problem: ${error instanceof Error ? error.message : String(error)}. Group work is retrying; private chat is unaffected.`;
+				if (this.lastErrorReported !== text) {
+					this.lastErrorReported = text;
+					this.options.report(text);
+				}
 				this.scheduleRetry();
 			}
 		});
@@ -201,13 +209,7 @@ export class GroupRuntime {
 		this.retryAttempt += 1;
 		this.retryTimer = setTimeout(() => {
 			this.retryTimer = undefined;
-			void this.run(async () => {
-				if (this.membership.state !== "verified") await this.verify();
-				await this.processUpdates();
-				await this.electionTick();
-				await this.recordAgentPosts();
-				await this.deliverWakes();
-			});
+			void this.run(() => this.catchUp());
 		}, delay);
 		this.retryTimer.unref?.();
 	}
@@ -264,6 +266,14 @@ export class GroupRuntime {
 		const { api, config, ownerUserId } = this.options;
 		try {
 			if (!this.self) this.self = await api.getMe();
+			if (config.otherAgents.some((agent) => agent.botUserId === this.self!.id || agent.telegramAccount.toLowerCase() === this.self!.username.toLowerCase())) {
+				return this.setMembership({ state: "unverified", reason: `groupChat.otherAgents lists this bot (@${this.self.username}); list only the other agents` });
+			}
+			try {
+				await this.options.journal.checkRoot();
+			} catch (error) {
+				return this.setMembership({ state: "unverified", reason: (error as Error).message });
+			}
 			const chat = await api.getChat();
 			if (chat.type !== "supergroup") return this.setMembership({ state: "unverified", reason: `the configured chat is a ${chat.type}, not a supergroup` });
 			const me = await api.getChatMember(this.self.id);
@@ -277,7 +287,10 @@ export class GroupRuntime {
 			const expected = 2 + config.otherAgents.length;
 			if (count !== expected) return this.setMembership({ state: "unverified", reason: `the group has ${count} members; expected ${expected}` });
 			if (this.rosterMismatched) return;
+			const wasVerified = this.verified;
 			this.setMembership({ state: "verified" });
+			// Ranks only agree if every agent has the same configuration.
+			if (!wasVerified) await this.exchangeRoster();
 		} catch (error) {
 			this.setMembership({ state: "unverified", reason: `membership check failed (${error instanceof Error ? error.message : String(error)})` });
 			this.scheduleRetry();
@@ -300,10 +313,10 @@ export class GroupRuntime {
 		const anonymous = Boolean(message.sender_chat);
 		const agent = this.agentById(fromId);
 		const senderKind = !anonymous && fromId === this.options.ownerUserId ? "owner" : agent || fromId === this.self?.id ? "agent" : "other";
-		const sender = senderKind === "owner" ? OWNER_SENDER : agent ? agent.telegramName : fromId === this.self?.id ? (this.self?.username ?? "this agent") : message.from?.first_name ?? message.from?.username ?? "unknown";
+		const sender = senderKind === "owner" ? GROUP_OWNER_SENDER : agent ? agent.telegramName : fromId === this.self?.id ? (this.self?.firstName ?? "this agent") : message.from?.first_name ?? message.from?.username ?? "unknown";
 		const text = message.text ?? message.caption ?? "";
 		const entities = ((message.text !== undefined ? message.entities : message.caption_entities) ?? []).map((entity): TelegramEntity => ({ type: entity.type, offset: entity.offset, length: entity.length, ...(entity.url ? { url: entity.url } : {}), ...(entity.user ? { user: { id: entity.user.id } } : {}) }));
-		const media = message.photo ? { kind: "photo" as const } : message.document ? { kind: "document" as const, ...(message.document.file_name ? { fileName: message.document.file_name } : {}), ...(message.document.mime_type ? { mimeType: message.document.mime_type } : {}), ...(message.document.file_size ? { size: message.document.file_size } : {}) } : !text ? { kind: "other" as const } : undefined;
+		const media = message.photo ? { kind: "photo" as const } : message.document ? { kind: "document" as const, ...(message.document.file_name ? { fileName: message.document.file_name } : {}), ...(message.document.mime_type ? { mimeType: message.document.mime_type } : {}), ...(message.document.file_size ? { size: message.document.file_size } : {}) } : otherContent(message) ? { kind: "other" as const } : undefined;
 		const reply = (message as TelegramMessage).reply_to_message;
 		return {
 			chatId: this.config.chatId,
@@ -351,6 +364,11 @@ export class GroupRuntime {
 				await this.append({ type: "group_handled", updateId, stage: "routed", timestamp: this.timestamp() });
 				continue;
 			}
+			if (isServiceMessage(payload.message)) {
+				// Pins, joins, title changes and similar are not conversation.
+				await this.append({ type: "group_handled", updateId, stage: "routed", timestamp: this.timestamp() });
+				continue;
+			}
 			if (!handled?.has("published")) {
 				await this.publish(payload.message);
 				await this.append({ type: "group_handled", updateId, stage: "published", timestamp: this.timestamp() });
@@ -366,15 +384,21 @@ export class GroupRuntime {
 		const reply = message.reply_to_message;
 		if (reply && !(await this.options.journal.message(this.config.chatId, reply.message_id))) {
 			// Telegram's copy of the replied-to message repairs an entry missing from the shared journal.
-			await this.options.journal.recordMessage(this.toGroupMessage({ ...reply, chat: message.chat }), this.self!.username);
+			await this.options.journal.recordMessage({ ...this.toGroupMessage({ ...reply, chat: message.chat }), source: "reply-copy" }, this.self!.username);
 		}
 		const recorded = this.toGroupMessage(message);
 		const image = imageOf(message);
 		if (image && !(await this.options.journal.message(this.config.chatId, message.message_id))) {
-			// Downloaded once, by the agent that records the message.
-			const downloaded = await this.options.api.downloadImage(image);
-			const attachment = await this.options.journal.storeAttachment(Buffer.from(downloaded.data, "base64"), image.mimeType);
-			recorded.media = { ...(recorded.media ?? { kind: "photo" }), mimeType: image.mimeType, attachment };
+			// Downloaded once, by the agent that records the message. A photo that cannot be
+			// downloaded is recorded as an attachment the agent cannot open.
+			try {
+				const downloaded = await this.options.api.downloadImage(image);
+				const attachment = await this.options.journal.storeAttachment(Buffer.from(downloaded.data, "base64"), image.mimeType);
+				recorded.media = { ...(recorded.media ?? { kind: "photo" }), mimeType: image.mimeType, attachment };
+			} catch (error) {
+				this.options.onError(error);
+				recorded.media = recorded.media ?? { kind: "photo" };
+			}
 		}
 		const result = await this.options.journal.recordMessage(recorded, this.self!.username);
 		if (result.outcome !== "conflict") this.options.onJournalChanged?.();
@@ -432,6 +456,8 @@ export class GroupRuntime {
 	}
 
 	private async admitOwnerItem(messages: GroupMessage[]): Promise<void> {
+		// Claiming the messages makes an election elsewhere, which may have grouped them differently, lose them.
+		await this.options.journal.claim(this.config.chatId, messages.map((message) => message.messageId), this.self!.username, { force: true });
 		await this.options.admit(await this.ownerItem(messages));
 		await this.markSeen(messages.at(-1)!.messageId);
 	}
@@ -504,7 +530,7 @@ export class GroupRuntime {
 		let nextCheck: number | undefined;
 		for (const candidate of this.openCandidates()) {
 			const first = candidate.firstMessageId;
-			const owner = await this.options.journal.claimFor(this.config.chatId, first);
+			const owner = await this.options.journal.claimFor(this.config.chatId, candidate.messageIds);
 			if (owner && owner !== this.self.username) {
 				await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: "lost", timestamp: this.timestamp() });
 				continue;
@@ -521,7 +547,7 @@ export class GroupRuntime {
 			}
 			// Busy: nobody may have claimed it yet. Once every rank's wait has passed, make sure the owner sees a notice.
 			if (elapsed >= allWaited) {
-				await this.options.journal.reserveNotice(this.config.chatId, first, this.self.username, async () => Number(await this.sendWithAnchor("Everyone is busy right now; the first agent to finish will pick this up.", candidate.messageIds.at(-1))));
+				await this.options.journal.reserveNotice(this.config.chatId, candidate.messageIds, this.self.username, async () => Number(await this.sendWithAnchor("Everyone is busy right now; the first agent to finish will pick this up.", candidate.messageIds.at(-1))));
 			} else {
 				nextCheck = Math.min(nextCheck ?? Infinity, allWaited - elapsed);
 			}
@@ -540,7 +566,11 @@ export class GroupRuntime {
 		this.electionTimer.unref?.();
 	}
 
-	/** Claims the item in the shared journal while this agent is idle, and starts it. */
+	/**
+	 * Claims every message of the item in the shared journal while this agent is
+	 * idle, then starts it. The claim is made outside the private queue, so a
+	 * slow shared lock never holds private work.
+	 */
 	private async tryClaim(candidate: Extract<GroupProgressRecord, { type: "group_candidate" }>, alreadyClaimed: boolean): Promise<"claimed" | "lost" | "busy"> {
 		const first = candidate.firstMessageId;
 		const messages: GroupMessage[] = [];
@@ -548,17 +578,18 @@ export class GroupRuntime {
 			const message = await this.options.journal.message(this.config.chatId, id);
 			if (message) messages.push(message);
 		}
-		if (!messages.length || !this.options.claimWhenIdle) return "busy";
-		let won = alreadyClaimed;
-		const result = await this.options.claimWhenIdle(async () => {
-			if (!won) won = (await this.options.journal.claim(this.config.chatId, first, this.self!.username)).won;
-			return won ? this.ownerItem(messages) : undefined;
-		});
-		if (result === "busy") return "busy";
-		await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: won ? "claimed" : "lost", timestamp: this.timestamp() });
-		if (!won) return "lost";
+		if (!messages.length) return "busy";
+		if (!alreadyClaimed) {
+			if (!this.options.isIdle?.()) return "busy";
+			if (!(await this.options.journal.claim(this.config.chatId, candidate.messageIds, this.self!.username)).won) {
+				await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: "lost", timestamp: this.timestamp() });
+				return "lost";
+			}
+		}
+		await this.options.admit(await this.ownerItem(messages));
+		await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: "claimed", timestamp: this.timestamp() });
 		await this.markSeen(Math.max(...candidate.messageIds));
-		const notice = await this.options.journal.noticeFor(this.config.chatId, first);
+		const notice = await this.options.journal.noticeFor(this.config.chatId, candidate.messageIds);
 		if (notice) await this.options.api.deleteMessage(String(notice)).catch((error) => this.options.onError(error));
 		for (const peer of this.config.otherAgents) void this.options.coordinate?.(peer, { kind: "claimed", messageId: first, agent: this.self!.username });
 		return "claimed";
@@ -592,7 +623,7 @@ export class GroupRuntime {
 	private rosterMismatched = false;
 
 	private async rosterMismatch(peer: string): Promise<void> {
-		await this.options.journal.appendEvent(() => ({ kind: "roster_check", agent: this.self!.username, peer, result: "mismatch" }), () => undefined).catch((error) => this.options.onError(error));
+		await this.options.journal.appendEvent({ kind: "roster_check", agent: this.self!.username, peer, result: "mismatch" }).catch((error) => this.options.onError(error));
 		this.rosterMismatched = true;
 		this.setMembership({ state: "unverified", reason: `the group configuration differs from ${peer}'s (roster, owner or election step)` });
 	}
@@ -621,14 +652,18 @@ export class GroupRuntime {
 		if (!mentioned && !repliesToOwnRequest) return { status: 400, body: { error: "The message does not address this agent" } };
 		// An answer to this agent's request returns to the work that asked; a new request is answered in the group.
 		if (repliesToOwnRequest && message.posting?.kind === "answer") return this.admitAnswer(message, peer, target!);
+		return this.admitPeerItem(message, peer, { kind: "group", chatId: this.config.chatId, messageId: message.messageId }, [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))]);
+	}
+
+	private async admitPeerItem(message: GroupMessage, peer: GroupAgentConfig, reply: WorkItem["reply"], context: string[]): Promise<EndpointResponse> {
 		const result = await this.options.admit({
 			itemId: groupItemId(this.config.chatId, message.messageId),
 			channel: "group",
 			authority: "peer",
 			sender: `${peer.telegramName} (@${peer.telegramAccount})`,
 			text: message.text || "[empty message]",
-			reply: { kind: "group", chatId: this.config.chatId, messageId: message.messageId },
-			context: [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))],
+			reply,
+			context,
 		}) as { item: WorkItem; duplicate: boolean } | undefined;
 		await this.markSeen(message.messageId);
 		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
@@ -659,22 +694,7 @@ export class GroupRuntime {
 		}
 		context.push(...(await this.missedLines(message.messageId)));
 		context.push("Use telegram_group_timeline or telegram_timeline if you need more of that conversation.");
-		const result = await this.options.admit({
-			itemId: groupItemId(this.config.chatId, message.messageId),
-			channel: "group",
-			authority: "peer",
-			sender: `${peer.telegramName} (@${peer.telegramAccount})`,
-			text: message.text || "[empty message]",
-			reply,
-			context,
-		}) as { item: WorkItem; duplicate: boolean } | undefined;
-		await this.markSeen(message.messageId);
-		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
-	}
-
-	/** After /new, answers to requests sent before now no longer start work. */
-	async closeRequests(): Promise<void> {
-		await this.append({ type: "group_requests_closed", timestamp: this.timestamp() });
+		return this.admitPeerItem(message, peer, reply, context);
 	}
 
 	/** Journals group replies Telegram accepted for this agent, then queues wake-ups for the agents they address. */
@@ -711,7 +731,7 @@ export class GroupRuntime {
 			messageId: post.partIds[0]!,
 			...(post.partIds.length > 1 ? { partIds: post.partIds } : {}),
 			senderId: this.self!.id,
-			sender: this.self!.username,
+			sender: this.self!.firstName,
 			senderKind: "agent",
 			date: post.date,
 			text: post.text,
@@ -752,8 +772,12 @@ export class GroupRuntime {
 			const result = await (this.options.wake ?? defaultWake)(peer, record.messageId);
 			if (result === "retry") {
 				retry = true;
+				const attempts = (this.wakeAttempts.get(peer.telegramAccount) ?? 0) + 1;
+				this.wakeAttempts.set(peer.telegramAccount, attempts);
+				if (attempts === 5) this.options.report(`Cannot reach @${peer.telegramAccount}'s queue endpoint on port ${peer.queuePort}; still retrying. Check that the agent is running and that the port matches its queuePort.`);
 				continue;
 			}
+			this.wakeAttempts.delete(peer.telegramAccount);
 			done.add(`${record.messageId}:${record.peer}`);
 			await this.append({ type: "group_wake_done", messageId: record.messageId, peer: record.peer, outcome: result, timestamp: this.timestamp() });
 			if (result === "rejected") this.options.report(`@${peer.telegramAccount} refused group message ${record.messageId}; check that its group chat is configured.`);
@@ -791,6 +815,17 @@ export class GroupRuntime {
 	}
 }
 
+const OTHER_CONTENT = ["sticker", "voice", "video", "video_note", "audio", "animation", "contact", "location", "venue", "poll", "dice", "story"];
+
+function otherContent(message: object): boolean {
+	return OTHER_CONTENT.some((field) => field in message);
+}
+
+/** A message with no conversational content: a pin, join, title change and so on. */
+function isServiceMessage(message: TelegramMessage): boolean {
+	return message.text === undefined && message.caption === undefined && !message.photo && !message.document && !otherContent(message);
+}
+
 function imageOf(message: TelegramMessage): (TelegramImageRef & { mimeType: "image/jpeg" | "image/png" | "image/webp" }) | undefined {
 	const photo = message.photo?.at(-1);
 	if (photo && (!photo.file_size || photo.file_size <= MAX_IMAGE_BYTES)) return { fileId: photo.file_id, mimeType: "image/jpeg", fileSize: photo.file_size };
@@ -819,4 +854,3 @@ function splitForGroup(text: string, limit = 4_000): string[] {
 	return parts;
 }
 
-export type { GroupUpdatePayload };

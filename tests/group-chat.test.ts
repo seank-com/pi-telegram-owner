@@ -62,8 +62,10 @@ class FakeGroupApi implements GroupTelegramApi {
 	async editMessageText(messageId: string, text: string) { this.calls.push(`edit:${messageId}:${text}`); }
 	async deleteMessage(messageId: string) { this.calls.push(`delete:${messageId}`); }
 	downloads = 0;
+	failDownloads = false;
 	async downloadImage() {
 		this.downloads += 1;
+		if (this.failDownloads) throw new Error("Telegram image contents do not match the declared type");
 		return { data: PNG.toString("base64"), mimeType: "image/png" };
 	}
 }
@@ -94,7 +96,7 @@ interface Agent {
 	runTurn(answer: string): Promise<string>;
 }
 
-function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wake: (peer: GroupAgentConfig, messageId: number) => Promise<WakeResult>, extra: { events?: unknown; datastore?: GroupChatConfig["datastore"]; electionStepMs?: number; coordinate?: (peer: GroupAgentConfig, body: unknown) => Promise<{ status: number; body: unknown } | undefined> } = {}): Agent {
+function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wake: (peer: GroupAgentConfig, messageId: number) => Promise<WakeResult>, extra: { events?: unknown; datastore?: GroupChatConfig["datastore"]; electionStepMs?: number; otherAgents?: GroupAgentConfig[]; retryDelayMs?: (attempt: number) => number; coordinate?: (peer: GroupAgentConfig, body: unknown) => Promise<{ status: number; body: unknown } | undefined> } = {}): Agent {
 	const self = AGENTS[key];
 	const other: AgentKey = key === "a" ? "b" : "a";
 	const journal = new MemoryJournal();
@@ -120,12 +122,15 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 			promptImages.push(content.filter((part) => part.type === "image").map((part) => ({ data: part.data!, mimeType: part.mimeType! })));
 		},
 	} as unknown as ExtensionAPI;
-	const config: GroupChatConfig = { chatId: GROUP, sharedRoot, datastore: extra.datastore ?? { mode: "off", store: "telegram-group" }, electionStepMs: extra.electionStepMs ?? 250, otherAgents: [peerConfig(other)] };
+	const config: GroupChatConfig = { chatId: GROUP, sharedRoot, datastore: extra.datastore ?? { mode: "off", store: "telegram-group" }, electionStepMs: extra.electionStepMs ?? 250, otherAgents: extra.otherAgents ?? [peerConfig(other)] };
 	createTelegramOwnerExtension({ dependencies: {
 		journal, ownerUserId: OWNER, privateChatId: self.privateChat, agentLabel: self.name, queuePort: 0,
 		source: { async start(handler) { onBatch = handler; return async () => {}; } },
 		async sendReply(text, replyTo) { privateReplies.push(text); privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
-		groupChat: { config, api, journalOptions, wake, ...(extra.coordinate ? { coordinate: extra.coordinate } : {}) },
+		async sendActivity(text, _signal, replyTo) { privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
+		async editActivity() {},
+		async deleteActivity() {},
+		groupChat: { config, api, journalOptions, wake, ...(extra.coordinate ? { coordinate: extra.coordinate } : {}), ...(extra.retryDelayMs ? { retryDelayMs: extra.retryDelayMs } : {}) },
 	} })(pi);
 	const ctx = {
 		cwd: PROJECT_ROOT, isIdle: () => idle,
@@ -649,4 +654,86 @@ test("/status in the private chat reports the group, the endpoint and the last f
 	assert.match(status, /\nGroup: verified/);
 	assert.match(status, /\nQueue endpoint: 127\.0\.0\.1:\d+/);
 	assert.match(status, /\nLast failed turn: ABORTED at /);
+});
+
+async function oneAgent(t: test.TestContext, extra: Parameters<typeof startAgent>[4] = {}, wake: (peer: GroupAgentConfig, messageId: number) => Promise<WakeResult> = async () => "accepted") {
+	const sharedRoot = await mkdtemp(join(tmpdir(), "group-one-"));
+	const agent = startAgent("a", sharedRoot, { next: 20_000 }, wake, extra);
+	await agent.emit("session_start", { type: "session_start", reason: "startup" });
+	t.after(async () => { await agent.emit("session_shutdown", { type: "session_shutdown", reason: "exit" }); await rm(sharedRoot, { recursive: true, force: true }); });
+	return { agent, sharedRoot, shared: new GroupJournal(sharedRoot, journalOptions) };
+}
+
+test("a photo that cannot be downloaded is recorded as unusable and later messages still route", async (t) => {
+	const { agent, shared } = await oneAgent(t);
+	await waitFor(() => agent.status().includes("group=verified"));
+	agent.api.failDownloads = true;
+	const caption = "@example_agent_a_bot look";
+	await agent.batch([ownerGroupMessage(150, "", { text: undefined, caption, caption_entities: [mention(caption, AGENTS.a.username)], document: { file_id: "bad", mime_type: "image/png", file_size: 10 } })]);
+	await waitFor(() => agent.prompts.length === 1);
+	assert.match(agent.prompts[0]!, /includes a document that you cannot open/);
+	await agent.runTurn("I can't open that image.");
+	const next = "@example_agent_a_bot and this?";
+	await agent.batch([ownerGroupMessage(151, next, { entities: [mention(next, AGENTS.a.username)] })]);
+	await waitFor(() => agent.prompts.length === 2);
+	assert.equal((await shared.message(GROUP, 150))?.media?.attachment, undefined);
+});
+
+test("a group image that cannot be read is left out without blocking private work", async (t) => {
+	const { agent, sharedRoot, shared } = await oneAgent(t);
+	await waitFor(() => agent.status().includes("group=verified"));
+	agent.setIdle(false);
+	const caption = "@example_agent_a_bot see";
+	await agent.batch([ownerGroupMessage(160, "", { text: undefined, caption, caption_entities: [mention(caption, AGENTS.a.username)], photo: [{ file_id: "p", file_size: 10 }] })]);
+	await waitFor(() => agent.journal.records.some((record) => record.type === "work_item"));
+	await rm(join(sharedRoot, (await shared.message(GROUP, 160))!.media!.attachment!));
+	await agent.batch([ownerPrivate("a", 600, "private question")]);
+	agent.setIdle(true);
+	await agent.emit("agent_settled", { type: "agent_settled" });
+	await waitFor(() => agent.prompts.length === 1);
+	assert.deepEqual(agent.promptImages[0], [], "the unreadable image is left out");
+	await agent.runTurn("Answered without the image.");
+	await waitFor(() => agent.prompts.length === 2);
+	assert.match(agent.prompts[1]!, /private question$/);
+});
+
+test("service messages such as pins are not conversation and start no work", async (t) => {
+	const { agent, shared } = await oneAgent(t);
+	await waitFor(() => agent.status().includes("group=verified"));
+	await agent.batch([{ update_id: updateId++, message: { message_id: 170, date: 1_790_000_170, chat: { id: GROUP, type: "supergroup" }, from: { id: OWNER }, pinned_message: { message_id: 1 } } as unknown as TelegramMessage }]);
+	await waitFor(() => agent.journal.records.some((record) => record.type === "group_handled" && record.stage === "routed"));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(agent.prompts.length, 0);
+	assert.equal(await shared.message(GROUP, 170), undefined);
+});
+
+test("while the group is paused, group items wait and private queued notices still go out", async (t) => {
+	const { agent } = await oneAgent(t);
+	await waitFor(() => agent.status().includes("group=verified"));
+	agent.setIdle(false);
+	const text = "@example_agent_a_bot when you can";
+	await agent.batch([ownerGroupMessage(180, text, { entities: [mention(text, AGENTS.a.username)] })]);
+	await waitFor(() => agent.journal.records.some((record) => record.type === "work_item"));
+	agent.api.chatType = "group";
+	await agent.batch([{ update_id: updateId++, my_chat_member: { chat: { id: GROUP, type: "supergroup" }, new_chat_member: { status: "administrator", user: { id: AGENTS.a.id } } } }]);
+	await waitFor(() => agent.status().includes("group=unverified"));
+	await agent.batch([ownerPrivate("a", 610, "private while busy")]);
+	await waitFor(() => agent.privateSends.some((send) => send.text.startsWith("Queued:") && send.replyTo === 610));
+	agent.setIdle(true);
+	await agent.emit("agent_settled", { type: "agent_settled" });
+	await waitFor(() => agent.prompts.length === 1);
+	assert.match(agent.prompts[0]!, /private while busy$/, "the private request runs; the group item waits for the group");
+});
+
+test("an agent that lists itself among the other agents does not verify", async (t) => {
+	const { agent } = await oneAgent(t, { otherAgents: [peerConfig("b"), peerConfig("a", 7001)] });
+	await waitFor(() => agent.status().includes("group=unverified"));
+	assert.match(agent.privateReplies.at(-1)!, /otherAgents lists this bot \(@example_agent_a_bot\)/);
+});
+
+test("an unreachable peer endpoint is reported while wake-ups keep retrying", async (t) => {
+	const { agent } = await oneAgent(t, { retryDelayMs: () => 10 }, async () => "retry");
+	await waitFor(() => agent.status().includes("group=verified"));
+	await agent.tools.get("telegram_group_send").execute("unreachable-1", { text: "@example_agent_b_bot are you there?" });
+	await waitFor(() => agent.privateReplies.some((reply) => reply.startsWith("Cannot reach @example_agent_b_bot's queue endpoint on port 7000")), 3_000);
 });

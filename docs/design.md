@@ -63,8 +63,8 @@ identifiers/types are checked against the owner's actual packed contract.
 Native CLIs/archive helpers import no Pi runtime values. The extension supplies
 Pi's CONFIG_DIR_NAME; the menu CLI defaults to .pi with an explicit override.
 Runtime dependencies are declared parsing libraries; TypeBox and Pi remain host
-peers for extension loading. Compiled ESM/declarations and both executable CLI
-shebangs ship. No tests, private operational content or sibling source imports
+peers for extension loading. Compiled ESM/declarations and every executable CLI
+shebang ship. No tests, private operational content or sibling source imports
 are included in the package.
 
 The operation event is `pi-markdown-datastore:v1:request`; discovery remains
@@ -97,8 +97,7 @@ the start of the turn. Local interactive input in the agent's terminal keeps
 Pi's normal behavior: it is answered in the terminal and is not accepted while
 a queued item is running. The extension cannot authenticate who typed it, so it
 carries no envelope and no channel authority; the agent judges it as it would
-without this extension. It remains a fallback path when the group is
-unavailable.
+without this extension.
 
 Output routing is mechanical. A turn's final reply goes only to the
 destination pinned in its envelope: a private item answers in the private
@@ -182,7 +181,9 @@ messages, and Telegram reports membership changes to them. The poller requests
 `message`, `chat_member` and `my_chat_member` updates. Edits are not requested:
 each message is recorded and routed as first sent.
 
-At startup, and on every membership update, an agent checks that the
+At startup, and on every membership update, an agent checks that its
+configuration does not list its own bot among the other agents, that the shared
+root is a directory owned by the agents' account with mode 0700, that the
 configured chat is a supergroup, that it is an administrator with permission
 to ban members and delete messages, that every configured identity is a
 member, and that the member count equals the owner plus the configured agents.
@@ -192,7 +193,8 @@ not match, the agent sends nothing to the group, keeps group items queued, and
 reports the problem in the private chat. Private transport is unaffected. An
 agent leaves any other group or channel it is added to. A group message whose
 sender is not the owner's user account, such as one posted anonymously as the
-group, has no owner authority; it is recorded but not routed.
+group, has no owner authority; it is recorded but not routed. Service messages
+such as pins, joins and title changes are neither recorded nor routed.
 
 ### Transport
 
@@ -204,9 +206,9 @@ journal and the queue endpoint:
 1. An agent posts to the group, either with `telegram_group_send` or as the
    final reply of a group turn. A message Telegram must split into several
    parts is recorded as one journal entry listing every part's message ID.
-2. When Telegram accepts the message, the agent appends Telegram's returned
-   message, including its mention entities and reply target, to the shared
-   journal, and records a pending wake-up for each agent it addresses.
+2. When Telegram accepts the message, the agent appends it to the shared
+   journal with its reply target, and records a pending wake-up for each agent
+   it addresses.
 3. It posts each wake-up to that agent's queue endpoint, naming the journal
    entry, and retries with backoff until the recipient answers `202`. Pending
    wake-ups survive the sender's restart. A recipient that is down receives
@@ -226,9 +228,11 @@ repair a lost entry by replying to it and mentioning the agent that should act.
 
 Group updates are recorded in the agent's transport journal before its cursor
 advances, as private updates are. Publication to the shared journal is a
-separate step retried from that record. A shared journal failure pauses group
-behavior and is reported in the private chat; it never holds the private
-cursor or private work.
+separate step retried from that record. A shared journal failure is reported
+once in the private chat and retried; it never holds the private cursor or
+private work. A shared journal lock that stays unreadable is reported with its
+path instead of waited on, so an operator can check that no agent is writing
+and remove it.
 
 ### Shared journal
 
@@ -239,7 +243,7 @@ Telegram. It has the same properties as the private archive: a forward-only
 JSONL event log is authoritative, canonical Markdown is its projection, and
 indexes are disposable. The shared root is dedicated to the group, so notes
 sit directly under it by month (`YYYY/MM/`), photos under `_attachments/`,
-and the event log, lock and archive state under `.telegram-archive/`. The
+and the event log and lock under `.telegram-archive/`. The
 private archive keeps the same layout under `messages/` because its
 projection root is the agent's whole workspace.
 
@@ -252,8 +256,11 @@ ID. Every agent observes the owner's group messages, so the first agent to
 record a message writes it and later identical observations are no-ops. A
 conflicting observation of an existing message is recorded as a conflict and
 never overwrites it. Agent messages are recorded by their sender from
-Telegram's acceptance response. Elections, claims, queued election notices and
-roster checks are journaled alongside messages.
+Telegram's acceptance response. When a message is first known only from
+Telegram's copy inside a reply, its sender's own record later supersedes that
+copy. Claims, election notices and roster mismatches are journaled alongside
+messages; each agent keeps its own election candidates in its transport
+journal.
 
 Routing reads Telegram's entities against the untrimmed `text` or `caption`,
 using Telegram's UTF-16 offsets. Photos are downloaded once, by the agent that
@@ -265,8 +272,8 @@ so; nothing is silently dropped.
 
 A Telegram Desktop export of the group can be imported into the shared root with
 `pi-telegram-group-import`. A prepare pass pins the export pages and lists every
-sender; the operator assigns each sender to the owner or an agent. Messages whose Telegram message ID is already
-journaled are left as recorded, so an export restores missing history without
+sender; the operator assigns each sender to the owner, an agent or another
+person. Messages whose Telegram message ID is already journaled are left as recorded, so an export restores missing history without
 duplicating or overwriting what the agents recorded live. Exported photos are
 stored like live ones; other attachments are recorded as metadata.
 
@@ -280,9 +287,11 @@ shared journal, when the group store is available.
 
 ### Routing
 
-Routing uses Telegram mention entities, text mentions and reply targets
-matched against configured usernames and numeric bot IDs. Literal names in
-message text do not route.
+Routing matches `@username` mentions, text mentions and reply targets against
+configured usernames and numeric bot IDs. For the owner's messages it uses
+Telegram's mention entities; for agent posts, which other bots never receive,
+it finds `@username` in the text as Telegram does. Names without `@`, such as
+an agent's display name, do not route.
 
 Consecutive owner messages within the quiet window are one item, as in the
 private chat, so a long message Telegram split into parts routes once. The
@@ -364,8 +373,9 @@ includes the original request.
 
 Election ranks depend on every agent having the same roster and
 `electionStepMs`. Agents exchange a roster check through their coordination
-endpoints at startup. A mismatch pauses group behavior on the agents that
-detect it and is reported in the private chat.
+endpoints whenever their membership becomes verified. A mismatch pauses group
+behavior on the agents that detect it and is reported in the private chat;
+correct the configuration and restart the affected agents.
 
 ### Tools
 
@@ -377,8 +387,10 @@ detect it and is reported in the private chat.
   before or after a message.
 - `telegram_group_recall`: datastore search over the group store.
 
-The tools are registered only when a group is configured, and fail with a
-diagnostic while membership is unverified.
+The tools are registered only when a group is configured. Timeline and send
+fail with a diagnostic while membership is unverified; recall keeps searching
+history. While membership is unverified, queued group items wait and private
+work continues.
 
 ### Failure and recovery
 
@@ -400,7 +412,10 @@ Each configured agent listens on `127.0.0.1:<queuePort>`. The endpoint has no
 token: it is reachable only from the local host, and the operating-system
 account that runs the agents is their security boundary. Requests and
 responses are JSON. `202` means the item was durably recorded in the agent's
-transport journal; senders retry until they receive it.
+transport journal, or, for an answer to a request closed by `/new`, that it
+needs no work; senders retry until they receive it. Calls between agents time
+out after ten seconds and are retried, and an agent that stays unreachable is
+reported once in the private chat.
 
 - `POST /queue` accepts work.
   - `{"kind": "group-message", "messageId": N}` from another agent: a wake-up

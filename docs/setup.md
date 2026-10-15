@@ -57,26 +57,32 @@ curl -s -X POST http://127.0.0.1:7351/queue -H 'Content-Type: application/json' 
 ```
 
 `reply` selects the private chat, the group or no reply. Use a stable `id` per
-logical request so retries do not queue duplicates. `GET /status` reports
-whether the agent is idle. The endpoint never listens on other interfaces. A
+logical request so retries do not queue duplicates. `GET /status` returns
+`state` (`idle` or `busy`), `queue` (`owner` and `peer` counts) and `group`
+(`unconfigured`, `verifying`, `verified` or `unverified`). The endpoint never listens on other interfaces. A
 group chat requires a queue port.
 
 ## Group chat
 
 A group joins several agents, each with its own project, bot and private chat
-with the same owner, in one Telegram supergroup with the owner.
+with the same owner, in one Telegram supergroup with the owner. All of the
+agents run on one host under one operating-system account: they reach each
+other on `127.0.0.1` and share one directory.
 
 1. Create the group in Telegram, add every agent bot, and promote each bot to
    administrator with permission to delete messages and ban users. Add nobody
-   else. Telegram converts the group to a supergroup when needed; use the
-   supergroup's ID.
-2. In BotFather, disable "Allow Groups" for each bot after adding it, so it
+   else. Telegram converts the group to a supergroup when needed.
+2. Find the supergroup's ID: open the group in Telegram Web, and the address
+   ends with it, for example `#-1001234567890`. Use that negative number.
+3. In BotFather, disable "Allow Groups" for each bot after adding it, so it
    cannot be added elsewhere.
-3. Choose a shared root directory owned by the agents' account, mode 0700, for
-   example outside every agent's project. Every agent must name the same
-   absolute path.
-4. Give each agent a distinct `queuePort` and add a `groupChat` object to its
-   config.json. Each agent lists every other agent, never itself:
+4. Create the shared root outside every agent's project, for example
+   `mkdir -m 700 /absolute/path/to/group-chat`. Agents refuse a shared root
+   that other accounts can read. Every agent names the same absolute path.
+5. Give each agent a distinct `queuePort` and add a `groupChat` object to its
+   config.json. Each agent lists every other agent, never itself, and the
+   `queuePort` it lists for another agent must be that agent's own
+   `queuePort`:
 
 ```json
 {
@@ -115,12 +121,21 @@ bot's token). `telegramName` is how the agent is named to the others.
 `datastore` uses the same modes as the private `datastore` setting and names
 the store for the shared Markdown. The agent's own username and ID come from
 Telegram at startup. Usernames, bot IDs and ports must be unique and must not
-match the owner or the running bot. All agents must describe the same roster;
-election ranks depend on it.
+match the owner. An agent that lists its own bot stays unverified and says so.
+All agents must describe the same group, owner, roster and election step;
+election ranks depend on it, and agents that disagree pause the group until
+the configuration is corrected and they are restarted.
 
-For group recall, add a store to each agent's datastore configuration rooted at
-`<sharedRoot>` with the same name as `groupChat.datastore.store`, including
-`**/*.md`.
+For group recall, add a store to each agent's datastore configuration with the
+same name as `groupChat.datastore.store`, rooted at the shared root:
+
+```json
+"telegram-group": {
+  "root": "/absolute/path/to/group-chat",
+  "include": ["**/*.md"],
+  "search": { "defaultMode": "lexical", "qmdCollection": "telegram-group" }
+}
+```
 
 After starting the agents, `/status` in the private chat reports group
 verification. If membership does not match, the agent names the mismatch and

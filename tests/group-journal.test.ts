@@ -149,3 +149,54 @@ test("the group timeline tool pages the shared journal and reports when no group
 	available = false;
 	await assert.rejects(tool.execute("call", {}), /CAPABILITY_UNAVAILABLE/);
 });
+
+test("an agent's own record supersedes Telegram's reply copy, keeping request metadata", async (t) => {
+	const root = await shared(t);
+	const store = journal(root);
+	const copy = { ...ownerMessage(50, "plain copy"), senderId: 200, sender: "Agent B", senderKind: "agent" as const, source: "reply-copy" as const };
+	await store.recordMessage(copy, "agent_a_bot");
+	const own = { ...ownerMessage(50, "**formatted** original"), senderId: 200, sender: "Agent B", senderKind: "agent" as const, posting: { kind: "request" as const } };
+	assert.equal((await store.recordMessage(own, "agent_b_bot")).outcome, "recorded");
+	assert.equal((await store.message(GROUP, 50))?.posting?.kind, "request");
+	assert.equal((await store.recordMessage(copy, "agent_c_bot")).outcome, "duplicate", "a later copy never replaces the original");
+	assert.equal((await store.timeline({ chatId: GROUP, limit: 10 })).length, 1);
+	assert.equal((await store.events()).filter((event) => event.kind === "conflict").length, 0);
+});
+
+test("claims cover every message of an item; force claims the rest; notices respect claims", async (t) => {
+	const root = await shared(t);
+	const store = journal(root);
+	assert.deepEqual(await store.claim(GROUP, [60, 61], "agent_a"), { agent: "agent_a", won: true });
+	assert.deepEqual(await store.claim(GROUP, [61], "agent_b"), { agent: "agent_a", won: false }, "a split grouping loses messages already claimed");
+	assert.deepEqual(await store.claim(GROUP, [61, 62], "agent_b", { force: true }), { agent: "agent_b", won: true });
+	assert.equal(await store.claimFor(GROUP, [62]), "agent_b");
+	let sent = 0;
+	assert.equal(await store.reserveNotice(GROUP, [60], "agent_c", async () => { sent += 1; return 900; }), undefined, "no notice once the item is claimed");
+	assert.equal(await store.reserveNotice(GROUP, [70], "agent_c", async () => { sent += 1; return 901; }), 901);
+	assert.equal(await store.reserveNotice(GROUP, [70], "agent_d", async () => { sent += 1; return 902; }), 901);
+	assert.equal(sent, 1);
+});
+
+test("a broken lock is reported instead of waited on forever, and close interrupts a wait", async (t) => {
+	const root = await shared(t);
+	await mkdir(join(root, ".telegram-archive"), { recursive: true, mode: 0o700 });
+	await writeFile(join(root, ".telegram-archive", "lock"), "", { mode: 0o600 });
+	await assert.rejects(journal(root).claim(GROUP, 80, "agent_a"), /lock .* is unreadable or unsafe; check that no agent is writing, then remove it/);
+
+	await writeFile(join(root, ".telegram-archive", "lock"), `${JSON.stringify({ pid: process.pid, nonce: "held", bootId: "synthetic-boot" })}\n`, { mode: 0o600 });
+	const waiting = journal(root);
+	const pending = waiting.claim(GROUP, 81, "agent_a");
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	waiting.close();
+	const { GroupJournalClosedError } = await import("../src/group-journal.ts");
+	await assert.rejects(pending, GroupJournalClosedError);
+});
+
+test("the shared root must be owned and private", async (t) => {
+	const root = await shared(t);
+	await journal(root).checkRoot();
+	const { chmod } = await import("node:fs/promises");
+	await chmod(root, 0o755);
+	await assert.rejects(journal(root).checkRoot(), /mode 0700/);
+	await assert.rejects(journal(join(root, "missing")).checkRoot(), /not a directory/);
+});

@@ -1102,10 +1102,12 @@ export class TelegramOwnerBridge {
 		sendUserMessage: (text: string, images?: ResolvedImage[]) => void,
 		resolveImages?: (images: TelegramImageRef[], archived: readonly ArchivedTelegramAttachment[]) => Promise<ResolvedArchivedImage[]>,
 		resolveItemImages?: (item: WorkItem) => Promise<ResolvedImage[]>,
+		/** Jobs whose destination is unavailable, such as a paused group, stay queued. */
+		canDispatch?: (job: Job) => boolean,
 	): Promise<Job | undefined> {
 		if (this.active || this.stopped) return undefined;
 		await this.sealReadyBatches();
-		const job = recover(this.records, this.now()).queued[0];
+		const job = recover(this.records, this.now()).queued.find((candidate) => canDispatch?.(candidate) ?? true);
 		if (!job) return undefined;
 		const archived = this.capturedMedia(job.jobId, "in").map((record) => record.attachment);
 		const captured = job.images.length ? await resolveImages?.(job.images, archived) : undefined;

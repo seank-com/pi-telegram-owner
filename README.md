@@ -60,17 +60,21 @@ missing from the shared journal with `--commit`. The CLIs run as
 native Node programs without loading Pi. Pure helpers are exported as `/format`, `/markdown-projector` and `/importer`.
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
-`npm pack --dry-run`, `npm run test:package`. Run `npm run hooks:install` once per
-clone to refuse commits and pushes that add any line of `~/.pii` (matched
-case-insensitively) or any value of 8 or more characters from `~/.env`;
-`npm run check:private -- --all` checks every tracked file. The setting
-persists across branches but has no effect on a branch without `.githooks/`. Default tests need no companion or
+`npm pack --dry-run`, `npm run test:package`. Default tests need no companion or
 real Telegram. Explicit composition checks use actual candidate tarballs:
 
 ```bash
 DATASTORE_TARBALL=/path/to/datastore.tgz OBSERVABILITY_TARBALL=/path/to/observability.tgz \
   npm run test:integration
 ```
+
+To keep private terms and secrets out of commits, run `npm run hooks:install`
+once per clone. Commits and pushes are then refused when an added line or a
+commit message contains a line of `~/.pii` (one term per line, matched
+case-insensitively; `#` lines are comments) or a value of 8 or more characters
+from `~/.env`. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
+files. `npm run check:private -- --all` checks every staged file, including
+unchanged ones.
 
 Public README/MIT history and extracted implementation attribution are preserved.
 Only compiled code/declarations, generic docs, README, LICENSE and metadata ship.
