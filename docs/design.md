@@ -274,8 +274,8 @@ journal directly, and searched with `telegram_group_recall` through the
 datastore store named in `groupChat.datastore`, with the same optional,
 required and off modes as private recall. The Markdown source is shared; any
 index the datastore builds for it belongs to the datastore. Each agent requests
-coalesced lexical refreshes when it reads entries written by others, since
-those changes do not come from its own publication.
+coalesced lexical refreshes after each message it records or observes in the
+shared journal, when the group store is available.
 
 ### Routing
 

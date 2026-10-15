@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { parseTelegramOwnerCommand, type TelegramOwnerCommandName } from "./commands.ts";
 import { createTelegramTransportPlan, MAX_TELEGRAM_CHUNKS, TELEGRAM_HTML_LIMIT, type TelegramTransportPlan } from "./format.ts";
 
-export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported";
+export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported" | "group";
 
 export interface TelegramImageRef {
 	fileId: string;
@@ -32,22 +32,60 @@ export interface ResolvedArchivedImage {
 	attachment: ArchivedTelegramAttachment;
 }
 
+export interface TelegramUser {
+	id: number;
+	is_bot?: boolean;
+	username?: string;
+	first_name?: string;
+}
+
+export interface TelegramMessage {
+	message_id: number;
+	date?: number;
+	edit_date?: number;
+	text?: string;
+	caption?: string;
+	entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string; user?: TelegramUser }>;
+	caption_entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string; user?: TelegramUser }>;
+	photo?: Array<{ file_id: string; file_size?: number; width?: number; height?: number }>;
+	document?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
+	chat: { id: number; type: string };
+	from?: TelegramUser;
+	/** Set when the owner posts anonymously as the group. */
+	sender_chat?: { id: number; type: string };
+	/** Telegram's copy of the replied-to message, without its own reply. */
+	reply_to_message?: Omit<TelegramMessage, "reply_to_message">;
+}
+
+export interface TelegramChatMemberUpdate {
+	chat: { id: number; type: string };
+	from?: TelegramUser;
+	date?: number;
+	old_chat_member?: { status: string; user: TelegramUser };
+	new_chat_member: { status: string; user: TelegramUser };
+}
+
 export interface TelegramUpdate {
 	update_id: number;
-	message?: {
-		message_id: number;
-		date?: number;
-		edit_date?: number;
-		text?: string;
-		caption?: string;
-		entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string }>;
-		caption_entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string }>;
-		photo?: Array<{ file_id: string; file_size?: number; width?: number; height?: number }>;
-		document?: { file_id: string; file_size?: number; mime_type?: string };
-		chat: { id: number; type: string };
-		from?: { id: number };
-	};
+	message?: TelegramMessage;
+	chat_member?: TelegramChatMemberUpdate;
+	my_chat_member?: TelegramChatMemberUpdate;
 }
+
+/** A group update kept in the agent's own transport journal until it is published to the shared journal. */
+export type GroupUpdatePayload =
+	| { kind: "message"; message: TelegramMessage }
+	| { kind: "member"; member: TelegramChatMemberUpdate; self: boolean }
+	| { kind: "foreign-chat"; chatId: number; chatType: string };
+
+/** Agent-local progress for group work. These records never affect the private queue. */
+export type GroupProgressRecord =
+	| { type: "group_handled"; updateId: number; stage: "published" | "routed"; timestamp: string }
+	| { type: "group_send_planned"; sendId: string; text: string; replyToMessageId?: number; originJobId?: string; timestamp: string }
+	| { type: "group_send_accepted"; sendId: string; messageIds: number[]; date: number; timestamp: string }
+	| { type: "group_post_recorded"; postId: string; messageId: number; timestamp: string }
+	| { type: "group_wake"; messageId: number; peer: string; timestamp: string }
+	| { type: "group_wake_done"; messageId: number; peer: string; outcome: "accepted" | "rejected"; timestamp: string };
 
 export interface FetchLike {
 	(input: string, init: { method: string; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal }): Promise<{
@@ -64,6 +102,7 @@ export async function fetchUpdateBatch(
 	cursor?: number,
 	signal?: AbortSignal,
 	pollTimeoutSeconds = 0,
+	allowedUpdates: readonly string[] = ["message"],
 ): Promise<TelegramUpdate[]> {
 	const response = await fetchImpl(`https://api.telegram.org/bot${token}/getUpdates`, {
 		method: "POST",
@@ -71,7 +110,7 @@ export async function fetchUpdateBatch(
 		body: JSON.stringify({
 			offset: cursor === undefined ? undefined : cursor + 1,
 			timeout: pollTimeoutSeconds,
-			allowed_updates: ["message"],
+			allowed_updates: allowedUpdates,
 		}),
 		signal,
 	});
@@ -106,6 +145,7 @@ export interface WorkItem {
 
 export type JournalRecord =
 	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
+	| GroupProgressRecord
 	| {
 			type: "update";
 			schemaVersion?: 2 | 3;
@@ -123,6 +163,7 @@ export type JournalRecord =
 			entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string }>;
 			images?: TelegramImageRef[];
 			command?: TelegramOwnerCommandName | "unknown";
+			group?: GroupUpdatePayload;
 	  }
 	| { type: "inbound_batch"; schemaVersion: 1; batchId: string; revision: number; state: "open" | "sealed" | "dispatching"; openedAt: string; readyAt: string; memberJobIds: string[]; messageIds: number[]; segmentSha256: string[]; boundaries: Array<{ start: number; end: number }>; text: string; finalMessageId: number }
 	| { type: "media_captured"; schemaVersion: 1; mediaId: string; jobId: string; direction: "in" | "out"; attachment: ArchivedTelegramAttachment; telegram: { updateId?: number; messageId?: number; fileId?: string }; timestamp: string }
@@ -198,6 +239,8 @@ export interface TelegramBridgeOptions {
 	formattedDelivery?: boolean;
 	/** Same-date text segments are durably coalesced before dispatch. Default 4000ms. */
 	inboundQuietWindowMs?: number;
+	/** The configured group chat, whose updates are kept for the group runtime. */
+	groupChatId?: number;
 	now?: () => number;
 }
 
@@ -517,6 +560,7 @@ export class TelegramOwnerBridge {
 	private readonly privateChatId: number;
 	private readonly formattedDelivery: boolean;
 	private readonly inboundQuietWindowMs: number;
+	private readonly groupChatId?: number;
 	private readonly now: () => number;
 
 	constructor(journal: Journal, ownerUserId: number, privateChatId: number, options: TelegramBridgeOptions = {}) {
@@ -527,6 +571,16 @@ export class TelegramOwnerBridge {
 		this.inboundQuietWindowMs = options.inboundQuietWindowMs ?? DEFAULT_INBOUND_QUIET_WINDOW_MS;
 		if (!Number.isSafeInteger(this.inboundQuietWindowMs) || (this.inboundQuietWindowMs !== 0 && this.inboundQuietWindowMs < MIN_INBOUND_QUIET_WINDOW_MS) || this.inboundQuietWindowMs > MAX_INBOUND_QUIET_WINDOW_MS) throw new StateCorruptionError("Inbound quiet window is out of bounds");
 		this.now = options.now ?? Date.now;
+		this.groupChatId = options.groupChatId;
+	}
+
+	/** Group updates in arrival order. */
+	groupUpdates(): Array<{ updateId: number; payload: GroupUpdatePayload }> {
+		return this.records.filter((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.disposition === "group" && Boolean(record.group)).map((record) => ({ updateId: record.updateId, payload: record.group! }));
+	}
+
+	appendGroupRecord(record: GroupProgressRecord): Promise<void> {
+		return this.append(record);
 	}
 
 	async initialize(): Promise<Recovery> {
@@ -679,6 +733,12 @@ export class TelegramOwnerBridge {
 			const message = update.message;
 			let disposition: UpdateDisposition;
 			let image: TelegramImageRef | undefined;
+			const group = this.classifyGroup(update);
+			if (group) {
+				await this.append({ type: "update", schemaVersion: 2, updateId: update.update_id, disposition: "group", timestamp: new Date(this.now()).toISOString(), group });
+				seen.add(update.update_id);
+				continue;
+			}
 			if (
 				message &&
 				message.chat.type === "private" &&
@@ -706,6 +766,19 @@ export class TelegramOwnerBridge {
 			seen.add(update.update_id);
 		}
 		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount };
+	}
+
+	private classifyGroup(update: TelegramUpdate): GroupUpdatePayload | undefined {
+		if (this.groupChatId === undefined) return undefined;
+		const member = update.chat_member ?? update.my_chat_member;
+		if (member) {
+			if (member.chat.id === this.groupChatId) return { kind: "member", member, self: Boolean(update.my_chat_member) };
+			return member.chat.type === "private" ? undefined : { kind: "foreign-chat", chatId: member.chat.id, chatType: member.chat.type };
+		}
+		const message = update.message;
+		if (!message) return undefined;
+		if (message.chat.id === this.groupChatId) return { kind: "message", message };
+		return message.chat.type === "private" ? undefined : { kind: "foreign-chat", chatId: message.chat.id, chatType: message.chat.type };
 	}
 
 	pendingInboundMediaJobs(): Job[] {

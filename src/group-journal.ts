@@ -298,7 +298,6 @@ export class GroupJournal {
 	}
 
 	private async acquire(): Promise<PollerLock> {
-		await mkdir(dirname(this.lockPath), { recursive: true, mode: 0o700 });
 		return this.retryWhileBusy(() => PollerLock.acquire(this.lockPath, process.pid, this.options.pidState ?? systemPidState, this.options.bootIdentity ?? systemBootIdentity));
 	}
 
