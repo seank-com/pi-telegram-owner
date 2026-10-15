@@ -46,8 +46,13 @@ export interface GroupRuntimeOptions {
 	onStatus?(): void;
 	/** The shared journal gained entries; group search indexes may need a refresh. */
 	onJournalChanged?(): void;
-	/** Unaddressed owner items, for election. */
-	onUnaddressed?(messages: GroupMessage[]): Promise<void>;
+	/**
+	 * Runs claim inside the agent's queue reservation when the agent is idle, then
+	 * admits the item it returns. Resolves "busy" without calling claim otherwise.
+	 */
+	claimWhenIdle?(claim: () => Promise<(Omit<WorkItem, "itemId" | "timestamp"> & { itemId: string }) | undefined>): Promise<"busy" | "done">;
+	/** Posts a coordination message to a peer; undefined when it cannot be reached. */
+	coordinate?(peer: GroupAgentConfig, body: unknown): Promise<{ status: number; body: unknown } | undefined>;
 	now?: () => number;
 	/** Delay before retrying a failed wake-up or membership check. */
 	retryDelayMs?: (attempt: number) => number;
@@ -144,9 +149,11 @@ export class GroupRuntime {
 		}
 		await this.run(async () => {
 			await this.verify();
+			if (this.verified) await this.exchangeRoster();
 			await this.processUpdates();
 			await this.recordAgentPosts();
 			await this.deliverWakes();
+			await this.electionTick();
 		});
 	}
 
@@ -154,6 +161,7 @@ export class GroupRuntime {
 		this.stopped = true;
 		if (this.quietTimer) clearTimeout(this.quietTimer);
 		if (this.retryTimer) clearTimeout(this.retryTimer);
+		if (this.electionTimer) clearTimeout(this.electionTimer);
 		await this.chain;
 	}
 
@@ -193,6 +201,7 @@ export class GroupRuntime {
 			void this.run(async () => {
 				if (this.membership.state !== "verified") await this.verify();
 				await this.processUpdates();
+				await this.electionTick();
 				await this.recordAgentPosts();
 				await this.deliverWakes();
 			});
@@ -264,6 +273,7 @@ export class GroupRuntime {
 			const count = await api.getChatMemberCount();
 			const expected = 2 + config.otherAgents.length;
 			if (count !== expected) return this.setMembership({ state: "unverified", reason: `the group has ${count} members; expected ${expected}` });
+			if (this.rosterMismatched) return;
 			this.setMembership({ state: "verified" });
 		} catch (error) {
 			this.setMembership({ state: "unverified", reason: `membership check failed (${error instanceof Error ? error.message : String(error)})` });
@@ -397,7 +407,7 @@ export class GroupRuntime {
 			}
 		}
 		if (messages.length && addressed.has(this.self!.id)) await this.admitOwnerItem(messages);
-		else if (messages.length && addressed.size === 0) await this.options.onUnaddressed?.(messages);
+		else if (messages.length && addressed.size === 0) await this.startElection(messages);
 		for (const { updateId } of pending) await this.append({ type: "group_handled", updateId, stage: "routed", timestamp: this.timestamp() });
 	}
 
@@ -411,10 +421,14 @@ export class GroupRuntime {
 	}
 
 	private async admitOwnerItem(messages: GroupMessage[]): Promise<void> {
+		await this.options.admit(await this.ownerItem(messages));
+	}
+
+	private async ownerItem(messages: GroupMessage[]): Promise<Omit<WorkItem, "itemId" | "timestamp"> & { itemId: string }> {
 		const first = messages[0]!;
 		const last = messages.at(-1)!;
 		const text = messages.map((message) => message.text || (message.media ? `[${message.media.kind}]` : "")).filter(Boolean).join("\n\n");
-		await this.options.admit({
+		return ({
 			itemId: groupItemId(this.config.chatId, first.messageId),
 			channel: "group",
 			authority: "owner",
@@ -423,6 +437,141 @@ export class GroupRuntime {
 			reply: { kind: "group", chatId: this.config.chatId, messageId: last.messageId },
 			context: await this.contextFor(first),
 		});
+	}
+
+	/** Every agent's position for an item: the roster by bot ID, rotated by the item's first message ID. */
+	electionRank(firstMessageId: number): number {
+		const ids = [this.self!.id, ...this.config.otherAgents.map((agent) => agent.botUserId)].sort((a, b) => a - b);
+		const offset = ((firstMessageId % ids.length) + ids.length) % ids.length;
+		const rotated = [...ids.slice(offset), ...ids.slice(0, offset)];
+		return rotated.indexOf(this.self!.id);
+	}
+
+	private electionTimer?: ReturnType<typeof setTimeout>;
+
+	private async startElection(messages: GroupMessage[]): Promise<void> {
+		await this.append({ type: "group_candidate", firstMessageId: messages[0]!.messageId, messageIds: messages.map((message) => message.messageId), timestamp: this.timestamp() });
+		await this.electionTick();
+	}
+
+	/** Called when this agent becomes idle, so it can claim waiting items. */
+	notifyIdle(): void {
+		void this.run(() => this.electionTick());
+	}
+
+	private openCandidates(): Array<Extract<GroupProgressRecord, { type: "group_candidate" }>> {
+		const records = this.records();
+		const done = new Set(records.filter((record) => record.type === "group_candidate_done").map((record) => (record as Extract<GroupProgressRecord, { type: "group_candidate_done" }>).firstMessageId));
+		return records.filter((record): record is Extract<GroupProgressRecord, { type: "group_candidate" }> => record.type === "group_candidate" && !done.has(record.firstMessageId));
+	}
+
+	private async electionTick(): Promise<void> {
+		if (!this.self || !this.verified) return;
+		const step = this.config.electionStepMs;
+		const rosterSize = this.config.otherAgents.length + 1;
+		let nextCheck: number | undefined;
+		for (const candidate of this.openCandidates()) {
+			const first = candidate.firstMessageId;
+			const owner = await this.options.journal.claimFor(this.config.chatId, first);
+			if (owner && owner !== this.self.username) {
+				await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: "lost", timestamp: this.timestamp() });
+				continue;
+			}
+			const elapsed = this.now() - new Date(candidate.timestamp).valueOf();
+			const myWait = this.electionRank(first) * step;
+			const allWaited = rosterSize * step;
+			if (owner === this.self.username || elapsed >= myWait) {
+				const outcome = await this.tryClaim(candidate, owner === this.self.username);
+				if (outcome === "claimed" || outcome === "lost") continue;
+			} else {
+				nextCheck = Math.min(nextCheck ?? Infinity, myWait - elapsed);
+				continue;
+			}
+			// Busy: nobody may have claimed it yet. Once every rank's wait has passed, make sure the owner sees a notice.
+			if (elapsed >= allWaited) {
+				await this.options.journal.reserveNotice(this.config.chatId, first, this.self.username, async () => Number(await this.sendWithAnchor("Everyone is busy right now; the first agent to finish will pick this up.", candidate.messageIds.at(-1))));
+			} else {
+				nextCheck = Math.min(nextCheck ?? Infinity, allWaited - elapsed);
+			}
+		}
+		this.scheduleElection(nextCheck);
+	}
+
+	private scheduleElection(delay: number | undefined): void {
+		if (this.electionTimer) clearTimeout(this.electionTimer);
+		this.electionTimer = undefined;
+		if (delay === undefined || this.stopped) return;
+		this.electionTimer = setTimeout(() => {
+			this.electionTimer = undefined;
+			void this.run(() => this.electionTick());
+		}, Math.max(0, delay));
+		this.electionTimer.unref?.();
+	}
+
+	/** Claims the item in the shared journal while this agent is idle, and starts it. */
+	private async tryClaim(candidate: Extract<GroupProgressRecord, { type: "group_candidate" }>, alreadyClaimed: boolean): Promise<"claimed" | "lost" | "busy"> {
+		const first = candidate.firstMessageId;
+		const messages: GroupMessage[] = [];
+		for (const id of candidate.messageIds) {
+			const message = await this.options.journal.message(this.config.chatId, id);
+			if (message) messages.push(message);
+		}
+		if (!messages.length || !this.options.claimWhenIdle) return "busy";
+		let won = alreadyClaimed;
+		const result = await this.options.claimWhenIdle(async () => {
+			if (!won) won = (await this.options.journal.claim(this.config.chatId, first, this.self!.username)).won;
+			return won ? this.ownerItem(messages) : undefined;
+		});
+		if (result === "busy") return "busy";
+		await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: won ? "claimed" : "lost", timestamp: this.timestamp() });
+		if (!won) return "lost";
+		const notice = await this.options.journal.noticeFor(this.config.chatId, first);
+		if (notice) await this.options.api.deleteMessage(String(notice)).catch((error) => this.options.onError(error));
+		for (const peer of this.config.otherAgents) void this.options.coordinate?.(peer, { kind: "claimed", messageId: first, agent: this.self!.username });
+		return "claimed";
+	}
+
+	/** Handles POST /coordinate from a peer. */
+	async acceptCoordination(body: unknown): Promise<EndpointResponse> {
+		if (!this.self) return { status: 503, body: { error: "The group runtime has not started" } };
+		const value = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+		if (value.kind === "claimed") {
+			if (!Number.isSafeInteger(value.messageId)) return { status: 400, body: { error: "messageId must be an integer" } };
+			// The shared journal, not the notification, decides the winner.
+			void this.run(() => this.electionTick());
+			return { status: 200, body: { agent: await this.options.journal.claimFor(this.config.chatId, value.messageId as number) ?? null } };
+		}
+		if (value.kind === "roster") {
+			const mine = this.rosterFingerprint();
+			const match = value.roster === mine;
+			if (!match) await this.rosterMismatch(String(value.agent ?? "a peer"));
+			return { status: 200, body: { roster: mine, match } };
+		}
+		return { status: 400, body: { error: "kind must be \"claimed\" or \"roster\"" } };
+	}
+
+	/** Every agent must agree on the group, owner, roster and election step for ranks to agree. */
+	rosterFingerprint(): string {
+		const ids = [this.self!.id, ...this.config.otherAgents.map((agent) => agent.botUserId)].sort((a, b) => a - b);
+		return `${this.config.chatId}:${this.options.ownerUserId}:${ids.join(",")}:${this.config.electionStepMs}`;
+	}
+
+	private rosterMismatched = false;
+
+	private async rosterMismatch(peer: string): Promise<void> {
+		await this.options.journal.appendEvent(() => ({ kind: "roster_check", agent: this.self!.username, peer, result: "mismatch" }), () => undefined).catch((error) => this.options.onError(error));
+		this.rosterMismatched = true;
+		this.setMembership({ state: "unverified", reason: `the group configuration differs from ${peer}'s (roster, owner or election step)` });
+	}
+
+	/** Compares configuration with every reachable peer. */
+	private async exchangeRoster(): Promise<void> {
+		const roster = this.rosterFingerprint();
+		for (const peer of this.config.otherAgents) {
+			const response = await this.options.coordinate?.(peer, { kind: "roster", agent: this.self!.username, roster });
+			const reply = response?.body as { roster?: unknown; match?: unknown } | undefined;
+			if (response?.status === 200 && reply?.roster !== roster) return this.rosterMismatch(`@${peer.telegramAccount}`);
+		}
 	}
 
 	/** Verifies and queues a peer's wake-up for a journaled group message. */

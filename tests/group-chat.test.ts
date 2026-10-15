@@ -85,7 +85,7 @@ interface Agent {
 	runTurn(answer: string): Promise<string>;
 }
 
-function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wake: (peer: GroupAgentConfig, messageId: number) => Promise<WakeResult>, extra: { events?: unknown; datastore?: GroupChatConfig["datastore"] } = {}): Agent {
+function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wake: (peer: GroupAgentConfig, messageId: number) => Promise<WakeResult>, extra: { events?: unknown; datastore?: GroupChatConfig["datastore"]; electionStepMs?: number; coordinate?: (peer: GroupAgentConfig, body: unknown) => Promise<{ status: number; body: unknown } | undefined> } = {}): Agent {
 	const self = AGENTS[key];
 	const other: AgentKey = key === "a" ? "b" : "a";
 	const journal = new MemoryJournal();
@@ -106,12 +106,12 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 		registerTool(definition: any) { tools.set(definition.name, definition); },
 		sendUserMessage(text: string) { prompts.push(text); },
 	} as unknown as ExtensionAPI;
-	const config: GroupChatConfig = { chatId: GROUP, sharedRoot, datastore: extra.datastore ?? { mode: "off", store: "telegram-group" }, electionStepMs: 250, otherAgents: [peerConfig(other)] };
+	const config: GroupChatConfig = { chatId: GROUP, sharedRoot, datastore: extra.datastore ?? { mode: "off", store: "telegram-group" }, electionStepMs: extra.electionStepMs ?? 250, otherAgents: [peerConfig(other)] };
 	createTelegramOwnerExtension({ dependencies: {
 		journal, ownerUserId: OWNER, privateChatId: self.privateChat, agentLabel: self.name, queuePort: 0,
 		source: { async start(handler) { onBatch = handler; return async () => {}; } },
 		async sendReply(text, replyTo) { privateReplies.push(text); privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
-		groupChat: { config, api, journalOptions, wake },
+		groupChat: { config, api, journalOptions, wake, ...(extra.coordinate ? { coordinate: extra.coordinate } : {}) },
 	} })(pi);
 	const ctx = {
 		cwd: PROJECT_ROOT, isIdle: () => idle,
@@ -152,7 +152,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 	};
 }
 
-async function twoAgents(t: test.TestContext, wakeOverride?: (to: AgentKey, messageId: number) => Promise<WakeResult>) {
+async function twoAgents(t: test.TestContext, wakeOverride?: (to: AgentKey, messageId: number) => Promise<WakeResult>, stepFor: Partial<Record<AgentKey, number>> = {}) {
 	const sharedRoot = await mkdtemp(join(tmpdir(), "group-chat-"));
 	const ids = { next: 5_000 };
 	const agents = {} as Record<AgentKey, Agent>;
@@ -163,8 +163,19 @@ async function twoAgents(t: test.TestContext, wakeOverride?: (to: AgentKey, mess
 		const response = await fetch(`http://127.0.0.1:${agents[to].port()}/queue`, { method: "POST", body: JSON.stringify({ kind: "group-message", messageId }) });
 		return response.status === 202 ? "accepted" : response.status === 409 || response.status === 400 ? "rejected" : "retry";
 	};
-	agents.a = startAgent("a", sharedRoot, ids, wakeFor("a"));
-	agents.b = startAgent("b", sharedRoot, ids, wakeFor("b"));
+	const coordinateFor = (from: AgentKey) => async (_peer: GroupAgentConfig, body: unknown) => {
+		const to: AgentKey = from === "a" ? "b" : "a";
+		const port = agents[to]?.port();
+		if (!port) return undefined;
+		try {
+			const response = await fetch(`http://127.0.0.1:${port}/coordinate`, { method: "POST", body: JSON.stringify(body) });
+			return { status: response.status, body: await response.json() };
+		} catch {
+			return undefined;
+		}
+	};
+	agents.a = startAgent("a", sharedRoot, ids, wakeFor("a"), { coordinate: coordinateFor("a"), electionStepMs: stepFor.a });
+	agents.b = startAgent("b", sharedRoot, ids, wakeFor("b"), { coordinate: coordinateFor("b"), electionStepMs: stepFor.b });
 	for (const agent of Object.values(agents)) await agent.emit("session_start", { type: "session_start", reason: "startup" });
 	// Agents stop before their shared root is removed.
 	t.after(async () => {
@@ -464,4 +475,79 @@ test("/new ends queued group work with a notice that wakes the requester, and cl
 	assert.equal(agents.b.prompts.some((prompt) => prompt.includes("Logs are clean.")), false, "an answer to a request closed by /new does not start work");
 	assert.ok(agents.b.journal.records.some((record) => record.type === "group_requests_closed"));
 	assert.ok(outstanding.details.messageId);
+});
+
+test("election ranks rotate the roster by message ID", async () => {
+	const { GroupRuntime } = await import("../src/group-runtime.ts");
+	const runtime = new GroupRuntime({ config: { chatId: GROUP, sharedRoot: "/x", datastore: { mode: "off", store: "telegram-group" }, electionStepMs: 250, otherAgents: [peerConfig("b"), { telegramAccount: "example_agent_c_bot", telegramName: "Agent C", botUserId: 203, queuePort: 7003 }] }, ownerUserId: OWNER, api: new FakeGroupApi(AGENTS.a, { next: 1 }), journal: new GroupJournal("/x"), bridge: () => undefined, admit: async () => undefined, quietWindowMs: 0, report() {}, onError() {} });
+	await runtime.start();
+	assert.deepEqual([90, 91, 92, 93].map((id) => runtime.electionRank(id)), [0, 2, 1, 0]);
+	await runtime.stop();
+});
+
+test("an unaddressed owner message is claimed by exactly one idle agent, rotating by message", async (t) => {
+	const { agents, shared } = await twoAgents(t);
+	await verified(agents);
+	for (const [messageId, expected] of [[80, "a"], [81, "b"]] as const) {
+		const update = ownerGroupMessage(messageId, "Can anyone look at this?");
+		await Promise.all([agents.a.batch([update]), agents.b.batch([update])]);
+		const winner = agents[expected];
+		const loser = agents[expected === "a" ? "b" : "a"];
+		await waitFor(() => winner.prompts.length === 1);
+		assert.match(winner.prompts[0]!, /From: the owner \(owner authority\)/);
+		assert.equal(await shared.claimFor(GROUP, messageId), AGENTS[expected].username);
+		await waitFor(() => loser.journal.records.some((record) => record.type === "group_candidate_done" && record.firstMessageId === messageId && record.outcome === "lost"));
+		assert.equal(loser.prompts.length, 0);
+		await winner.runTurn("On it.");
+		winner.prompts.length = 0;
+	}
+});
+
+test("a busy rank-0 agent loses the item to an idle peer after one election step", async (t) => {
+	const { agents, shared } = await twoAgents(t);
+	await verified(agents);
+	agents.a.setIdle(false);
+	const update = ownerGroupMessage(82, "Is anybody free?");
+	const started = Date.now();
+	await Promise.all([agents.a.batch([update]), agents.b.batch([update])]);
+	await waitFor(() => agents.b.prompts.length === 1, 3_000);
+	assert.ok(Date.now() - started >= 200, "the rank-1 agent waits one step");
+	assert.equal(await shared.claimFor(GROUP, 82), AGENTS.b.username);
+	agents.a.setIdle(true);
+	await agents.a.emit("agent_settled", { type: "agent_settled" });
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(agents.a.prompts.length, 0);
+});
+
+test("when everyone is busy one notice is posted, and the first agent to become idle claims the item and removes it", async (t) => {
+	const { agents, shared } = await twoAgents(t);
+	await verified(agents);
+	agents.a.setIdle(false);
+	agents.b.setIdle(false);
+	const update = ownerGroupMessage(84, "Whoever is free: please triage.");
+	await Promise.all([agents.a.batch([update]), agents.b.batch([update])]);
+	await waitFor(() => [...agents.a.api.sent, ...agents.b.api.sent].some((message) => message.text.startsWith("Everyone is busy")), 3_000);
+	await new Promise((resolve) => setTimeout(resolve, 600));
+	const notices = [...agents.a.api.sent, ...agents.b.api.sent].filter((message) => message.text.startsWith("Everyone is busy"));
+	assert.equal(notices.length, 1);
+	assert.equal(notices[0]!.replyTo, 84);
+	assert.equal(await shared.noticeFor(GROUP, 84), notices[0]!.id);
+
+	agents.b.setIdle(true);
+	await agents.b.emit("agent_settled", { type: "agent_settled" });
+	await waitFor(() => agents.b.prompts.length === 1);
+	assert.equal(await shared.claimFor(GROUP, 84), AGENTS.b.username);
+	await waitFor(() => agents.b.api.calls.includes(`delete:${notices[0]!.id}`));
+	agents.a.setIdle(true);
+	await agents.a.emit("agent_settled", { type: "agent_settled" });
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(agents.a.prompts.length, 0);
+});
+
+test("agents that disagree on the roster or election step pause the group", async (t) => {
+	const { agents, shared } = await twoAgents(t, undefined, { b: 500 });
+	await waitFor(() => agents.a.status().includes("group=unverified") || agents.b.status().includes("group=unverified"), 3_000);
+	const paused = agents.b.status().includes("group=unverified") ? agents.b : agents.a;
+	assert.match(paused.privateReplies.at(-1)!, /group configuration differs/);
+	assert.ok((await shared.events()).some((event) => event.kind === "roster_check" && event.result === "mismatch"));
 });

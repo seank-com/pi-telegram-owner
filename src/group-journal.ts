@@ -220,6 +220,21 @@ export class GroupJournal {
 		});
 	}
 
+	/** Posts and records at most one election notice per message; returns the notice's message ID. */
+	reserveNotice(chatId: number, messageId: number, agent: string, send: () => Promise<number>): Promise<number> {
+		return this.withLock(async (events, append) => {
+			const existing = events.find((event): event is Extract<GroupEvent, { kind: "election_notice" }> => event.kind === "election_notice" && event.chatId === chatId && event.messageId === messageId);
+			if (existing) return existing.noticeMessageId;
+			const noticeMessageId = await send();
+			await append({ kind: "election_notice", chatId, messageId, noticeMessageId, agent });
+			return noticeMessageId;
+		});
+	}
+
+	async noticeFor(chatId: number, messageId: number): Promise<number | undefined> {
+		return (await this.events()).find((event): event is Extract<GroupEvent, { kind: "election_notice" }> => event.kind === "election_notice" && event.chatId === chatId && event.messageId === messageId)?.noticeMessageId;
+	}
+
 	/** Records an event that needs no deduplication beyond what the caller checks under the lock. */
 	appendEvent<T>(decide: (events: readonly GroupEvent[]) => GroupEventInput | undefined, result: (event: GroupEvent | undefined) => T): Promise<T> {
 		return this.withLock(async (events, append) => {

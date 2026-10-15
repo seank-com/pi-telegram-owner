@@ -410,9 +410,9 @@ transport journal; senders retry until they receive it.
 - `POST /coordinate` carries coordination between agents:
   - `{"kind": "claimed", "messageId": N, "agent": "username"}`: the receiver
     confirms the claim in the shared journal before acting on it.
-  - `{"kind": "roster", "agent": "username", "roster": [...], "electionStepMs": N}`:
-    the receiver compares the roster and step with its own and answers with
-    its own values.
+  - `{"kind": "roster", "agent": "username", "roster": "fingerprint"}`: the
+    fingerprint covers the group, owner, every agent's bot ID and the election
+    step. The receiver answers with its own fingerprint and whether they match.
 - `GET /status` returns `idle` or `busy`, queue depth by tier, and whether the
   group is verified.
 

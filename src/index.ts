@@ -84,6 +84,7 @@ export interface PrototypeDependencies {
 		api: GroupTelegramApi;
 		journalOptions?: GroupJournalOptions;
 		wake?: GroupRuntimeOptions["wake"];
+		coordinate?: GroupRuntimeOptions["coordinate"];
 	};
 	/** Local queue endpoint port on 127.0.0.1; 0 selects a free port. */
 	queuePort?: number;
@@ -554,6 +555,13 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			}
 		};
 
+		/** Idle for elections: nothing running, queued, being collected in the quiet window, or awaiting delivery. */
+		const electionIdle = (): boolean => {
+			if (!bridge || !currentContext || compacting || switching || !currentContext.isIdle()) return false;
+			const queued = bridge.queueDepthByTier;
+			return !bridge.activeJob && queued.owner + queued.peer === 0 && bridge.nextBatchReadyDelayMs === undefined && bridge.pendingReplyCount === 0;
+		};
+
 		const isBusy = (): boolean => Boolean(bridge?.activeJob) || compacting || switching || (currentContext ? !currentContext.isIdle() : false);
 
 		const endpointHandlers = (ownGeneration: number): QueueEndpointHandlers => ({
@@ -583,7 +591,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				if (!admitted) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
 				return { status: 202, body: { itemId: admitted.item.itemId, duplicate: admitted.duplicate } };
 			},
-			coordinate: async () => ({ status: 409, body: { error: "The group chat is not configured" } }),
+			coordinate: async (body) => (groupRuntime ? groupRuntime.acceptCoordination(body) : { status: 409, body: { error: "The group chat is not configured" } }),
 			status: async () => ({
 				status: 200,
 				body: {
@@ -648,6 +656,31 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				// The same window the bridge applies to private messages.
 				quietWindowMs: deps.inboundQuietWindowMs ?? (options.dependencies ? 0 : DEFAULT_INBOUND_QUIET_WINDOW_MS),
 				wake: group.wake,
+				coordinate: group.coordinate ?? (async (peer, body) => {
+					try {
+						const response = await fetch(`http://${QUEUE_ENDPOINT_HOST}:${peer.queuePort}/coordinate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+						return { status: response.status, body: await response.json() };
+					} catch {
+						return undefined;
+					}
+				}),
+				claimWhenIdle: (claim) => serialized(async () => {
+					if (generation !== ownGeneration || !bridge || !electionIdle()) return "busy" as const;
+					const input = await claim();
+					if (input) {
+						await bridge.admitItem(input);
+						try {
+							if (currentContext) {
+								await dispatchIfIdle(currentContext);
+								await postQueuedNotices();
+							}
+						} catch (error) {
+							noteError(error);
+						}
+						updateStatus();
+					}
+					return "done" as const;
+				}),
 				report: (text) => { void deps.sendReply(text).catch((error) => noteError(error)); },
 				onError: (error) => { lastGroupError = sanitizeError(error); updateStatus(); },
 				onStatus: updateStatus,
@@ -929,6 +962,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						if (generation !== ownGeneration || !bridge) return bridge?.cursor;
 						const state = await bridge.ingestBatch(updates);
 						groupRuntime?.notifyUpdates();
+						groupRuntime?.notifyIdle();
 						for (let index = 0; index < state.acceptedModelInputCount; index++) startReceiptTyping();
 						await capturePendingInboundMedia();
 						await retryPendingReplies();
@@ -1031,6 +1065,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				await postQueuedNotices();
 				updateStatus();
 			});
+			groupRuntime?.notifyIdle();
 		});
 
 		pi.on("session_before_switch", () => (bridge?.activeJob ? { cancel: true } : undefined));

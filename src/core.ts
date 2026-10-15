@@ -87,7 +87,10 @@ export type GroupProgressRecord =
 	| { type: "group_wake"; messageId: number; peer: string; timestamp: string }
 	| { type: "group_wake_done"; messageId: number; peer: string; outcome: "accepted" | "rejected"; timestamp: string }
 	/** /new closes requests this agent was waiting on; later answers become context. */
-	| { type: "group_requests_closed"; timestamp: string };
+	| { type: "group_requests_closed"; timestamp: string }
+	/** An unaddressed owner item this agent may claim in an election. */
+	| { type: "group_candidate"; firstMessageId: number; messageIds: number[]; timestamp: string }
+	| { type: "group_candidate_done"; firstMessageId: number; outcome: "claimed" | "lost"; timestamp: string };
 
 export interface FetchLike {
 	(input: string, init: { method: string; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal }): Promise<{
