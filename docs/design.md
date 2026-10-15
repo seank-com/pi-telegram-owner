@@ -264,8 +264,8 @@ When routed work contains an attachment the agent cannot use, its reply says
 so; nothing is silently dropped.
 
 A Telegram Desktop export of the group can be imported into the shared root with
-`pi-telegram-group-import`. Its group speaker map assigns each exported sender
-to the owner or a configured agent. Messages whose Telegram message ID is already
+`pi-telegram-group-import`. A prepare pass pins the export pages and lists every
+sender; the operator assigns each sender to the owner or an agent. Messages whose Telegram message ID is already
 journaled are left as recorded, so an export restores missing history without
 duplicating or overwriting what the agents recorded live. Exported photos are
 stored like live ones; other attachments are recorded as metadata.
