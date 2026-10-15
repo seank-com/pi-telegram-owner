@@ -90,7 +90,9 @@ export type GroupProgressRecord =
 	| { type: "group_requests_closed"; timestamp: string }
 	/** An unaddressed owner item this agent may claim in an election. */
 	| { type: "group_candidate"; firstMessageId: number; messageIds: number[]; timestamp: string }
-	| { type: "group_candidate_done"; firstMessageId: number; outcome: "claimed" | "lost"; timestamp: string };
+	| { type: "group_candidate_done"; firstMessageId: number; outcome: "claimed" | "lost"; timestamp: string }
+	/** The latest group message an admitted group item brought into this agent's session. */
+	| { type: "group_seen"; messageId: number; timestamp: string };
 
 export interface FetchLike {
 	(input: string, init: { method: string; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal }): Promise<{
@@ -150,8 +152,31 @@ export interface WorkItem {
 	timestamp: string;
 }
 
+/** Why a turn ended without a usable final reply. */
+export type TurnFailureCode = "LENGTH" | "ABORTED" | "MODEL_ERROR" | "NO_REPLY";
+
+const TURN_FAILURE_TEXT: Record<TurnFailureCode, string> = {
+	LENGTH: "the reply was cut off by the model's length limit",
+	ABORTED: "the turn was stopped before it finished",
+	MODEL_ERROR: "the model request failed",
+	NO_REPLY: "the model produced no reply",
+};
+
+export function turnFailureNotice(code: TurnFailureCode): string {
+	return `Couldn't finish this: ${TURN_FAILURE_TEXT[code]}.`;
+}
+
+/** How a turn ended, from the session's final assistant message. */
+export interface TurnOutcome {
+	text?: string;
+	failure?: TurnFailureCode;
+	/** Bounded provider detail for diagnostics; never shown to the chat. */
+	detail?: string;
+}
+
 export type JournalRecord =
 	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
+	| { type: "turn_failed"; jobId: string; code: TurnFailureCode; detail?: string; timestamp: string }
 	| GroupProgressRecord
 	| {
 			type: "update";
@@ -560,6 +585,7 @@ export class TelegramOwnerBridge {
 	private dispatchConfirmed = false;
 	private sawOwnInput = false;
 	private assistantText?: string;
+	private turnOutcome?: TurnOutcome;
 	private stopped = false;
 	private appendTail: Promise<void> = Promise.resolve();
 
@@ -1114,14 +1140,30 @@ export class TelegramOwnerBridge {
 		return true;
 	}
 
-	captureAgentEnd(text: string | undefined): void {
-		if (this.dispatchConfirmed && text) this.assistantText = text;
+	captureAgentEnd(outcome: string | TurnOutcome | undefined): void {
+		if (!this.dispatchConfirmed) return;
+		const result = typeof outcome === "string" || outcome === undefined ? { text: outcome } : outcome;
+		this.turnOutcome = result.failure || !result.text ? { failure: result.failure ?? "NO_REPLY", ...(result.detail ? { detail: result.detail } : {}) } : { text: result.text };
+		this.assistantText = this.turnOutcome.text;
+	}
+
+	/** The most recent turn that ended without a usable reply. */
+	get lastTurnFailure(): Extract<JournalRecord, { type: "turn_failed" }> | undefined {
+		return this.records.findLast((record): record is Extract<JournalRecord, { type: "turn_failed" }> => record.type === "turn_failed");
 	}
 
 	async settle(send: SendReply, route?: ItemReplyRoute): Promise<boolean> {
-		if (!this.active || !this.dispatchConfirmed || this.assistantText === undefined) return false;
+		if (!this.active || !this.dispatchConfirmed || !this.turnOutcome) return false;
 		const job = this.active;
-		const text = this.assistantText;
+		const outcome = this.turnOutcome;
+		this.turnOutcome = undefined;
+		let text: string;
+		if (outcome.failure) {
+			// A failed turn still gets a visible disposition; it is a notice, not the model's answer.
+			text = turnFailureNotice(outcome.failure);
+			await this.append({ type: "turn_failed", jobId: job.jobId, code: outcome.failure, ...(outcome.detail ? { detail: outcome.detail } : {}), timestamp: new Date(this.now()).toISOString() });
+			await this.append({ type: "interrupted", jobId: job.jobId, reason: outcome.failure });
+		} else text = outcome.text!;
 		await this.append({ type: "reply_ready", jobId: job.jobId, text, timestamp: new Date().toISOString() });
 		// The durable ready reply is retried by retryReadyReplies if delivery
 		// fails, so the job no longer holds the queue.

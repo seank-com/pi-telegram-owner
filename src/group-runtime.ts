@@ -433,6 +433,20 @@ export class GroupRuntime {
 
 	private async admitOwnerItem(messages: GroupMessage[]): Promise<void> {
 		await this.options.admit(await this.ownerItem(messages));
+		await this.markSeen(messages.at(-1)!.messageId);
+	}
+
+	/** Tells a group turn how much of the room it has not seen since its previous group turn. */
+	private async missedLines(firstMessageId: number): Promise<string[]> {
+		const seen = this.records().reduce((latest, record) => (record.type === "group_seen" ? Math.max(latest, record.messageId) : latest), 0);
+		const missed = (await this.options.journal.timeline({ chatId: this.config.chatId, before: firstMessageId, ...(seen ? { after: seen } : {}), limit: Number.MAX_SAFE_INTEGER })).filter((message) => message.senderId !== this.self?.id).length;
+		if (!missed) return [];
+		const count = `${missed} group ${missed === 1 ? "message" : "messages"}`;
+		return [seen ? `${count} arrived since your previous group turn; read them with telegram_group_timeline if they matter.` : `There are ${count} before this one; read them with telegram_group_timeline if they matter.`];
+	}
+
+	private async markSeen(messageId: number): Promise<void> {
+		await this.append({ type: "group_seen", messageId, timestamp: this.timestamp() });
 	}
 
 	private async ownerItem(messages: GroupMessage[]): Promise<Omit<WorkItem, "itemId" | "timestamp"> & { itemId: string }> {
@@ -450,6 +464,7 @@ export class GroupRuntime {
 			reply: { kind: "group", chatId: this.config.chatId, messageId: last.messageId },
 			context: [
 				...(await this.contextFor(first)),
+				...(await this.missedLines(first.messageId)),
 				...(unusable.length ? [`The owner's message includes ${unusable.join(" and ")} that you cannot open; say so in your reply if it matters.`] : []),
 			],
 			...(images.length ? { images } : {}),
@@ -542,6 +557,7 @@ export class GroupRuntime {
 		if (result === "busy") return "busy";
 		await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: won ? "claimed" : "lost", timestamp: this.timestamp() });
 		if (!won) return "lost";
+		await this.markSeen(Math.max(...candidate.messageIds));
 		const notice = await this.options.journal.noticeFor(this.config.chatId, first);
 		if (notice) await this.options.api.deleteMessage(String(notice)).catch((error) => this.options.onError(error));
 		for (const peer of this.config.otherAgents) void this.options.coordinate?.(peer, { kind: "claimed", messageId: first, agent: this.self!.username });
@@ -612,8 +628,9 @@ export class GroupRuntime {
 			sender: `${peer.telegramName} (@${peer.telegramAccount})`,
 			text: message.text || "[empty message]",
 			reply: { kind: "group", chatId: this.config.chatId, messageId: message.messageId },
-			context: await this.contextFor(message),
+			context: [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))],
 		}) as { item: WorkItem; duplicate: boolean } | undefined;
+		await this.markSeen(message.messageId);
 		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
 	}
 
@@ -640,6 +657,7 @@ export class GroupRuntime {
 		} else {
 			reply = { kind: "group", chatId: this.config.chatId, messageId: message.messageId };
 		}
+		context.push(...(await this.missedLines(message.messageId)));
 		context.push("Use telegram_group_timeline or telegram_timeline if you need more of that conversation.");
 		const result = await this.options.admit({
 			itemId: groupItemId(this.config.chatId, message.messageId),
@@ -650,6 +668,7 @@ export class GroupRuntime {
 			reply,
 			context,
 		}) as { item: WorkItem; duplicate: boolean } | undefined;
+		await this.markSeen(message.messageId);
 		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
 	}
 

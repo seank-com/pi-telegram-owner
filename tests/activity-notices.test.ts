@@ -139,3 +139,29 @@ test("a failed final reply leaves the activity visible until a retry succeeds", 
 	assert.ok(host.calls.some((call) => call.startsWith("delete:")));
 	assert.equal(host.journal.records.filter((record) => record.type === "activity_cleared").length, 1);
 });
+
+test("a turn that fails gets a visible notice and a diagnostic, and the queue moves on", async () => {
+	const host = harness();
+	await host.emit("session_start", { type: "session_start", reason: "startup" });
+	const cases = [
+		{ messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "provider exploded token=secret-value" }], notice: "Couldn't finish this: the model request failed.", code: "MODEL_ERROR" },
+		{ messages: [{ role: "assistant", content: [{ type: "text", text: "partial answ" }], stopReason: "length" }], notice: "Couldn't finish this: the reply was cut off by the model's length limit.", code: "LENGTH" },
+		{ messages: [{ role: "user", content: "x" }], notice: "Couldn't finish this: the model produced no reply.", code: "NO_REPLY" },
+	];
+	for (const [index, item] of cases.entries()) {
+		await host.batch([ownerText(10 + index, 200 + index, `question ${index}`)]);
+		const prompt = host.prompts.at(-1)!;
+		await host.emit("input", { type: "input", source: "extension", text: prompt });
+		await host.emit("before_agent_start", { type: "before_agent_start", prompt });
+		await host.emit("agent_end", { type: "agent_end", messages: item.messages });
+		await host.emit("agent_settled", { type: "agent_settled" });
+		assert.ok(host.calls.includes(`reply:${200 + index}:${item.notice}`), `${item.code} notice`);
+		const failure = host.journal.records.findLast((record) => record.type === "turn_failed")!;
+		assert.equal((failure as { code: string }).code, item.code);
+	}
+	assert.equal(host.calls.some((call) => call.includes("partial answ")), false, "a cut-off reply is not posted as an answer");
+	const detail = (host.journal.records.find((record) => record.type === "turn_failed") as { detail?: string }).detail;
+	assert.match(detail!, /provider exploded/);
+	assert.doesNotMatch(detail!, /secret-value/);
+	assert.equal(host.prompts.length, 3, "each failure released the queue for the next request");
+});

@@ -594,3 +594,59 @@ test("an attachment the agent cannot open is recorded and the agent is told to s
 	assert.equal(agents.a.api.downloads, 0);
 	assert.deepEqual((await shared.message(GROUP, 91))?.media, { kind: "document", fileName: "report.json", mimeType: "application/json", size: 1200 });
 });
+
+test("a group turn is told how many group messages it missed since its previous group turn", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const forB = (id: number) => { const text = `@example_agent_b_bot note ${id}`; return ownerGroupMessage(id, text, { entities: [mention(text, AGENTS.b.username)] }); };
+	const forA = (id: number) => { const text = `@example_agent_a_bot task ${id}`; return ownerGroupMessage(id, text, { entities: [mention(text, AGENTS.a.username)] }); };
+	const routed = () => agents.a.journal.records.filter((record) => record.type === "group_handled" && record.stage === "routed").length;
+	await agents.a.batch([forB(110), forB(111)]);
+	await waitFor(() => routed() === 2);
+	await agents.a.batch([forA(112)]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	assert.match(agents.a.prompts[0]!, /There are 2 group messages before this one; read them with telegram_group_timeline if they matter\./);
+	await agents.a.runTurn("Done.");
+	await agents.a.batch([forB(120)]);
+	await waitFor(() => routed() === 4);
+	await agents.a.batch([forA(121)]);
+	await waitFor(() => agents.a.prompts.length === 2);
+	assert.match(agents.a.prompts[1]!, /1 group message arrived since your previous group turn/, "its own answer is not counted");
+	await agents.a.runTurn("Done again.");
+	await agents.a.batch([forA(130)]);
+	await waitFor(() => agents.a.prompts.length === 3);
+	assert.doesNotMatch(agents.a.prompts[2]!, /group messages? (arrived|before)/);
+});
+
+test("a failed peer request gets a visible notice that wakes the requester", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const request = await agents.a.tools.get("telegram_group_send").execute("fail-1", { text: "@example_agent_b_bot run the migration" });
+	await waitFor(() => agents.b.prompts.length === 1);
+	await agents.b.startTurn();
+	await agents.b.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "rate limited" }] });
+	agents.b.setIdle(true);
+	await agents.b.emit("agent_settled", { type: "agent_settled" });
+	await waitFor(() => agents.b.api.sent.some((message) => message.text === "Couldn't finish this: the model request failed." && message.replyTo === request.details.messageId));
+	await waitFor(() => agents.a.prompts.length === 1);
+	assert.match(agents.a.prompts[0]!, /Couldn't finish this: the model request failed\.$/);
+});
+
+test("/status in the private chat reports the group, the endpoint and the last failed turn", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const text = "@example_agent_a_bot try this";
+	await agents.a.batch([ownerGroupMessage(140, text, { entities: [mention(text, AGENTS.a.username)] })]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.a.startTurn();
+	await agents.a.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "aborted" }] });
+	agents.a.setIdle(true);
+	await agents.a.emit("agent_settled", { type: "agent_settled" });
+	await agents.a.batch([ownerPrivate("a", 500, "/status")]);
+	await waitFor(() => agents.a.privateReplies.some((reply) => reply.startsWith("State:")));
+	const status = agents.a.privateReplies.find((reply) => reply.startsWith("State:"))!;
+	assert.match(status, /Telegram: \w+, queue 0 owner, 0 peer/);
+	assert.match(status, /\nGroup: verified/);
+	assert.match(status, /\nQueue endpoint: 127\.0\.0\.1:\d+/);
+	assert.match(status, /\nLast failed turn: ABORTED at /);
+});

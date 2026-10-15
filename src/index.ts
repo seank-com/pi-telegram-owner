@@ -19,6 +19,7 @@ import {
 	type Journal,
 	type Job,
 	type WorkItem,
+	type TurnOutcome,
 	type ArchivedTelegramAttachment,
 	type ResolvedArchivedImage,
 	TelegramOwnerBridge,
@@ -116,6 +117,17 @@ export interface ExtensionOptions {
 }
 
 const GENERIC_AGENT_LABEL = "The agent";
+
+/** Reads how a turn ended from its final assistant message. */
+export function turnOutcome(messages: unknown[]): TurnOutcome {
+	const last = [...messages].reverse().find((message) => (message as { role?: string }).role === "assistant") as { stopReason?: string; errorMessage?: unknown } | undefined;
+	const detail = typeof last?.errorMessage === "string" ? sanitizeError(last.errorMessage).slice(0, 300) : undefined;
+	if (last?.stopReason === "length") return { failure: "LENGTH" };
+	if (last?.stopReason === "aborted") return { failure: "ABORTED" };
+	if (last?.stopReason === "error") return { failure: "MODEL_ERROR", ...(detail ? { detail } : {}) };
+	const text = extractAssistantText(messages);
+	return text ? { text } : { failure: "NO_REPLY" };
+}
 const GROUP_SEND_TOOL = "telegram_group_send";
 export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 	// Capture this once, before any session can change its active cwd.
@@ -443,11 +455,17 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unavailable";
 			const state = switching ? "switching" : compacting ? "compacting" : ctx.isIdle() ? "idle" : "working";
 			const active = bridge?.activeJob ? `, active ${bridge.activeJob.jobId.slice(0, 8)}` : "";
+			const queued = bridge?.queueDepthByTier;
+			const group = groupRuntime?.state;
+			const failure = bridge?.lastTurnFailure;
 			return [
 				`State: ${state}`,
 				contextText(ctx),
 				`Model: ${model}, ${ctx.thinkingLevel ?? "off"}`,
-				`Telegram: ${connection.phase}, queue ${bridge?.queueDepth ?? 0}${active}`,
+				`Telegram: ${connection.phase}, queue ${queued ? `${queued.owner} owner, ${queued.peer} peer` : "0"}${active}`,
+				...(group ? [`Group: ${group.state === "unverified" ? `paused, ${group.reason}` : group.state}${lastGroupError ? ` (last error: ${lastGroupError})` : ""}`] : []),
+				...(runtimeDependencies?.queuePort !== undefined ? [`Queue endpoint: ${endpoint ? `${QUEUE_ENDPOINT_HOST}:${endpoint.port}` : `unavailable${lastEndpointError ? `, ${lastEndpointError}` : ""}`}`] : []),
+				...(failure ? [`Last failed turn: ${failure.code} at ${failure.timestamp}${failure.detail ? ` (${failure.detail})` : ""}`] : []),
 			].join("\n");
 		};
 
@@ -1045,7 +1063,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		});
 
 		pi.on("agent_end", (event) => {
-			bridge?.captureAgentEnd(extractAssistantText(event.messages));
+			bridge?.captureAgentEnd(turnOutcome(event.messages));
 		});
 
 		pi.on("agent_settled", async (_event, ctx) => {

@@ -383,9 +383,11 @@ diagnostic while membership is unverified.
 ### Failure and recovery
 
 Every piece of routed group work ends with a visible disposition: a final
-reply, or a reply saying the work failed with a short static reason. A final
-counts only when the model stopped normally with text; output cut off by a
-length limit or an abort is reported as a failure. Failures are not retried
+reply, or a reply saying the work failed with a short static reason. The same
+rule applies to private and queue endpoint work in their own destinations. A
+final counts only when the model stopped normally with text; a model error, an
+empty reply, or output cut off by a length limit or an abort is reported as a
+failure, never posted as an answer. Failures are not retried
 automatically. The owner or requesting agent decides whether to ask again.
 Diagnostic codes and detail are recorded in the agent's transport journal and
 shown by `/status` in the private chat. Startup recovery uses the same
