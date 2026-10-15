@@ -684,7 +684,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				quietWindowMs: deps.inboundQuietWindowMs ?? (options.dependencies ? 0 : DEFAULT_INBOUND_QUIET_WINDOW_MS),
 				wake: group.wake,
 				...(group.retryDelayMs ? { retryDelayMs: group.retryDelayMs } : {}),
-				coordinate: group.coordinate ?? ((peer, body) => postToPeer(peer.queuePort, "/coordinate", body)),
+				coordinate: group.coordinate ?? (async (peer, body) => {
+					const response = await postToPeer(peer.queuePort, "/coordinate", body);
+					return "status" in response ? response : undefined;
+				}),
 				isIdle: () => generation === ownGeneration && electionIdle(),
 				report: (text) => { void deps.sendReply(text).catch((error) => noteError(error)); },
 				onError: (error) => { lastGroupError = sanitizeError(error); updateStatus(); },

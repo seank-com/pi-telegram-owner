@@ -413,9 +413,11 @@ token: it is reachable only from the local host, and the operating-system
 account that runs the agents is their security boundary. Requests and
 responses are JSON. `202` means the item was durably recorded in the agent's
 transport journal, or, for an answer to a request closed by `/new`, that it
-needs no work; senders retry until they receive it. Calls between agents time
-out after ten seconds and are retried, and an agent that stays unreachable is
-reported once in the private chat.
+needs no work; senders retry until they receive it. Calls between agents have
+no deadline, so a slow agent is waited for, and each peer is called on its own
+so a stalled one holds up nothing else. An agent whose endpoint refuses
+connections, because it is not running or its port is wrong, is reported once in
+the private chat while delivery keeps retrying.
 
 - `POST /queue` accepts work.
   - `{"kind": "group-message", "messageId": N}` from another agent: a wake-up

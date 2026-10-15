@@ -120,12 +120,21 @@ export async function startQueueEndpoint(port: number, handlers: QueueEndpointHa
 	};
 }
 
-/** Posts JSON to another agent's endpoint on this host; undefined when it cannot be reached in time. */
-export async function postToPeer(port: number, path: "/queue" | "/coordinate", body: unknown, timeoutMs = 10_000): Promise<EndpointResponse | undefined> {
+export type PeerResponse = EndpointResponse | { unreachable: true } | { failed: true };
+
+const CONNECTION_REFUSED = new Set(["ECONNREFUSED", "EHOSTUNREACH", "EADDRNOTAVAIL"]);
+
+/**
+ * Posts JSON to another agent's endpoint on this host. There is no deadline: a
+ * peer that is slow but alive is waited for. A refused connection means the
+ * agent is not running or the port is wrong.
+ */
+export async function postToPeer(port: number, path: "/queue" | "/coordinate", body: unknown, signal?: AbortSignal): Promise<PeerResponse> {
 	try {
-		const response = await fetch(`http://${QUEUE_ENDPOINT_HOST}:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+		const response = await fetch(`http://${QUEUE_ENDPOINT_HOST}:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), ...(signal ? { signal } : {}) });
 		return { status: response.status, body: await response.json().catch(() => undefined) };
-	} catch {
-		return undefined;
+	} catch (error) {
+		const code = (error as { cause?: { code?: unknown } }).cause?.code;
+		return typeof code === "string" && CONNECTION_REFUSED.has(code) ? { unreachable: true } : { failed: true };
 	}
 }

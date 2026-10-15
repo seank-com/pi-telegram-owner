@@ -731,9 +731,33 @@ test("an agent that lists itself among the other agents does not verify", async 
 	assert.match(agent.privateReplies.at(-1)!, /otherAgents lists this bot \(@example_agent_a_bot\)/);
 });
 
-test("an unreachable peer endpoint is reported while wake-ups keep retrying", async (t) => {
-	const { agent } = await oneAgent(t, { retryDelayMs: () => 10 }, async () => "retry");
+test("a refused peer connection is reported while wake-ups keep retrying", async (t) => {
+	let attempts = 0;
+	const { agent } = await oneAgent(t, { retryDelayMs: () => 10 }, async () => { attempts += 1; return "unreachable"; });
 	await waitFor(() => agent.status().includes("group=verified"));
 	await agent.tools.get("telegram_group_send").execute("unreachable-1", { text: "@example_agent_b_bot are you there?" });
-	await waitFor(() => agent.privateReplies.some((reply) => reply.startsWith("Cannot reach @example_agent_b_bot's queue endpoint on port 7000")), 3_000);
+	await waitFor(() => agent.privateReplies.some((reply) => reply.startsWith("Cannot connect to @example_agent_b_bot's queue endpoint on port 7000")), 3_000);
+	await waitFor(() => attempts > 6);
+	assert.equal(agent.privateReplies.filter((reply) => reply.startsWith("Cannot connect")).length, 1, "reported once");
+});
+
+test("a peer that never answers holds no other group work and does not delay shutdown", async (t) => {
+	let waiting = 0;
+	const sharedRoot = await mkdtemp(join(tmpdir(), "group-slow-"));
+	t.after(() => rm(sharedRoot, { recursive: true, force: true }));
+	const agent = startAgent("a", sharedRoot, { next: 30_000 }, (_peer, _id, signal) => new Promise<WakeResult>((resolve) => {
+		waiting += 1;
+		signal?.addEventListener("abort", () => resolve("retry"), { once: true });
+	}), {});
+	await agent.emit("session_start", { type: "session_start", reason: "startup" });
+	await waitFor(() => agent.status().includes("group=verified"));
+	await agent.tools.get("telegram_group_send").execute("slow-1", { text: "@example_agent_b_bot take your time" });
+	await waitFor(() => waiting === 1);
+	const text = "@example_agent_a_bot meanwhile, this";
+	await agent.batch([ownerGroupMessage(190, text, { entities: [mention(text, AGENTS.a.username)] })]);
+	await waitFor(() => agent.prompts.length === 1);
+	const started = Date.now();
+	await agent.emit("session_shutdown", { type: "session_shutdown", reason: "exit" });
+	assert.ok(Date.now() - started < 1_000, "shutdown does not wait for the stalled peer");
+	assert.ok(!agent.journal.records.some((record) => record.type === "group_wake_done"), "the wake-up stays pending for the next start");
 });

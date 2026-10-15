@@ -29,7 +29,8 @@ export interface GroupTelegramApi {
 	deleteMessage(messageId: string, signal?: AbortSignal): Promise<void>;
 }
 
-export type WakeResult = "accepted" | "rejected" | "retry";
+/** "unreachable" means the connection was refused; "retry" covers anything else that did not settle. */
+export type WakeResult = "accepted" | "rejected" | "retry" | "unreachable";
 
 export interface GroupRuntimeOptions {
 	config: GroupChatConfig;
@@ -42,7 +43,7 @@ export interface GroupRuntimeOptions {
 	/** The owner's consecutive group messages within this window are one item. */
 	quietWindowMs: number;
 	/** Posts a wake-up to a peer's queue endpoint. */
-	wake?(peer: GroupAgentConfig, messageId: number): Promise<WakeResult>;
+	wake?(peer: GroupAgentConfig, messageId: number, signal?: AbortSignal): Promise<WakeResult>;
 	/** A short notice for the owner's private chat. */
 	report(text: string): void;
 	onError(error: unknown): void;
@@ -62,10 +63,12 @@ export type MembershipState = { state: "verifying" } | { state: "verified" } | {
 
 const MEMBER_STATUSES = new Set(["creator", "administrator", "member", "restricted"]);
 
-async function defaultWake(peer: GroupAgentConfig, messageId: number): Promise<WakeResult> {
-	const response = await postToPeer(peer.queuePort, "/queue", { kind: "group-message", messageId });
-	if (response?.status === 202) return "accepted";
-	if (response?.status === 409 || response?.status === 400) return "rejected";
+async function defaultWake(peer: GroupAgentConfig, messageId: number, signal?: AbortSignal): Promise<WakeResult> {
+	const response = await postToPeer(peer.queuePort, "/queue", { kind: "group-message", messageId }, signal);
+	if ("unreachable" in response) return "unreachable";
+	if ("failed" in response) return "retry";
+	if (response.status === 202) return "accepted";
+	if (response.status === 409 || response.status === 400) return "rejected";
 	return "retry";
 }
 
@@ -86,7 +89,9 @@ export class GroupRuntime {
 	private retryAttempt = 0;
 	private lastReported?: string;
 	private lastErrorReported?: string;
-	private readonly wakeAttempts = new Map<string, number>();
+	private readonly peerDeliveries = new Map<string, Promise<void>>();
+	/** Aborted on stop, so a stalled peer call never delays shutdown. */
+	private readonly deliveries = new AbortController();
 
 	/** Replies and transient messages in the group; sends are unavailable while membership is unverified. */
 	readonly transport: {
@@ -164,8 +169,9 @@ export class GroupRuntime {
 		if (this.quietTimer) clearTimeout(this.quietTimer);
 		if (this.retryTimer) clearTimeout(this.retryTimer);
 		if (this.electionTimer) clearTimeout(this.electionTimer);
-		// Interrupts a wait on the shared journal lock so shutdown cannot hang.
+		// Interrupts a wait on the shared journal lock or a peer so shutdown cannot hang.
 		this.options.journal.close();
+		this.deliveries.abort(new Error("Group runtime stopped"));
 		await this.chain;
 	}
 
@@ -758,31 +764,53 @@ export class GroupRuntime {
 		await this.append({ type: "group_post_recorded", postId, messageId: message.messageId, timestamp: this.timestamp() });
 	}
 
+	/** Starts delivery to every peer with pending wake-ups; each peer has its own loop. */
 	private async deliverWakes(): Promise<void> {
+		for (const peer of this.config.otherAgents) {
+			if (this.stopped || this.peerDeliveries.has(peer.telegramAccount) || !this.pendingWakes(peer).length) continue;
+			const delivery = this.deliverToPeer(peer).catch((error) => this.options.onError(error)).finally(() => {
+				this.peerDeliveries.delete(peer.telegramAccount);
+				if (!this.stopped && this.pendingWakes(peer).length) void this.deliverWakes();
+			});
+			this.peerDeliveries.set(peer.telegramAccount, delivery);
+		}
+	}
+
+	private pendingWakes(peer: GroupAgentConfig): number[] {
 		const records = this.records();
-		const done = new Set(records.filter((record) => record.type === "group_wake_done").map((record) => {
-			const item = record as Extract<GroupProgressRecord, { type: "group_wake_done" }>;
-			return `${item.messageId}:${item.peer}`;
-		}));
-		let retry = false;
-		for (const record of records) {
-			if (record.type !== "group_wake" || done.has(`${record.messageId}:${record.peer}`)) continue;
-			const peer = this.agentByAccount(record.peer);
-			if (!peer) continue;
-			const result = await (this.options.wake ?? defaultWake)(peer, record.messageId);
-			if (result === "retry") {
-				retry = true;
-				const attempts = (this.wakeAttempts.get(peer.telegramAccount) ?? 0) + 1;
-				this.wakeAttempts.set(peer.telegramAccount, attempts);
-				if (attempts === 5) this.options.report(`Cannot reach @${peer.telegramAccount}'s queue endpoint on port ${peer.queuePort}; still retrying. Check that the agent is running and that the port matches its queuePort.`);
+		const done = new Set(records.filter((record) => record.type === "group_wake_done" && record.peer === peer.telegramAccount).map((record) => (record as Extract<GroupProgressRecord, { type: "group_wake_done" }>).messageId));
+		return records.filter((record): record is Extract<GroupProgressRecord, { type: "group_wake" }> => record.type === "group_wake" && record.peer === peer.telegramAccount && !done.has(record.messageId)).map((record) => record.messageId);
+	}
+
+	/**
+	 * Delivers one peer's wake-ups in order, outside the group queue, so a slow
+	 * peer never holds other group work. A slow peer is waited for; only a
+	 * refused connection is reported.
+	 */
+	private async deliverToPeer(peer: GroupAgentConfig): Promise<void> {
+		let attempt = 0;
+		let refused = 0;
+		for (let pending = this.pendingWakes(peer); pending.length && !this.stopped; pending = this.pendingWakes(peer)) {
+			const messageId = pending[0]!;
+			const result = await (this.options.wake ?? defaultWake)(peer, messageId, this.deliveries.signal);
+			if (this.stopped) return;
+			if (result === "accepted" || result === "rejected") {
+				attempt = 0;
+				refused = 0;
+				await this.append({ type: "group_wake_done", messageId, peer: peer.telegramAccount, outcome: result, timestamp: this.timestamp() });
+				if (result === "rejected") this.options.report(`@${peer.telegramAccount} refused group message ${messageId}; check that its group chat is configured.`);
 				continue;
 			}
-			this.wakeAttempts.delete(peer.telegramAccount);
-			done.add(`${record.messageId}:${record.peer}`);
-			await this.append({ type: "group_wake_done", messageId: record.messageId, peer: record.peer, outcome: result, timestamp: this.timestamp() });
-			if (result === "rejected") this.options.report(`@${peer.telegramAccount} refused group message ${record.messageId}; check that its group chat is configured.`);
+			refused = result === "unreachable" ? refused + 1 : 0;
+			if (refused === 5) this.options.report(`Cannot connect to @${peer.telegramAccount}'s queue endpoint on port ${peer.queuePort}; still retrying. Check that the agent is running and that the port matches its queuePort.`);
+			const delay = (this.options.retryDelayMs ?? ((n) => Math.min(60_000, 1_000 * 2 ** Math.min(n, 6))))(attempt);
+			attempt += 1;
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, delay);
+				timer.unref?.();
+				this.deliveries.signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+			});
 		}
-		if (retry) this.scheduleRetry();
 	}
 
 	/** Posts a request to the group for telegram_group_send. Never resends an uncertain attempt. */

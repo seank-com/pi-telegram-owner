@@ -212,3 +212,16 @@ test("a port that cannot be bound is reported and leaves the transport running",
 		await blocker.close();
 	}
 });
+
+test("a peer call to a closed port is reported as unreachable, with no deadline on a live peer", async () => {
+	const { postToPeer } = await import("../src/endpoint.ts");
+	const endpoint = await startQueueEndpoint(0, {
+		async queue() { await new Promise((resolve) => setTimeout(resolve, 300)); return { status: 202, body: { slow: true } }; },
+		async coordinate() { return { status: 200, body: {} }; },
+		async status() { return { status: 200, body: {} }; },
+	});
+	const port = endpoint.port;
+	assert.deepEqual(await postToPeer(port, "/queue", {}), { status: 202, body: { slow: true } }, "a slow peer is waited for");
+	await endpoint.close();
+	assert.deepEqual(await postToPeer(port, "/queue", {}), { unreachable: true });
+});
