@@ -82,7 +82,30 @@ export async function fetchUpdateBatch(
 	return payload.result as TelegramUpdate[];
 }
 
+/** Where a work item's final reply goes. */
+export type ReplyDestination =
+	| { kind: "private" }
+	| { kind: "group"; chatId: number; messageId: number }
+	| { kind: "none" };
+
+/** Non-private work admitted to the queue: group messages and queue endpoint items. */
+export interface WorkItem {
+	itemId: string;
+	channel: "group" | "endpoint";
+	authority: "owner" | "peer";
+	/** Display name of the authenticated sender, or the endpoint caller's source label. */
+	sender: string;
+	text: string;
+	reply: ReplyDestination;
+	/** Additional verified context lines for the envelope, such as a referenced owner message. */
+	context?: string[];
+	/** Caller-supplied key; repeating it returns the original item. */
+	idempotencyKey?: string;
+	timestamp: string;
+}
+
 export type JournalRecord =
+	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
 	| {
 			type: "update";
 			schemaVersion?: 2 | 3;
@@ -136,6 +159,38 @@ export interface Job {
 	messageIds?: number[];
 	segmentSha256?: string[];
 	boundaries?: Array<{ start: number; end: number }>;
+	/** Present for non-private work; private jobs answer in the private chat. */
+	item?: WorkItem;
+	/** Owner-authority work runs before peer work. */
+	tier?: "owner" | "peer";
+	/** Admission order within the journal. */
+	order?: number;
+}
+
+export const WORK_ITEM_MARKER_PREFIX = "[telegram-item:";
+
+/** The model-visible envelope for a non-private work item. */
+export function renderWorkItemPrompt(item: WorkItem): string {
+	const channel = item.channel === "group" ? "group chat" : "queue endpoint";
+	const destination = item.reply.kind === "private"
+		? "the private chat with the owner"
+		: item.reply.kind === "group"
+			? `the group chat, as a reply to message ${item.reply.messageId}`
+			: "nowhere; this turn sends no reply";
+	const lines = [
+		`Channel: ${channel}`,
+		`From: ${item.sender} (${item.authority} authority)`,
+		`Your final reply goes to ${destination}.`,
+		...(item.channel === "group" ? ["The owner and every configured agent can read the group chat."] : []),
+		...(item.context ?? []),
+	];
+	return `${lines.join("\n")}\n\n${item.text}`;
+}
+
+/** Item IDs are UUIDs, or endpoint-chosen keys hashed into the same shape. */
+export function workItemIdForKey(channel: WorkItem["channel"], key: string): string {
+	const hex = createHash("sha256").update(`${channel}\n${key}`, "utf8").digest("hex");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 export interface TelegramBridgeOptions {
@@ -164,6 +219,17 @@ export interface Journal {
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 export type SendReply = (text: string, replyTo?: number, format?: "HTML" | "plain") => Promise<string>;
+
+/** Chooses the sender for a work item whose reply goes to the group; undefined when the group is unavailable. */
+export type ItemReplyRoute = (item: WorkItem) => SendReply | undefined;
+
+export class ReplyDestinationUnavailableError extends Error {}
+
+function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>): void {
+	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
+	const validReply = reply?.kind === "private" || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && Number.isSafeInteger(reply.messageId) && reply.messageId! > 0);
+	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
+}
 
 export class StateCorruptionError extends Error {}
 
@@ -343,9 +409,15 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 	const ready = new Map<string, string>();
 	const activities = new Map<string, { jobId: string; messageId: string }>();
 	const batches = new Map<string, Extract<JournalRecord, { type: "inbound_batch" }>>();
+	const items: Job[] = [];
 	let cursor: number | undefined;
-	for (const record of records) {
-		if (record.type === "update") {
+	for (const [order, record] of records.entries()) {
+		if (record.type === "work_item") {
+			validateWorkItem(record);
+			const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+			const anchor = item.reply.kind === "group" ? item.reply.messageId : 0;
+			items.push({ jobId: item.itemId, updateId: 0, messageId: anchor, text: renderWorkItemPrompt(item), images: [], item, tier: item.authority, order });
+		} else if (record.type === "update") {
 			cursor = record.updateId;
 			if (
 				record.disposition === "accepted" &&
@@ -354,6 +426,8 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 				record.text !== undefined
 			) {
 				updates.push({
+					order,
+					tier: "owner",
 					jobId: record.jobId,
 					updateId: record.updateId,
 					messageId: record.messageId,
@@ -391,8 +465,9 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 		if (sentMembers === batch.memberJobIds.length) return false;
 		throw new StateCorruptionError("Inbound batch has partially terminal legacy members");
 	});
-	const batchJobs: Job[] = recoverableBatches.filter((batch) => batch.state !== "open" || new Date(batch.readyAt).valueOf() <= now).map((batch) => ({ jobId: batch.batchId, batchId: batch.batchId, updateId: updateByJobId.get(batch.memberJobIds[0]!)?.updateId ?? 0, messageId: batch.finalMessageId, text: batch.text, images: [], memberJobIds: batch.memberJobIds, messageIds: batch.messageIds, segmentSha256: batch.segmentSha256, boundaries: batch.boundaries }));
-	const unsent = [...updates.filter((job) => !memberJobIds.has(job.jobId)), ...batchJobs].filter((job) => !sent.has(job.jobId) && (job.images.length === 0 || job.captureRequired || capturedInboundJobs.has(job.jobId))).sort((a, b) => a.updateId - b.updateId);
+	const batchJobs: Job[] = recoverableBatches.filter((batch) => batch.state !== "open" || new Date(batch.readyAt).valueOf() <= now).map((batch) => ({ jobId: batch.batchId, batchId: batch.batchId, updateId: updateByJobId.get(batch.memberJobIds[0]!)?.updateId ?? 0, messageId: batch.finalMessageId, text: batch.text, images: [], memberJobIds: batch.memberJobIds, messageIds: batch.messageIds, segmentSha256: batch.segmentSha256, boundaries: batch.boundaries, tier: "owner" as const, order: updateByJobId.get(batch.memberJobIds[0]!)?.order ?? 0 }));
+	const tierRank = (job: Job) => (job.tier === "peer" ? 1 : 0);
+	const unsent = [...updates.filter((job) => !memberJobIds.has(job.jobId)), ...batchJobs, ...items].filter((job) => !sent.has(job.jobId) && (job.images.length === 0 || job.captureRequired || capturedInboundJobs.has(job.jobId))).sort((a, b) => tierRank(a) - tierRank(b) || (a.order ?? 0) - (b.order ?? 0));
 	const actionable = unsent.filter((job) => !interrupted.has(job.jobId));
 	const prompts = actionable.filter((job) => !job.command);
 	const commands = actionable.filter((job) => job.command);
@@ -465,7 +540,9 @@ export class TelegramOwnerBridge {
 	}
 
 	get marker(): string | undefined {
-		return this.active ? this.active.batchId ? `[telegram-batch:${this.active.batchId}]` : `[telegram-job:${this.active.jobId}]` : undefined;
+		if (!this.active) return undefined;
+		if (this.active.item) return `${WORK_ITEM_MARKER_PREFIX}${this.active.jobId}]`;
+		return this.active.batchId ? `[telegram-batch:${this.active.batchId}]` : `[telegram-job:${this.active.jobId}]`;
 	}
 
 	get nextBatchReadyDelayMs(): number | undefined {
@@ -477,8 +554,30 @@ export class TelegramOwnerBridge {
 		return recover(this.records, this.now()).queued.length;
 	}
 
+	/** Pending private-chat replies, which hold back further private dispatch to keep replies in order. */
 	get pendingReplyCount(): number {
-		return recover(this.records, this.now()).repliesToRetry.length;
+		return recover(this.records, this.now()).repliesToRetry.filter((job) => !job.item || job.item.reply.kind === "private").length;
+	}
+
+	get queueDepthByTier(): { owner: number; peer: number } {
+		const queued = recover(this.records, this.now()).queued;
+		return { owner: queued.filter((job) => job.tier !== "peer").length, peer: queued.filter((job) => job.tier === "peer").length };
+	}
+
+	/** Durably admits a non-private work item. Repeating an item ID returns the original item. */
+	async admitItem(input: Omit<WorkItem, "itemId" | "timestamp"> & { itemId?: string }): Promise<{ item: WorkItem; duplicate: boolean }> {
+		const itemId = input.itemId ?? (input.idempotencyKey ? workItemIdForKey(input.channel, input.idempotencyKey) : randomUUID());
+		const existing = this.records.find((record): record is Extract<JournalRecord, { type: "work_item" }> => record.type === "work_item" && record.itemId === itemId);
+		if (existing) {
+			const { type: _type, schemaVersion: _schemaVersion, ...item } = existing;
+			return { item, duplicate: true };
+		}
+		const { itemId: _ignored, ...fields } = input;
+		const record: Extract<JournalRecord, { type: "work_item" }> = { type: "work_item", schemaVersion: 1, ...fields, itemId, timestamp: new Date(this.now()).toISOString() };
+		validateWorkItem(record);
+		await this.append(record);
+		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+		return { item, duplicate: false };
 	}
 
 	get pendingCommands(): Job[] {
@@ -720,6 +819,14 @@ export class TelegramOwnerBridge {
 		return [...open.values()];
 	}
 
+	/** The work item behind a job ID, if the job is not a private-chat job. */
+	itemFor(jobId: string): WorkItem | undefined {
+		const record = this.records.find((candidate): candidate is Extract<JournalRecord, { type: "work_item" }> => candidate.type === "work_item" && candidate.itemId === jobId);
+		if (!record) return undefined;
+		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+		return item;
+	}
+
 	/** The open activity or queued-notice message for a job, if any. */
 	openActivity(jobId: string): string | undefined {
 		return this.openActivities().find((activity) => activity.jobId === jobId)?.messageId;
@@ -762,7 +869,7 @@ export class TelegramOwnerBridge {
 	}
 
 	private async sendWithAnchorRecovery(job: Job, text: string, format: "HTML" | "plain" | undefined, send: SendReply): Promise<string> {
-		if (this.replyAnchorRejected(job.jobId)) return send(text, undefined, format);
+		if (job.messageId <= 0 || this.replyAnchorRejected(job.jobId)) return send(text, undefined, format);
 		try {
 			return await send(text, job.messageId, format);
 		} catch (error) {
@@ -779,6 +886,20 @@ export class TelegramOwnerBridge {
 			if (!firstId) firstId = id;
 		}
 		await this.append({ type: "reply_sent", jobId: job.jobId, messageId: firstId });
+	}
+
+	private async deliver(job: Job, text: string, send: SendReply, route?: ItemReplyRoute): Promise<void> {
+		const destination = job.item?.reply;
+		if (destination?.kind === "none") {
+			await this.append({ type: "reply_sent", jobId: job.jobId, messageIds: [], timestamp: new Date(this.now()).toISOString() });
+			return;
+		}
+		if (destination?.kind === "group") {
+			const groupSend = route?.(job.item!);
+			if (!groupSend) throw new ReplyDestinationUnavailableError("The group chat is not available for this reply");
+			return this.deliverPlan(job, text, groupSend);
+		}
+		return this.deliverPlan(job, text, send);
 	}
 
 	private async deliverPlan(job: Job, text: string, send: SendReply): Promise<void> {
@@ -828,10 +949,25 @@ export class TelegramOwnerBridge {
 		await this.append({ type: "reply_sent", jobId: job.jobId, messageIds: messageIds as string[], timestamp: new Date().toISOString() });
 	}
 
-	async retryReadyReplies(send: SendReply): Promise<number> {
+	async retryReadyReplies(send: SendReply, route?: ItemReplyRoute): Promise<number> {
 		const retries = recover(this.records, this.now()).repliesToRetry;
-		for (const job of retries) await this.deliverPlan(job, job.reply, send);
-		return retries.length;
+		let delivered = 0;
+		let firstError: unknown;
+		let privateBlocked = false;
+		for (const job of retries) {
+			// Private replies stay in order; a group outage must not hold them.
+			const isPrivate = !job.item || job.item.reply.kind === "private";
+			if (isPrivate && privateBlocked) continue;
+			try {
+				await this.deliver(job, job.reply, send, route);
+				delivered += 1;
+			} catch (error) {
+				if (isPrivate) privateBlocked = true;
+				firstError ??= error;
+			}
+		}
+		if (firstError !== undefined) throw firstError;
+		return delivered;
 	}
 
 	async dispatchNext(
@@ -880,7 +1016,7 @@ export class TelegramOwnerBridge {
 		if (this.dispatchConfirmed && text) this.assistantText = text;
 	}
 
-	async settle(send: SendReply): Promise<boolean> {
+	async settle(send: SendReply, route?: ItemReplyRoute): Promise<boolean> {
 		if (!this.active || !this.dispatchConfirmed || this.assistantText === undefined) return false;
 		const job = this.active;
 		const text = this.assistantText;
@@ -890,7 +1026,7 @@ export class TelegramOwnerBridge {
 		this.active = undefined;
 		this.dispatchConfirmed = false;
 		this.assistantText = undefined;
-		await this.deliverPlan(job, text, send);
+		await this.deliver(job, text, send, route);
 		return true;
 	}
 

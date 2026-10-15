@@ -17,6 +17,7 @@ import {
 	JsonlJournal,
 	type Journal,
 	type Job,
+	type WorkItem,
 	type ArchivedTelegramAttachment,
 	type ResolvedArchivedImage,
 	TelegramOwnerBridge,
@@ -71,7 +72,17 @@ export interface PrototypeDependencies {
 	stageOutboundPhoto?(path: string, projectRoot: string): Promise<{ image: { bytes: Buffer; filename: string; mimeType: string }; attachment: ArchivedTelegramAttachment }>;
 	sendPhoto?(image: { bytes: Buffer; filename: string; mimeType: string }, caption: string | undefined, replyToMessageId?: number, signal?: AbortSignal): Promise<string>;
 	sendTyping?(signal: AbortSignal): Promise<void>;
+	/** Transport for replies and transient messages in the group chat, when one is configured. */
+	group?: ChatTransport;
 	close?(): Promise<void>;
+}
+
+/** Sends, edits and deletes messages in one chat. */
+export interface ChatTransport {
+	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
+	sendActivity(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
+	editActivity(messageId: string, text: string, signal: AbortSignal): Promise<void>;
+	deleteActivity(messageId: string, signal: AbortSignal): Promise<void>;
 }
 
 export interface ExtensionOptions {
@@ -159,6 +170,24 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			currentContext?.ui.setStatus("telegram-owner", `telegram: ${statusText()}`);
 		};
 
+		/** The chat that shows a job's activity and receives its reply, or undefined when it has none. */
+		const transportFor = (item: WorkItem | undefined): ChatTransport | undefined => {
+			const deps = runtimeDependencies;
+			if (!deps) return undefined;
+			if (item?.reply.kind === "none") return undefined;
+			if (item?.reply.kind === "group") return deps.group;
+			if (!deps.sendActivity && !deps.editActivity && !deps.deleteActivity) return undefined;
+			const missing = (operation: string) => async (): Promise<never> => { throw new Error(`Telegram activity ${operation} is not configured`); };
+			return {
+				sendReply: deps.sendReply,
+				sendActivity: deps.sendActivity ?? missing("send"),
+				editActivity: deps.editActivity ?? missing("edit"),
+				deleteActivity: deps.deleteActivity ?? missing("delete"),
+			};
+		};
+		const anchorOf = (job: Job): number | undefined => (job.messageId > 0 ? job.messageId : undefined);
+		const routeItemReply = (item: WorkItem) => (item.reply.kind === "group" ? runtimeDependencies?.group?.sendReply : undefined);
+
 		const serialized = <T>(work: () => Promise<T>): Promise<T> => {
 			const result = operationTail.then(work);
 			operationTail = result.then(() => undefined, () => undefined);
@@ -212,14 +241,14 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const stopTyping = (): Promise<void> => typing?.stop() ?? Promise.resolve();
 
 		const startActivity = (job: Job, ctx: ExtensionContext): void => {
-			if (!bridge || !runtimeDependencies?.sendActivity || !runtimeDependencies.editActivity || !runtimeDependencies.deleteActivity) return;
+			const transport = transportFor(job.item);
+			if (!bridge || !transport) return;
 			lastActivityError = undefined;
-			const sendActivity = runtimeDependencies.sendActivity;
 			activity = new TelegramActivityMessage(job.jobId, {
-				send: (text, signal) => sendActivity(text, signal, job.messageId),
+				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
 				existingMessageId: bridge.openActivity(job.jobId),
-				edit: runtimeDependencies.editActivity,
-				delete: runtimeDependencies.deleteActivity,
+				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
+				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
 				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId),
 				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId),
 				onFailure: (operation, error) => {
@@ -241,11 +270,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const failedActivityDeletes = new Set<string>();
 		/** Deletes activity and queued-notice messages whose job has finished. */
 		const cleanupFinishedActivities = async (): Promise<void> => {
-			if (!bridge || !runtimeDependencies?.deleteActivity) return;
+			if (!bridge) return;
 			for (const finished of bridge.finishedActivities()) {
-				if (failedActivityDeletes.has(finished.messageId)) continue;
+				const transport = transportFor(bridge.itemFor(finished.jobId));
+				if (!transport || failedActivityDeletes.has(finished.messageId)) continue;
 				try {
-					await runtimeDependencies.deleteActivity(finished.messageId, new AbortController().signal);
+					await transport.deleteActivity(finished.messageId, new AbortController().signal);
 				} catch (error) {
 					failedActivityDeletes.add(finished.messageId);
 					lastActivityError = `delete: ${sanitizeError(error)}`;
@@ -258,11 +288,13 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		/** Tells the owner which accepted requests are waiting behind other work. */
 		const postQueuedNotices = async (): Promise<void> => {
-			if (!bridge || !runtimeDependencies?.sendActivity || connection.phase === "stopping") return;
+			if (!bridge || connection.phase === "stopping") return;
 			for (const { job, position } of bridge.jobsAwaitingQueuedNotice()) {
+				const transport = transportFor(job.item);
+				if (!transport) continue;
 				let messageId: string;
 				try {
-					messageId = await runtimeDependencies.sendActivity(queuedNoticeText(agentLabel, position), new AbortController().signal, job.messageId);
+					messageId = await transport.sendActivity(queuedNoticeText(agentLabel, position), new AbortController().signal, anchorOf(job));
 				} catch (error) {
 					lastActivityError = `queued: ${sanitizeError(error)}`;
 					updateStatus();
@@ -351,7 +383,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const retryPendingReplies = async (): Promise<void> => {
 			if (!bridge || !runtimeDependencies) return;
 			try {
-				const sent = await bridge.retryReadyReplies(runtimeDependencies.sendReply);
+				const sent = await bridge.retryReadyReplies(runtimeDependencies.sendReply, routeItemReply);
 				if (sent > 0) lastOperationError = undefined;
 			} catch (error) {
 				noteError(error);
@@ -795,7 +827,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				const halted = await haltActivity();
 				if (bridge && runtimeDependencies) {
 					try {
-						const sent = await bridge.settle(runtimeDependencies.sendReply);
+						const sent = await bridge.settle(runtimeDependencies.sendReply, routeItemReply);
 						if (sent) lastOperationError = undefined;
 						await reconcileMarkdown(ctx);
 					} catch (error) {
