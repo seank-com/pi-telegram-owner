@@ -20,9 +20,6 @@ export interface TelegramMarkdownProjectorConfig {
 	roleSlugs?: { user: string; assistant: string; command: string };
 }
 
-/** @deprecated Use TelegramMarkdownProjectorConfig. */
-export type TelegramArchiveConfig = TelegramMarkdownProjectorConfig;
-
 export interface ProjectionResult {
 	projected: number;
 	unchanged: number;
@@ -99,9 +96,6 @@ export interface TelegramTimelineResult {
 	messages?: TelegramTimelineMessage[];
 	exchanges?: TelegramTimelineExchange[];
 }
-
-/** @deprecated Use ProjectionResult. */
-export type ArchiveResult = ProjectionResult;
 
 interface ImportProvenance {
 	source: "telegram-desktop-historical-export" | "telegram-desktop-html-pi" | "pi-session-export-missing" | "telegram-desktop-gap";
@@ -937,5 +931,3 @@ export class TelegramMarkdownProjector {
 	}
 }
 
-/** @deprecated Use TelegramMarkdownProjector. */
-export { TelegramMarkdownProjector as TelegramArchiveProjector };

@@ -53,7 +53,7 @@ pi-telegram-archive-import --export-root EXPORT --source-set-manifest SOURCE.jso
 Menu registration contacts Telegram and is an explicit operator action. Archive
 import defaults to dry-run; commit requires the matching checkpoint and explicit
 `--commit --output-root ROOT`. Both CLIs run as native Node programs without
-loading Pi. Pure helpers are exported as `/format`, `/archive` and `/importer`.
+loading Pi. Pure helpers are exported as `/format`, `/markdown-projector` and `/importer`.
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
 `npm pack --dry-run`, `npm run test:package`. Run `npm run hooks:install` once per

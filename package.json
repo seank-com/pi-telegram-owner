@@ -27,9 +27,9 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./archive": {
-      "types": "./dist/archive.d.ts",
-      "import": "./dist/archive.js"
+    "./markdown-projector": {
+      "types": "./dist/markdown-projector.d.ts",
+      "import": "./dist/markdown-projector.js"
     },
     "./importer": {
       "types": "./dist/importer.d.ts",

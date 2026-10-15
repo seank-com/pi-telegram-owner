@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";import {createHash} from "node:crypto";import {execFileSync} from "node:child_process";import {mkdir,mkdtemp,readFile,rm,writeFile} from "node:fs/promises";import {tmpdir} from "node:os";import {join} from "node:path";import {existsSync} from "node:fs";
-import {markdownCompatibilityKey,TELEGRAM_FORMAT_COMPAT_VERSION,markdownToPlainText} from "@seank/pi-telegram-owner/format";import {TelegramArchiveImporter} from "@seank/pi-telegram-owner/importer";import {TelegramMarkdownProjector} from "@seank/pi-telegram-owner/archive";
+import {markdownCompatibilityKey,TELEGRAM_FORMAT_COMPAT_VERSION,markdownToPlainText} from "@seank/pi-telegram-owner/format";import {TelegramArchiveImporter} from "@seank/pi-telegram-owner/importer";import {TelegramMarkdownProjector} from "@seank/pi-telegram-owner/markdown-projector";
 const sha=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex");
 assert.equal(existsSync("node_modules/@earendil-works"),false);assert.equal(existsSync("node_modules/typebox"),false);assert.equal(markdownToPlainText("**fixture**"),"fixture");assert.equal(typeof TelegramArchiveImporter,"function");assert.equal(typeof TelegramMarkdownProjector,"function");
 async function fixture(postText = "answer") {

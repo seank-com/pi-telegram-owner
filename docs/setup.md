@@ -33,7 +33,7 @@ The group chat's shared root is the one deliberately shared location.
 
 For retrieval, configure the independent datastore extension with the exact
 selected store, pointing to this archive root and including messages/**/*.md.
-Exclude archive metadata and binary media. Its optional qmd collection belongs
+Its optional qmd collection belongs
 to the project-local datastore generation; qmd/model setup remains opt-in.
 Telegram auto mode discovers only that configured name. Off mode disables all
 integration. Required mode provides a persistent error and immediate recall
@@ -120,7 +120,7 @@ election ranks depend on it.
 
 For group recall, add a store to each agent's datastore configuration rooted at
 `<sharedRoot>` with the same name as `groupChat.datastore.store`, including
-`**/*.md` and excluding `.telegram-archive/**` and `_attachments/**`.
+`**/*.md`.
 
 After starting the agents, `/status` in the private chat reports group
 verification. If membership does not match, the agent names the mismatch and
