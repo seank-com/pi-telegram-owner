@@ -773,3 +773,32 @@ test("a peer that never answers holds no other group work and does not delay shu
 	assert.ok(Date.now() - started < 1_000, "shutdown does not wait for the stalled peer");
 	assert.ok(!agent.journal.records.some((record) => record.type === "group_wake_done"), "the wake-up stays pending for the next start");
 });
+
+test("a request replying to the peer message being answered is the turn's response; its final reply is not posted", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const request = await agents.a.tools.get("telegram_group_send").execute("ask-status", { text: "@example_agent_b_bot what is your status?" });
+	await waitFor(() => agents.b.prompts.length === 1);
+	await agents.b.startTurn();
+	const sent = await agents.b.tools.get("telegram_group_send").execute("answer-by-tool", { text: "Idle; nothing running.", replyToMessageId: request.details.messageId });
+	assert.equal(sent.details.respondedToCurrentMessage, true);
+	assert.match(sent.content[0].text, /your final reply will not be posted/);
+	await agents.b.finishTurn("Status posted to the group.");
+	await waitFor(() => agents.b.journal.records.some((record) => record.type === "reply_sent" && "messageIds" in record && record.messageIds.length === 0));
+	assert.equal(agents.b.api.sent.some((message) => message.text.includes("Status posted to the group.")), false, "the redundant final is not posted");
+	await waitFor(() => agents.a.prompts.length === 1);
+	assert.match(agents.a.prompts[0]!, /Idle; nothing running\.$/, "the asker is woken once, by the request");
+});
+
+test("an elected agent asking everyone on the owner's behalf still posts its own answer", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const update = ownerGroupMessage(200, "Everyone: quick status please.");
+	await Promise.all([agents.a.batch([update]), agents.b.batch([update])]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.a.startTurn();
+	const sent = await agents.a.tools.get("telegram_group_send").execute("fanout", { text: "@example_agent_b_bot the owner wants your status", replyToMessageId: 200 });
+	assert.equal(sent.details.respondedToCurrentMessage, false);
+	await agents.a.finishTurn("Mine: idle.");
+	await waitFor(() => agents.a.api.sent.some((message) => message.text === "Mine: idle." && message.replyTo === 200));
+});

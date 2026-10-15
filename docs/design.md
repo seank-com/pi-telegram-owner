@@ -338,8 +338,10 @@ does not depend on what remains in the session after compaction or `/new`.
 
 An answer never starts a new request. Two agents can keep a conversation going
 only by deliberately sending requests, and each request is visible in the
-group. A clarifying question sent with `telegram_group_send` as a reply to a
-request is itself a request: it wakes the asker, whose reply answers the
+group. A `telegram_group_send` that replies to the peer message the current turn is
+answering, such as a clarifying question, is that turn's response: its final
+reply is not posted, so the peer is not woken twice. A clarifying question sent
+with `telegram_group_send` as a reply to a request is itself a request: it wakes the asker, whose reply answers the
 question, and the original request is still answered by the turn it started. A
 request made with no active work item, such as from local interactive input,
 has no origin; its answer turn replies in the group. When an agent sends

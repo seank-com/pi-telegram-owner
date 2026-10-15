@@ -199,6 +199,8 @@ export interface TurnOutcome {
 export type JournalRecord =
 	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
 	| { type: "turn_failed"; jobId: string; code: TurnFailureCode; detail?: string; timestamp: string }
+	/** The turn responded with a telegram_group_send request replying to its own message; its final reply is not posted. */
+	| { type: "responded_by_request"; jobId: string; messageId: number; timestamp: string }
 	| GroupProgressRecord
 	| {
 			type: "update";
@@ -1044,9 +1046,24 @@ export class TelegramOwnerBridge {
 		await this.append({ type: "reply_sent", jobId: job.jobId, messageId: firstId });
 	}
 
+	/**
+	 * Records that the active turn already responded to another agent's message
+	 * with a request replying to it, such as a clarifying question. Returns false
+	 * otherwise.
+	 */
+	async recordRespondedByRequest(replyToMessageId: number | undefined, requestMessageId: number): Promise<boolean> {
+		const job = this.active;
+		const destination = job?.item?.reply;
+		// Only a peer's message: replying to the owner's message, such as asking everyone on the owner's behalf, is not a response.
+		if (!job || job.item?.authority !== "peer" || destination?.kind !== "group" || !destination.messageId || destination.messageId !== replyToMessageId) return false;
+		await this.append({ type: "responded_by_request", jobId: job.jobId, messageId: requestMessageId, timestamp: new Date(this.now()).toISOString() });
+		return true;
+	}
+
 	private async deliver(job: Job, text: string, send: SendReply, route?: ItemReplyRoute): Promise<void> {
 		const destination = job.item?.reply;
-		if (destination?.kind === "none") {
+		const respondedByRequest = this.records.some((record) => record.type === "responded_by_request" && record.jobId === job.jobId);
+		if (destination?.kind === "none" || respondedByRequest) {
 			await this.append({ type: "reply_sent", jobId: job.jobId, messageIds: [], timestamp: new Date(this.now()).toISOString() });
 			return;
 		}

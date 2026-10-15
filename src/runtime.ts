@@ -830,11 +830,12 @@ export class TelegramActivityMessage {
 		if (!this.messageId) {
 			this.attempted = this.initialText;
 			try {
-				this.messageId = await this.options.send(this.initialText, this.controller.signal);
+				// Never abort the first send: once Telegram may have posted it, its ID is needed to delete it later.
+				this.messageId = await this.options.send(this.initialText, new AbortController().signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
 				await this.options.onStarted(this.jobId, this.messageId);
 			} catch (error) {
-				if (!this.controller.signal.aborted) this.fail(this.messageId ? "journal" : "send", error);
+				this.fail(this.messageId ? "journal" : "send", error);
 				return;
 			}
 		}

@@ -804,10 +804,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.registerTool({
 			name: GROUP_SEND_TOOL,
 			label: "Send to group chat",
-			description: "Post a request to the group chat shared with the owner and the other agents. Mention an agent as @username to ask it; its answer comes back to you as a new turn that replies to whatever started this one. Only the supplied text is sent.",
-			promptSnippet: "Ask another agent, or the group, for help in the shared group chat",
+			description: "Ask another agent a question in the group chat shared with the owner and the other agents. Mention the agent as @username. Its answer comes back to you as a new turn carrying the work that led you to ask. To answer the message you are working on, do not use this tool: just write your reply, which is posted automatically. Only the supplied text is sent.",
+			promptSnippet: "Ask another agent a question in the shared group chat",
 			promptGuidelines: [
-				"Use telegram_group_send to ask another agent something; mention it as @username. Your final reply is posted automatically, so do not use this tool to answer the turn you are working on.",
+				"Use telegram_group_send only to ask another agent something, mentioning it as @username, then end your turn; the answer wakes you. To answer the message you are working on, write your reply normally; it is posted automatically.",
+				"A telegram_group_send that replies to the message you are working on, such as a clarifying question, is your response to that message: your final reply to it is not posted.",
 			],
 			parameters: {
 				type: "object",
@@ -823,7 +824,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				const input = params as { text: string; replyToMessageId?: number };
 				if (!groupRuntime) throw new Error("CAPABILITY_UNAVAILABLE: the group chat is not configured.");
 				const messageId = await groupRuntime.sendRequest(`tool:${toolCallId}`, input.text, input.replyToMessageId, bridge?.activeJob?.jobId);
-				return { content: [{ type: "text" as const, text: `Posted group message ${messageId}.` }], details: { messageId } };
+				if (bridge && await bridge.recordRespondedByRequest(input.replyToMessageId, messageId)) {
+					return { content: [{ type: "text" as const, text: `Posted group message ${messageId} as a question replying to message ${input.replyToMessageId}, the message you are working on. That question is your response to it: your final reply will not be posted, and the answer will come back to you as a new turn. End your turn now.` }], details: { messageId, respondedToCurrentMessage: true } };
+				}
+				return { content: [{ type: "text" as const, text: `Posted group message ${messageId}. The answer will come back to you as a new turn.` }], details: { messageId, respondedToCurrentMessage: false } };
 			},
 		});
 		pi.on("resources_discover", () => { updateRecall(); updateStatus(); });

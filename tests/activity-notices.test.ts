@@ -165,3 +165,31 @@ test("a turn that fails gets a visible notice and a diagnostic, and the queue mo
 	assert.doesNotMatch(detail!, /secret-value/);
 	assert.equal(host.prompts.length, 3, "each failure released the queue for the next request");
 });
+
+test("an activity message still being sent when a fast turn ends is recorded and deleted after the reply", async () => {
+	let release: (() => void) | undefined;
+	const sent: string[] = [];
+	const host = harness({
+		async sendActivity(text, signal, replyTo) {
+			// Telegram posts the message, but the response arrives after the turn has ended.
+			await new Promise<void>((resolve) => { release = resolve; });
+			assert.equal(signal.aborted, false, "the first send is never aborted");
+			sent.push(`activity:${replyTo}:${text}`);
+			return "777";
+		},
+	});
+	await host.emit("session_start", { type: "session_start", reason: "startup" });
+	await host.batch([ownerText(1, 100, "quick question")]);
+	const prompt = host.prompts.at(-1)!;
+	await host.emit("input", { type: "input", source: "extension", text: prompt });
+	await host.emit("before_agent_start", { type: "before_agent_start", prompt });
+	await waitFor(() => release !== undefined);
+	await host.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: "quick answer" }] });
+	setTimeout(() => release!(), 20);
+	await host.emit("agent_settled", { type: "agent_settled" });
+	assert.deepEqual(sent, ["activity:100:Thinking (10%)"]);
+	assert.ok(host.journal.records.some((record) => record.type === "activity_started" && record.messageId === "777"));
+	const replyIndex = host.calls.indexOf("reply:100:quick answer");
+	assert.ok(replyIndex >= 0);
+	assert.ok(host.calls.indexOf("delete:777") > replyIndex, "the late activity message is deleted after the reply");
+});
