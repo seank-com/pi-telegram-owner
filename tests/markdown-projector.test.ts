@@ -552,3 +552,19 @@ test("private-chat replies to work items are archived as outbound messages; grou
 	assert.equal(journal.some((record) => record.type === "projection_deferred"), false);
 	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 3, deferred: 0 });
 });
+
+test("a reply that posted nothing is not archived", async (t) => {
+	const base = await mkdtemp(join(tmpdir(), "telegram-empty-reply-"));
+	t.after(() => rm(base, { recursive: true, force: true }));
+	const archiveRoot = join(base, "archive"); const sessionRoot = join(base, "sessions");
+	const entries = [message("user0001", null, "user", "[telegram-job:job-1]\nhello", "2026-09-22T01:00:01.000Z"), message("asst0001", "user0001", "assistant", "", "2026-09-22T01:00:02.000Z")];
+	await persistSession(sessionRoot, entries);
+	const journal: JournalRecord[] = [
+		records()[0]!,
+		{ type: "dispatched", jobId: "job-1", sessionId: "session-1" },
+		{ type: "responded_by_request", jobId: "job-1", messageId: 0, timestamp: "2026-09-22T01:00:02.000Z" },
+		{ type: "reply_ready", jobId: "job-1", text: "Asked again in the group.", timestamp: "2026-09-22T01:00:02.000Z" },
+		{ type: "reply_sent", jobId: "job-1", messageIds: [], timestamp: "2026-09-22T01:00:02.000Z" },
+	];
+	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 1, unchanged: 0, deferred: 0 });
+});

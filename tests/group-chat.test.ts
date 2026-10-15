@@ -830,3 +830,27 @@ test("activity for another agent's request names what it is about", async (t) =>
 	assert.match(thinking.text, /^RE: Agent A: @example_agent_b_bot how many items are on your list\?\nThinking/);
 	await agents.b.finishTurn("Nine.");
 });
+
+test("only the first asking turn for an owner message is acknowledged", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	const askOnly = async (callId: string, text: string, replyToMessageId?: number) => {
+		await agents.a.startTurn();
+		await agents.a.tools.get("telegram_group_send").execute(callId, { text, ...(replyToMessageId ? { replyToMessageId } : {}) });
+		await agents.a.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "stop" }] });
+		agents.a.setIdle(true);
+		await agents.a.emit("agent_settled", { type: "agent_settled" });
+	};
+	await agents.a.batch([ownerPrivate("a", 710, "Ask the other agent how the test went.")]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await askOnly("first-ask", "@example_agent_b_bot how did the test go?");
+	await waitFor(() => agents.b.prompts.length === 1);
+	await agents.b.runTurn("Which test?");
+	await waitFor(() => agents.a.prompts.length === 2);
+	assert.match(agents.a.prompts[1]!, /Your final reply goes to the private chat with the owner, as a reply to message 710\./);
+	await askOnly("second-ask", "@example_agent_b_bot this was the whole test.");
+	await waitFor(() => agents.a.journal.records.filter((record) => record.type === "reply_sent").length >= 2);
+	const acknowledgements = agents.a.privateSends.filter((send) => send.text.startsWith("Asked @example_agent_b_bot"));
+	assert.equal(acknowledgements.length, 1, "the second asking turn stays quiet");
+	assert.equal(agents.a.privateSends.some((send) => send.text === "Asked again in the group."), false);
+});

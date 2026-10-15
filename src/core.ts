@@ -1207,6 +1207,26 @@ export class TelegramOwnerBridge {
 		this.assistantText = this.turnOutcome.text;
 	}
 
+	/** Where a job's reply goes, as a comparable key. */
+	private destinationKey(job: Pick<Job, "jobId" | "messageId" | "item">): string | undefined {
+		const reply = job.item?.reply;
+		if (!reply) return `private:${job.messageId}`;
+		if (reply.kind === "none") return undefined;
+		return reply.kind === "private" ? `private:${reply.messageId ?? ""}` : `group:${reply.chatId}:${reply.messageId ?? ""}`;
+	}
+
+	/** Whether an earlier asking turn already told this job's destination that a sister was asked. */
+	private alreadyAcknowledged(job: Job): boolean {
+		const key = this.destinationKey(job);
+		if (!key) return false;
+		return this.records.some((record) => {
+			if (record.type !== "interrupted" || record.reason !== "GROUP_REQUEST_ACKNOWLEDGED" || record.jobId === job.jobId) return false;
+			const item = this.itemFor(record.jobId);
+			const earlier = item ? { jobId: record.jobId, messageId: 0, item } : { jobId: record.jobId, messageId: this.privateJobFor(record.jobId)?.messageId ?? 0 };
+			return this.destinationKey(earlier) === key;
+		});
+	}
+
 	/** Agents mentioned in group requests a job sent and Telegram accepted; undefined when it sent none. */
 	private requestsSentBy(jobId: string): string[] | undefined {
 		const accepted = new Set(this.records.filter((record) => record.type === "group_send_accepted").map((record) => (record as Extract<GroupProgressRecord, { type: "group_send_accepted" }>).sendId));
@@ -1232,7 +1252,11 @@ export class TelegramOwnerBridge {
 		this.turnOutcome = undefined;
 		let text: string;
 		const asked = outcome.failure === "NO_REPLY" ? this.requestsSentBy(job.jobId) : undefined;
-		if (asked) {
+		if (asked && this.alreadyAcknowledged(job)) {
+			// A later asking turn in the same chain: the owner already knows a sister was asked.
+			await this.append({ type: "responded_by_request", jobId: job.jobId, messageId: 0, timestamp: new Date(this.now()).toISOString() });
+			text = "Asked again in the group.";
+		} else if (asked) {
 			// The turn's work was asking a peer; the answer arrives as a new turn, so this is not a failure.
 			text = asked.length ? `Asked ${asked.map((account) => `@${account}`).join(" and ")} in the group; the answer will follow here.` : "Posted a request in the group; any answer will follow here.";
 			await this.append({ type: "interrupted", jobId: job.jobId, reason: "GROUP_REQUEST_ACKNOWLEDGED" });

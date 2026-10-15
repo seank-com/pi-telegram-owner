@@ -412,8 +412,10 @@ rule applies to private and queue endpoint work in their own destinations. A
 final counts only when the model stopped normally with text; a model error, an
 empty reply, or output cut off by a length limit or an abort is reported as a
 failure, never posted as an answer. A turn that sent a group request and ended
-without text is not a failure: its destination gets a short note naming who was
-asked, and the answer follows as a new turn. Failures are not retried
+without text is not a failure: the first such turn for a destination gets a
+short note naming who was asked, later ones in the same exchange post nothing,
+and the answer follows as a new turn. A reply that posted nothing is not
+archived. Failures are not retried
 automatically. The owner or requesting agent decides whether to ask again.
 Diagnostic codes and detail are recorded in the agent's transport journal and
 shown by `/status` in the private chat. Startup recovery uses the same

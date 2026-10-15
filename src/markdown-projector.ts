@@ -557,6 +557,8 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 			}
 		}
 		if (!reply) continue;
+		// The archive records what Telegram showed; a reply that posted nothing is not a message.
+		if (records.some((record) => record.type === "reply_sent" && record.jobId === jobId && "messageIds" in record && record.messageIds.length === 0)) continue;
 		// The bridge records interruption notices after `interrupted`; they are not Pi assistant text.
 		const beforeReply = records.slice(0, records.lastIndexOf(reply)).findLast((record) => "jobId" in record && record.jobId === jobId);
 		if (beforeReply?.type === "interrupted") {
