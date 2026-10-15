@@ -746,6 +746,8 @@ export interface TelegramActivityMessageOptions {
 	minimumEditIntervalMs?: number;
 	/** An already journaled message for this job, such as its queued notice, to edit instead of sending. */
 	existingMessageId?: string;
+	/** A line shown above every status, naming what the work is about. */
+	prefix?: string;
 }
 
 /** Owns the single ephemeral activity message for one confirmed Telegram job. */
@@ -764,7 +766,7 @@ export class TelegramActivityMessage {
 	constructor(jobId: string, options: TelegramActivityMessageOptions, initialText = "Thinking…") {
 		this.jobId = jobId;
 		this.options = options;
-		this.initialText = boundedActivityText(initialText);
+		this.initialText = this.withPrefix(boundedActivityText(initialText));
 		this.desired = this.initialText;
 		this.messageId = options.existingMessageId;
 	}
@@ -773,9 +775,15 @@ export class TelegramActivityMessage {
 		this.ensureWorker();
 	}
 
+	private withPrefix(text: string): string {
+		return this.options.prefix ? `${this.options.prefix}\n${text}` : text;
+	}
+
 	update(text: string): void {
-		if (!this.acceptingUpdates || !text || text === this.desired) return;
-		this.desired = boundedActivityText(text);
+		if (!this.acceptingUpdates || !text) return;
+		const desired = this.withPrefix(boundedActivityText(text));
+		if (desired === this.desired) return;
+		this.desired = desired;
 		this.ensureWorker();
 	}
 
@@ -792,7 +800,7 @@ export class TelegramActivityMessage {
 	async annotate(text: string): Promise<void> {
 		if (this.acceptingUpdates || !this.messageId) return;
 		try {
-			await this.options.edit(this.messageId, boundedActivityText(text), new AbortController().signal);
+			await this.options.edit(this.messageId, this.withPrefix(boundedActivityText(text)), new AbortController().signal);
 		} catch (error) {
 			this.fail("edit", error);
 		}

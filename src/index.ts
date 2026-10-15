@@ -20,6 +20,7 @@ import {
 	type Job,
 	type WorkItem,
 	type TurnOutcome,
+	replyContextLine,
 	type ArchivedTelegramAttachment,
 	type ResolvedArchivedImage,
 	TelegramOwnerBridge,
@@ -292,6 +293,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			activity = new TelegramActivityMessage(job.jobId, {
 				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
 				existingMessageId: bridge.openActivity(job.jobId),
+				...(replyContextLine(job.item) ? { prefix: replyContextLine(job.item) } : {}),
 				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
 				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
 				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId),
@@ -339,7 +341,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				if (!transport) continue;
 				let messageId: string;
 				try {
-					messageId = await transport.sendActivity(queuedNoticeText(agentLabel, position), new AbortController().signal, anchorOf(job));
+					const context = replyContextLine(job.item);
+					messageId = await transport.sendActivity(`${context ? `${context}\n` : ""}${queuedNoticeText(agentLabel, position)}`, new AbortController().signal, anchorOf(job));
 				} catch (error) {
 					// One unavailable destination, such as a paused group, must not hide private notices.
 					lastActivityError = `queued: ${sanitizeError(error)}`;

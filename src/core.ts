@@ -141,11 +141,23 @@ export interface ReplyQuote {
 	text: string;
 }
 
+/** The first line of a message, shortened at a word boundary. */
+export function quoteExcerpt(text: string, max = 80): string {
+	const firstLine = text.split("\n").find((line) => line.trim())?.trim() ?? "";
+	if (firstLine.length <= max) return firstLine;
+	const cut = firstLine.slice(0, max - 1);
+	return `${(cut.lastIndexOf(" ") > max / 2 ? cut.slice(0, cut.lastIndexOf(" ")) : cut).trimEnd()}…`;
+}
+
+/** Names what a transient message is about when Telegram cannot show it as a reply. */
+export function replyContextLine(item: WorkItem | undefined): string | undefined {
+	const quote = item?.reply.kind === "group" ? item.reply.quote : undefined;
+	return quote ? `RE: ${quote.sender}: ${quoteExcerpt(quote.text, 60)}` : undefined;
+}
+
 /** The quote and @mention that stand in for a reply Telegram cannot show. */
 export function quotedReplyText(quote: ReplyQuote, text: string): string {
-	const firstLine = quote.text.split("\n").find((line) => line.trim())?.trim() ?? "";
-	const cut = firstLine.slice(0, 79);
-	const excerpt = firstLine.length > 80 ? `${(cut.lastIndexOf(" ") > 40 ? cut.slice(0, cut.lastIndexOf(" ")) : cut).trimEnd()}…` : firstLine;
+	const excerpt = quoteExcerpt(quote.text);
 	const escaped = excerpt.replace(/([\\`*_[\]])/g, "\\$1");
 	return `> ${quote.sender}: ${escaped}\n\n@${quote.account}\n${text}`;
 }
@@ -1195,6 +1207,19 @@ export class TelegramOwnerBridge {
 		this.assistantText = this.turnOutcome.text;
 	}
 
+	/** Agents mentioned in group requests a job sent and Telegram accepted; undefined when it sent none. */
+	private requestsSentBy(jobId: string): string[] | undefined {
+		const accepted = new Set(this.records.filter((record) => record.type === "group_send_accepted").map((record) => (record as Extract<GroupProgressRecord, { type: "group_send_accepted" }>).sendId));
+		const accounts = new Set<string>();
+		let sent = false;
+		for (const record of this.records) {
+			if (record.type !== "group_send_planned" || record.originJobId !== jobId || !accepted.has(record.sendId)) continue;
+			sent = true;
+			for (const match of record.text.matchAll(/(?:^|[^\w@])@([A-Za-z][A-Za-z0-9_]{3,31})\b/g)) accounts.add(match[1]!);
+		}
+		return sent ? [...accounts] : undefined;
+	}
+
 	/** The most recent turn that ended without a usable reply. */
 	get lastTurnFailure(): Extract<JournalRecord, { type: "turn_failed" }> | undefined {
 		return this.records.findLast((record): record is Extract<JournalRecord, { type: "turn_failed" }> => record.type === "turn_failed");
@@ -1206,7 +1231,12 @@ export class TelegramOwnerBridge {
 		const outcome = this.turnOutcome;
 		this.turnOutcome = undefined;
 		let text: string;
-		if (outcome.failure) {
+		const asked = outcome.failure === "NO_REPLY" ? this.requestsSentBy(job.jobId) : undefined;
+		if (asked) {
+			// The turn's work was asking a peer; the answer arrives as a new turn, so this is not a failure.
+			text = asked.length ? `Asked ${asked.map((account) => `@${account}`).join(" and ")} in the group; the answer will follow here.` : "Posted a request in the group; any answer will follow here.";
+			await this.append({ type: "interrupted", jobId: job.jobId, reason: "GROUP_REQUEST_ACKNOWLEDGED" });
+		} else if (outcome.failure) {
 			// A failed turn still gets a visible disposition; it is a notice, not the model's answer.
 			text = turnFailureNotice(outcome.failure);
 			await this.append({ type: "turn_failed", jobId: job.jobId, code: outcome.failure, ...(outcome.detail ? { detail: outcome.detail } : {}), timestamp: new Date(this.now()).toISOString() });

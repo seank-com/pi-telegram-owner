@@ -26,7 +26,7 @@ test("shared Markdown renderer emits only allowlisted Telegram HTML", () => {
 	].join("\n");
 	assert.equal(
 		markdownToTelegramHtml(markdown),
-		'<b>bold</b> <i>italic</i> <s>gone</s> <tg-spoiler>quiet</tg-spoiler>\n\n<code>a &lt; b</code> and <a href="https://example.test/a?x=1&amp;y=2">site</a>\n\n<blockquote>quoted</blockquote>\n\n<pre><code>&lt;tag&gt; &amp; data</code></pre>',
+		'<b>bold</b> <i>italic</i> <s>gone</s> <tg-spoiler>quiet</tg-spoiler>\n\n<code>a &lt; b</code> and <a href="https://example.test/a?x=1&amp;y=2">site</a>\n\n<blockquote>quoted</blockquote>\n<pre><code>&lt;tag&gt; &amp; data</code></pre>',
 	);
 });
 

@@ -137,7 +137,9 @@ private chat and the group, and to peer requests in the group, where the
 owner can see the request arrived. When the item starts, the same message is
 edited into the activity display (`Thinking (NN%)` and tool intents). Activity
 messages are Telegram replies to the message being worked on, in both the
-private chat and the group, so concurrent work is attributable. Queue endpoint
+private chat and the group, so concurrent work is attributable. Work on another
+agent's message cannot be a Telegram reply, so its queued notice and activity
+start with a line naming it instead, such as "RE: Agent B: Can you check…". Queue endpoint
 items show activity in their reply destination, when they have one. Queued
 notices and activity are transient: they are not recorded in either archive
 and never wake another agent.
@@ -409,7 +411,9 @@ reply, or a reply saying the work failed with a short static reason. The same
 rule applies to private and queue endpoint work in their own destinations. A
 final counts only when the model stopped normally with text; a model error, an
 empty reply, or output cut off by a length limit or an abort is reported as a
-failure, never posted as an answer. Failures are not retried
+failure, never posted as an answer. A turn that sent a group request and ended
+without text is not a failure: its destination gets a short note naming who was
+asked, and the answer follows as a new turn. Failures are not retried
 automatically. The owner or requesting agent decides whether to ask again.
 Diagnostic codes and detail are recorded in the agent's transport journal and
 shown by `/status` in the private chat. Startup recovery uses the same

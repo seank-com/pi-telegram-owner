@@ -482,7 +482,7 @@ test("/new ends queued group work with a notice that wakes the requester, and cl
 	await verified(agents);
 	agents.b.setIdle(false);
 	const queued = await agents.a.tools.get("telegram_group_send").execute("queued-1", { text: "@example_agent_b_bot please summarize" });
-	await waitFor(() => agents.b.api.sent.some((message) => message.text.startsWith("Queued:")));
+	await waitFor(() => agents.b.api.sent.some((message) => /^RE: Agent A: @example\\_agent\\_b\\_bot please summarize\nQueued:/.test(message.text) || /^RE: Agent A: @example_agent_b_bot please summarize\nQueued:/.test(message.text)));
 	assert.equal(agents.b.prompts.length, 0, "the request waits behind B's other work");
 
 	const outstanding = await agents.b.tools.get("telegram_group_send").execute("pending-1", { text: "@example_agent_a_bot can you check logs?" });
@@ -801,4 +801,32 @@ test("an elected agent asking everyone on the owner's behalf still posts its own
 	assert.equal(sent.details.respondedToCurrentMessage, false);
 	await agents.a.finishTurn("Mine: idle.");
 	await waitFor(() => agents.a.api.sent.some((message) => message.text === "Mine: idle." && message.replyTo === 200));
+});
+
+test("a turn that only asks a peer is acknowledged, not reported as failed", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	await agents.a.batch([ownerPrivate("a", 700, "Ask the other agent how many items are on her list.")]);
+	await waitFor(() => agents.a.prompts.length === 1);
+	await agents.a.startTurn();
+	await agents.a.tools.get("telegram_group_send").execute("ask-only", { text: "@example_agent_b_bot how many items are on your list?" });
+	await agents.a.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "toolCall", id: "ask-only", name: "telegram_group_send", arguments: {} }], stopReason: "stop" }] });
+	agents.a.setIdle(true);
+	await agents.a.emit("agent_settled", { type: "agent_settled" });
+	await waitFor(() => agents.a.privateSends.some((send) => send.text === "Asked @example_agent_b_bot in the group; the answer will follow here." && send.replyTo === 700));
+	assert.equal(agents.a.journal.records.some((record) => record.type === "turn_failed"), false);
+	assert.equal(agents.a.privateSends.some((send) => send.text.startsWith("Couldn't finish this")), false);
+});
+
+test("activity for another agent's request names what it is about", async (t) => {
+	const { agents } = await twoAgents(t);
+	await verified(agents);
+	await agents.a.tools.get("telegram_group_send").execute("re-line", { text: "@example_agent_b_bot how many items are on your list?" });
+	await waitFor(() => agents.b.prompts.length === 1);
+	await agents.b.startTurn();
+	await waitFor(() => agents.b.api.sent.some((message) => message.text.includes("Thinking")));
+	const thinking = agents.b.api.sent.find((message) => message.text.includes("Thinking"))!;
+	assert.equal(thinking.replyTo, undefined);
+	assert.match(thinking.text, /^RE: Agent A: @example_agent_b_bot how many items are on your list\?\nThinking/);
+	await agents.b.finishTurn("Nine.");
 });
