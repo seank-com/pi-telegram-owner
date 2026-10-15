@@ -128,10 +128,32 @@ export async function fetchUpdateBatch(
 	return payload.result as TelegramUpdate[];
 }
 
+/**
+ * Telegram does not let one bot reply to another bot's message. A reply to
+ * another agent is sent with this quote and an @mention instead; the shared
+ * journal still records the reply link.
+ */
+export interface ReplyQuote {
+	/** The other agent's display name. */
+	sender: string;
+	/** The other agent's bot username, without @. */
+	account: string;
+	text: string;
+}
+
+/** The quote and @mention that stand in for a reply Telegram cannot show. */
+export function quotedReplyText(quote: ReplyQuote, text: string): string {
+	const firstLine = quote.text.split("\n").find((line) => line.trim())?.trim() ?? "";
+	const cut = firstLine.slice(0, 79);
+	const excerpt = firstLine.length > 80 ? `${(cut.lastIndexOf(" ") > 40 ? cut.slice(0, cut.lastIndexOf(" ")) : cut).trimEnd()}…` : firstLine;
+	const escaped = excerpt.replace(/([\\`*_[\]])/g, "\\$1");
+	return `> ${quote.sender}: ${escaped}\n\n@${quote.account}\n${text}`;
+}
+
 /** Where a work item's final reply goes. */
 export type ReplyDestination =
 	| { kind: "private"; messageId?: number }
-	| { kind: "group"; chatId: number; messageId?: number }
+	| { kind: "group"; chatId: number; messageId?: number; quote?: ReplyQuote }
 	| { kind: "none" };
 
 /** Non-private work admitted to the queue: group messages and queue endpoint items. */
@@ -300,10 +322,16 @@ export type ItemReplyRoute = (item: WorkItem) => SendReply | undefined;
 
 export class ReplyDestinationUnavailableError extends Error {}
 
+function validQuote(quote: unknown): boolean {
+	if (quote === undefined) return true;
+	const value = quote as Partial<ReplyQuote>;
+	return Boolean(value && typeof value.sender === "string" && value.sender && typeof value.account === "string" && /^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(value.account) && typeof value.text === "string");
+}
+
 function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>): void {
 	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
 	const validMessageId = reply?.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0);
-	const validReply = (reply?.kind === "private" && validMessageId) || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)));
+	const validReply = (reply?.kind === "private" && validMessageId) || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)) && validQuote((reply as { quote?: unknown }).quote));
 	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || (record.images !== undefined && (!Array.isArray(record.images) || record.images.some((image) => !/^_attachments\/[0-9a-f]{64}\.(jpg|png|webp)$/.test(image?.path) || !["image/jpeg", "image/png", "image/webp"].includes(image?.mimeType)))) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
 }
 
@@ -491,7 +519,8 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 		if (record.type === "work_item") {
 			validateWorkItem(record);
 			const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
-			const anchor = item.reply.kind === "none" ? 0 : item.reply.messageId ?? 0;
+			// A quoted reply is sent unanchored because Telegram rejects replies to other bots.
+			const anchor = item.reply.kind === "none" || (item.reply.kind === "group" && item.reply.quote) ? 0 : item.reply.messageId ?? 0;
 			items.push({ jobId: item.itemId, updateId: 0, messageId: anchor, text: renderWorkItemPrompt(item), images: [], item, tier: item.authority, order });
 		} else if (record.type === "update") {
 			cursor = record.updateId;
@@ -1024,7 +1053,7 @@ export class TelegramOwnerBridge {
 		if (destination?.kind === "group") {
 			const groupSend = route?.(job.item!);
 			if (!groupSend) throw new ReplyDestinationUnavailableError("The group chat is not available for this reply");
-			return this.deliverPlan(job, text, groupSend);
+			return this.deliverPlan(job, destination.quote ? quotedReplyText(destination.quote, text) : text, groupSend);
 		}
 		return this.deliverPlan(job, text, send);
 	}

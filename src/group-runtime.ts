@@ -1,4 +1,5 @@
 import {
+	quotedReplyText,
 	ReplyDestinationUnavailableError,
 	workItemIdForKey,
 	type GroupProgressRecord,
@@ -13,7 +14,8 @@ import {
 } from "./core.ts";
 import { postToPeer, type EndpointResponse } from "./endpoint.ts";
 import { GROUP_OWNER_SENDER, type GroupJournal, type GroupMessage, type TelegramEntity } from "./group-journal.ts";
-import { TelegramReplyAnchorError, type GroupAgentConfig, type GroupChatConfig } from "./runtime.ts";
+import { createTelegramTransportPlan } from "./format.ts";
+import { TelegramParseError, TelegramReplyAnchorError, type GroupAgentConfig, type GroupChatConfig } from "./runtime.ts";
 
 /** The Telegram calls the group runtime makes against the configured group. */
 export interface GroupTelegramApi {
@@ -481,7 +483,7 @@ export class GroupRuntime {
 		await this.append({ type: "group_seen", messageId, timestamp: this.timestamp() });
 	}
 
-	private async ownerItem(messages: GroupMessage[]): Promise<Omit<WorkItem, "itemId" | "timestamp"> & { itemId: string }> {
+	private async ownerItem(messages: GroupMessage[], elected = false): Promise<Omit<WorkItem, "itemId" | "timestamp"> & { itemId: string }> {
 		const first = messages[0]!;
 		const last = messages.at(-1)!;
 		const text = messages.map((message) => message.text || (message.media ? `[${message.media.kind}]` : "")).filter(Boolean).join("\n\n");
@@ -498,6 +500,7 @@ export class GroupRuntime {
 				...(await this.contextFor(first)),
 				...(await this.missedLines(first.messageId)),
 				...(unusable.length ? [`The owner's message includes ${unusable.join(" and ")} that you cannot open; say so in your reply if it matters.`] : []),
+				...(elected ? [`You were chosen to handle this message because it did not @mention anyone. If it asks for everyone or implies it, answer for yourself, then ask the others (${this.config.otherAgents.map((agent) => `@${agent.telegramAccount}`).join(" and ")}) to answer as well using telegram_group_send, replying to message ${last.messageId}.`] : []),
 			],
 			...(images.length ? { images } : {}),
 		});
@@ -592,7 +595,7 @@ export class GroupRuntime {
 				return "lost";
 			}
 		}
-		await this.options.admit(await this.ownerItem(messages));
+		await this.options.admit(await this.ownerItem(messages, true));
 		await this.append({ type: "group_candidate_done", firstMessageId: first, outcome: "claimed", timestamp: this.timestamp() });
 		await this.markSeen(Math.max(...candidate.messageIds));
 		const notice = await this.options.journal.noticeFor(this.config.chatId, candidate.messageIds);
@@ -658,7 +661,12 @@ export class GroupRuntime {
 		if (!mentioned && !repliesToOwnRequest) return { status: 400, body: { error: "The message does not address this agent" } };
 		// An answer to this agent's request returns to the work that asked; a new request is answered in the group.
 		if (repliesToOwnRequest && message.posting?.kind === "answer") return this.admitAnswer(message, peer, target!);
-		return this.admitPeerItem(message, peer, { kind: "group", chatId: this.config.chatId, messageId: message.messageId }, [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))]);
+		return this.admitPeerItem(message, peer, this.replyToPeer(message, peer), [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))]);
+	}
+
+	/** A group reply to another agent's message, which Telegram can only show as a quote. */
+	private replyToPeer(message: GroupMessage, peer: GroupAgentConfig): WorkItem["reply"] {
+		return { kind: "group", chatId: this.config.chatId, messageId: message.messageId, quote: { sender: peer.telegramName, account: peer.telegramAccount, text: message.text } };
 	}
 
 	private async admitPeerItem(message: GroupMessage, peer: GroupAgentConfig, reply: WorkItem["reply"], context: string[]): Promise<EndpointResponse> {
@@ -696,7 +704,7 @@ export class GroupRuntime {
 			reply = { kind: "private", messageId: originPrivate.messageId };
 			context.push(`You sent that request while working on the owner's private message ${originPrivate.messageId}: ${originPrivate.text}`);
 		} else {
-			reply = { kind: "group", chatId: this.config.chatId, messageId: message.messageId };
+			reply = this.replyToPeer(message, peer);
 		}
 		context.push(...(await this.missedLines(message.messageId)));
 		context.push("Use telegram_group_timeline or telegram_timeline if you need more of that conversation.");
@@ -822,9 +830,22 @@ export class GroupRuntime {
 		if (accepted) return accepted.messageIds[0]!;
 		if (bridge.journalRecords.some((record) => record.type === "group_send_planned" && record.sendId === sendId)) throw new Error("This group message's delivery is uncertain after an interruption; it was not resent");
 		await this.append({ type: "group_send_planned", sendId, text, ...(replyToMessageId ? { replyToMessageId } : {}), ...(originJobId ? { originJobId } : {}), timestamp: this.timestamp() });
-		const parts = splitForGroup(text);
+		// Telegram rejects a reply to another bot's message, so that reply is shown as a quote; the journal keeps the link.
+		const target = replyToMessageId ? await this.options.journal.message(this.config.chatId, replyToMessageId) : undefined;
+		const peer = target && target.senderId !== this.self?.id ? this.agentById(target.senderId) : undefined;
+		const shown = peer ? quotedReplyText({ sender: peer.telegramName, account: peer.telegramAccount, text: target!.text }, text) : text;
+		const anchor = peer ? undefined : replyToMessageId;
 		const messageIds: number[] = [];
-		for (const [index, part] of parts.entries()) messageIds.push(Number(await this.sendWithAnchor(part, index === 0 ? replyToMessageId : undefined)));
+		for (const chunk of createTelegramTransportPlan(shown).chunks) {
+			let id: string;
+			try {
+				id = await this.sendWithAnchor(chunk.format === "HTML" ? chunk.payload : chunk.plainFallback, chunk.index === 0 ? anchor : undefined, chunk.format);
+			} catch (error) {
+				if (chunk.format !== "HTML" || !(error instanceof TelegramParseError)) throw error;
+				id = await this.sendWithAnchor(chunk.plainFallback, chunk.index === 0 ? anchor : undefined, "plain");
+			}
+			messageIds.push(Number(id));
+		}
 		await this.append({ type: "group_send_accepted", sendId, messageIds, date: Math.floor(this.now() / 1000), timestamp: this.timestamp() });
 		await this.run(async () => {
 			await this.recordAgentPosts();
@@ -867,18 +888,4 @@ export function groupItemId(chatId: number, messageId: number): string {
 	return workItemIdForKey("group", `${chatId}:${messageId}`);
 }
 
-function splitForGroup(text: string, limit = 4_000): string[] {
-	if (text.length <= limit) return [text];
-	const parts: string[] = [];
-	let remaining = text;
-	while (remaining.length > limit) {
-		const window = remaining.slice(0, limit + 1);
-		let split = Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf(" "));
-		if (split < Math.floor(limit * 0.6)) split = limit;
-		parts.push(remaining.slice(0, split));
-		remaining = remaining.slice(split).trimStart();
-	}
-	if (remaining) parts.push(remaining);
-	return parts;
-}
 

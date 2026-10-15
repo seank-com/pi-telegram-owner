@@ -10,7 +10,7 @@ import { MemoryJournal, type TelegramUpdate, type TelegramMessage } from "../src
 import { GroupJournal } from "../src/group-journal.ts";
 import type { GroupTelegramApi, WakeResult } from "../src/group-runtime.ts";
 import { createTelegramOwnerExtension } from "../src/index.ts";
-import { ConfigurationError, loadTelegramOwnerConfig, type GroupAgentConfig, type GroupChatConfig } from "../src/runtime.ts";
+import { ConfigurationError, loadTelegramOwnerConfig, TelegramReplyAnchorError, type GroupAgentConfig, type GroupChatConfig } from "../src/runtime.ts";
 
 const OWNER = 7;
 const GROUP = -1001234567890;
@@ -39,8 +39,8 @@ class FakeGroupApi implements GroupTelegramApi {
 	chatType = "supergroup";
 	canRestrict = true;
 	private readonly self: (typeof AGENTS)[AgentKey];
-	private readonly ids: { next: number };
-	constructor(self: (typeof AGENTS)[AgentKey], ids: { next: number }) {
+	private readonly ids: { next: number; senders?: Map<number, number> };
+	constructor(self: (typeof AGENTS)[AgentKey], ids: { next: number; senders?: Map<number, number> }) {
 		this.self = self;
 		this.ids = ids;
 	}
@@ -54,7 +54,12 @@ class FakeGroupApi implements GroupTelegramApi {
 	async removeChatMember(userId: number) { this.calls.push(`remove:${userId}`); }
 	async leaveChat(chatId: number) { this.calls.push(`leave:${chatId}`); }
 	async sendMessage(text: string, replyTo?: number) {
+		// Like Telegram, a bot cannot reply to another bot's message.
+		const senders = (this.ids.senders ??= new Map());
+		const target = replyTo ? senders.get(replyTo) : undefined;
+		if (target !== undefined && target !== this.self.id) throw new TelegramReplyAnchorError("Telegram rejected missing reply target");
 		const id = this.ids.next++;
+		senders.set(id, this.self.id);
 		this.sent.push({ id, text, ...(replyTo ? { replyTo } : {}) });
 		this.calls.push(`send:${id}:${replyTo}:${text}`);
 		return String(id);
@@ -248,6 +253,7 @@ test("an owner mention is published once, runs on the mentioned agent only and i
 	await waitFor(() => agents.a.prompts.length === 1);
 	assert.match(agents.a.prompts[0]!, /^\[telegram-item:[0-9a-f-]{36}\]\nChannel: group chat\nFrom: the owner \(owner authority\)\nYour final reply goes to the group chat, as a reply to message 10\./);
 	assert.ok(agents.a.prompts[0]!.endsWith(text), "UTF-16 entity offsets resolve the mention after an emoji");
+	assert.doesNotMatch(agents.a.prompts[0]!, /You were chosen/, "only elected items get the fan-out instruction");
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	assert.equal(agents.b.prompts.length, 0, "an agent that is not mentioned is not woken");
 	assert.equal((await shared.events()).filter((event) => event.kind === "message").length, 1, "both agents observed it; it was recorded once");
@@ -277,7 +283,11 @@ test("a request with telegram_group_send wakes the mentioned peer, whose answer 
 	await agents.b.runTurn("Deploy finished at noon.");
 	await waitFor(() => agents.a.prompts.length === 1);
 	assert.match(agents.a.prompts[0]!, /From: Agent B \(@example_agent_b_bot\) \(peer authority\)[\s\S]*Deploy finished at noon\.$/);
-	assert.equal(agents.b.api.sent.at(-1)?.replyTo, requestId);
+	// Telegram rejects a bot's reply to another bot, so the answer quotes the request and mentions the asker.
+	const answer = agents.b.api.sent.at(-1)!;
+	assert.equal(answer.replyTo, undefined);
+	assert.match(answer.text, /^> Agent A: @example\\_agent\\_b\\_bot what is the deploy status\?\n\n@example_agent_a_bot\nDeploy finished at noon\.$/);
+	assert.equal((await shared.timeline({ chatId: GROUP, limit: 1 }))[0]!.replyToMessageId, requestId, "the journal keeps the reply link");
 	const repeated = await send.execute("call-1", { text: "@example_agent_b_bot what is the deploy status?" });
 	assert.equal(repeated.details.messageId, requestId, "a repeated tool call returns the original message");
 	assert.equal(agents.a.api.sent.filter((message) => message.text.startsWith("@example_agent_b_bot")).length, 1);
@@ -472,7 +482,7 @@ test("/new ends queued group work with a notice that wakes the requester, and cl
 	await verified(agents);
 	agents.b.setIdle(false);
 	const queued = await agents.a.tools.get("telegram_group_send").execute("queued-1", { text: "@example_agent_b_bot please summarize" });
-	await waitFor(() => agents.b.api.sent.some((message) => message.text.startsWith("Queued:") && message.replyTo === queued.details.messageId));
+	await waitFor(() => agents.b.api.sent.some((message) => message.text.startsWith("Queued:")));
 	assert.equal(agents.b.prompts.length, 0, "the request waits behind B's other work");
 
 	const outstanding = await agents.b.tools.get("telegram_group_send").execute("pending-1", { text: "@example_agent_a_bot can you check logs?" });
@@ -484,7 +494,7 @@ test("/new ends queued group work with a notice that wakes the requester, and cl
 	await waitFor(() => agents.b.journal.records.some((record) => record.type === "command_started"));
 	await agents.b.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
 	await agents.b.emit("session_start", { type: "session_start", reason: "new" });
-	await waitFor(() => agents.b.api.sent.some((message) => message.text === "Not handled: the owner reset Agent B's session." && message.replyTo === queued.details.messageId));
+	await waitFor(() => agents.b.api.sent.some((message) => message.text.endsWith("@example_agent_a_bot\nNot handled: the owner reset Agent B's session.") && message.replyTo === undefined));
 	assert.match(agents.b.privateReplies.at(-1)!, /^Started a new session\./);
 
 	await agents.a.runTurn("Logs are clean.");
@@ -514,6 +524,8 @@ test("an unaddressed owner message is claimed by exactly one idle agent, rotatin
 		const loser = agents[expected === "a" ? "b" : "a"];
 		await waitFor(() => winner.prompts.length === 1);
 		assert.match(winner.prompts[0]!, /From: the owner \(owner authority\)/);
+		const others = expected === "a" ? "@example_agent_b_bot" : "@example_agent_a_bot";
+		assert.ok(winner.prompts[0]!.includes(`You were chosen to handle this message because it did not @mention anyone. If it asks for everyone or implies it, answer for yourself, then ask the others (${others}) to answer as well using telegram_group_send, replying to message ${messageId}.`));
 		assert.equal(await shared.claimFor(GROUP, messageId), AGENTS[expected].username);
 		await waitFor(() => loser.journal.records.some((record) => record.type === "group_candidate_done" && record.firstMessageId === messageId && record.outcome === "lost"));
 		assert.equal(loser.prompts.length, 0);
@@ -632,7 +644,7 @@ test("a failed peer request gets a visible notice that wakes the requester", asy
 	await agents.b.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "rate limited" }] });
 	agents.b.setIdle(true);
 	await agents.b.emit("agent_settled", { type: "agent_settled" });
-	await waitFor(() => agents.b.api.sent.some((message) => message.text === "Couldn't finish this: the model request failed." && message.replyTo === request.details.messageId));
+	await waitFor(() => agents.b.api.sent.some((message) => message.text.endsWith("@example_agent_a_bot\nCouldn't finish this: the model request failed.")));
 	await waitFor(() => agents.a.prompts.length === 1);
 	assert.match(agents.a.prompts[0]!, /Couldn't finish this: the model request failed\.$/);
 });

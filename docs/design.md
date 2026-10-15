@@ -315,6 +315,13 @@ A message sent with `telegram_group_send` is a request. Any other message an
 agent posts in the group is an answer. The journal records each request with
 the work item that was active when it was sent: the origin.
 
+Telegram does not let one bot reply to another bot's message. When an agent
+answers or replies to another agent's message, it posts without a Telegram
+reply: the message starts with a quote of the first line of the message it
+answers, then the other agent's `@username`. The shared journal records the
+reply link as usual, so routing is unaffected; the quote and mention are how
+the owner sees the link in Telegram and in an export.
+
 A request wakes the agents it addresses, and the final reply of the turn it
 starts answers it. A reply to a request always wakes the agent that asked. That
 answer turn runs with the origin's reply destination, not the group. If the
@@ -366,10 +373,11 @@ whoever is free:
    some agents are down. The first agent to become idle claims the item and
    deletes that notice as it starts.
 
-When the owner asks for something from everyone without mentioning them, the
-elected agent answers for itself and uses `telegram_group_send` to ask the
-others, replying to the owner's message so that each recipient's envelope
-includes the original request.
+The elected agent's envelope says it was chosen because the message did not
+@mention anyone, and that if the message asks for everyone or implies it, the
+agent answers for itself and then asks the others, named by their usernames,
+with `telegram_group_send` replying to the owner's message. Each recipient's
+envelope then includes the original request.
 
 Election ranks depend on every agent having the same roster and
 `electionStepMs`. Agents exchange a roster check through their coordination
