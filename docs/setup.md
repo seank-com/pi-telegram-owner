@@ -185,32 +185,100 @@ be stopped.
 five-command owner menu for private chats using protected config. This contacts Telegram. Tests
 intercept fetch with a synthetic fixture; no test contacts the service.
 
+### Private archive import
+
+The workflow is **prepare, fill placeholders, dry-run, review counts, commit**.
+No hand-computed hashes are needed. Export the private conversation from Telegram
+Desktop as HTML and supply the Pi session input root:
+
+```bash
+pi-telegram-archive-import --prepare --export-root EXPORT --pi-session-root SESSIONS
+```
+
+Prepare writes mode-0600 controls in the mode-0700 sibling directory
+`EXPORT-import` (or `--control-dir DIRECTORY`, outside the export). It leaves
+export pages, media, Pi sessions, and transport journals untouched:
+
+- `source.json` is complete: every `messages.html`, `messages2.html`, etc. page,
+  in numeric order, with byte size, SHA-256, and the total non-service message count.
+- `speakers.json` lists readable sender names with direction `<placeholder>`.
+  Set each to `in` (owner) or `out` (agent). The map uses
+  `pi-telegram-owner/speaker-map/v1`, `revision: 1`, and
+  `keyEncoding: "display-name"`; keep the encoding field so even a name that
+  looks like a hash is unambiguous. No direction is guessed from a display name.
+- `first-pi-boundary.json` contains a computed source-manifest hash, a
+  reviewable `admittedPiSessionIds` list, and `firstPi: "<placeholder>"`.
+- `boundary-candidates.json` lists fully computed candidate `firstPi` objects.
+  Candidates are generated once all speaker directions are filled.
+
+After filling directions, run the same `--prepare` command again. It preserves
+filled speaker entries, their revision, the reviewed session list, and any
+selected boundary. Review `admittedPiSessionIds`: the initial list comes only
+from the selected input files. Repeated `--pi-session RELATIVE_PATH` selects
+specific files under SESSIONS; otherwise discovery selects its top-level JSONL
+files. Supply only the intended conversation's session input set. Remove
+unwanted IDs from the admitted list; they stay excluded on re-prepare. Admission
+still requires a nonempty unique list including the anchor session, with exactly
+one selected source file per admitted ID and unambiguous session ordering.
+
+Choose the candidate identifying the first Pi-backed message in this export.
+Copy that **complete object** from the `candidates` array into `firstPi` in
+`first-pi-boundary.json`, replacing the placeholder. Candidates require exact
+Markdown-semantic or raw-source-text agreement and the assigned direction; the
+importer does not select one automatically. Multiple candidates remain an
+operator decision. If none are found, check the export, selected sessions, and
+speaker directions; prepare reports this explicitly rather than guessing.
+
+Run a dry-run, then review its historical, Pi-aligned, unresolved, ambiguous,
+missing-coverage, chunk-candidate, and gap counts before committing:
+
+```bash
+pi-telegram-archive-import --export-root EXPORT --pi-session-root SESSIONS --dry-run
+pi-telegram-archive-import --export-root EXPORT --pi-session-root SESSIONS --commit --output-root ARCHIVE
+```
+
+Use the same session selection and journal for preparation and subsequent runs.
+Use the same alignment options for dry-run and commit. These two modes read
+controls from the same default directory (or `--control-dir`) and refuse any
+`<placeholder>`, naming
+the file and entry. Dry-run writes `checkpoint.json` there, binding the exact
+inputs and plan. Commit refuses changed pinned export pages or an unmatched
+checkpoint. After intentionally changing inputs, prepare again if needed and
+review a new dry-run; never edit hashes or checkpoints to bypass that check.
+
 `pi-telegram-archive-import` accepts named arguments only:
 
-- Required: --export-root, --source-set-manifest, --first-pi-anchor, --speaker-map,
-  --pi-session-root and --checkpoint, each naming explicit local input/control paths.
+- Required: --export-root and --pi-session-root.
+- Controls: --control-dir; --source-set-manifest, --first-pi-anchor, --speaker-map,
+  and --checkpoint override individual default paths for dry-run/commit.
+  Prepare writes the standard filenames and accepts --control-dir instead of
+  individual path overrides.
 - Optional: --pi-session-root-id (default pi-sessions), repeated --pi-session,
-  --journal, and --output-root.
+  --journal, and --output-root. A supplied transport journal provides existing
+  correlation evidence; it is never modified.
 - Bounds: --lookahead (12), --chunk-candidate-gap-ms (2000),
   --chunk-candidate-min-length (3500), --deadline-seconds (60); positive integers.
-- Repeated --html-pi-timestamp-offset-seconds accepts signed integers within ±86400.
+- Repeated --html-pi-timestamp-offset-seconds accepts signed integers within
+  plus or minus 86400.
 - --dry-run is default. --commit requires --output-root and an exact matching
-  checkpoint from dry-run. The two flags are mutually exclusive.
+  checkpoint from dry-run. --prepare, --dry-run, and --commit are mutually exclusive.
 
-Source manifests pin page paths/sizes/hashes and message count. Speaker maps pin
-speaker hashes to directions. Boundary manifests pin the first admitted Pi entry
-and normalized/source hash. The single `pi-telegram-owner/first-pi-boundary/v1`
-contract requires `admittedPiSessionIds` and `firstPi.matchKind` (either
-`markdown-semantic` or `raw-source-text`). The session list must be nonempty,
-unique, and include the anchor session; no sessions are implicitly admitted.
-Use synthetic fixtures in tests; do not commit personal exports or mappings.
+Existing strict v1 boundary/source controls and hashed-key v1 speaker maps
+(without `keyEncoding`) still work with their explicit path options; their
+checkpoint binding is unchanged. Readable maps are normalized internally for
+matching, while checkpoints bind the original control bytes. To generate new
+controls from an existing export, use the prepare workflow in a new control
+directory and review a fresh dry-run. The single
+`pi-telegram-owner/first-pi-boundary/v1` contract retains its explicit session
+list and `firstPi.matchKind` (`markdown-semantic` or `raw-source-text`). Use
+synthetic fixtures in tests; do not commit personal exports or mappings.
 
 All archive/control schemas use `pi-telegram-owner/<kind>/v1`: `source-set`,
 `first-pi-boundary`, `speaker-map`, `import-report`, `import-checkpoint`,
-`archive-manifest`, `media-event`, `message`, and for the shared group root
-`group-event` (journal entries), `group-message` (notes), `group-speaker-map`,
-`group-import-prepare` and `group-import-report`. Earlier names and boundary
-shapes have no aliases in this unpublished package. Existing Telegram Desktop
+`archive-manifest`, `media-event`, `message`, `private-import-prepare`, and
+`boundary-candidates`; for the shared group root, `group-event` (journal entries),
+`group-message` (notes), `group-speaker-map`, `group-import-prepare`, and
+`group-import-report`. Earlier names and boundary shapes have no aliases in this unpublished package. Existing Telegram Desktop
 HTML and media exports can be reused. Regenerate the source manifest, speaker
 map and explicit boundary, then create a fresh dry-run checkpoint and publish
 to a fresh output directory. Keep the existing archive available for verification.

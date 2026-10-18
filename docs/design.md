@@ -19,8 +19,15 @@ Photos are captured before dispatch; attachments and media lifecycle receipts
 preserve identity across restart. Source Markdown and binary media are never
 replaced by search output. OS ownership and permissions define authority.
 
-The archive importer validates source manifests, speaker maps, Pi boundary
-anchors and explicit admitted sessions. Dry-run binds a content-free checkpoint
+The archive importer prepares protected controls outside the export, pinning all
+pages and listing readable sender names. Operators fill directions, re-prepare,
+and confirm a generated exact semantic/raw-text boundary candidate, with no
+hand-computed hashes. Preparation preserves filled controls and reviewed session
+admission; discovery is limited to the supplied session input set. Existing
+hashed speaker controls remain supported through explicit paths. Dry-run and
+commit refuse unresolved placeholders with file/entry diagnostics, then validate
+source manifests, speaker maps, Pi boundary anchors and explicit admitted
+sessions. Dry-run binds a content-free checkpoint
 to exact inputs. Commit requires that plan, protected output and atomic idempotent
 publication. Unsupported markup, changed source, corrupt state or cancellation
 fails explicitly. Source files, session JSONL and journals are not indexed.
