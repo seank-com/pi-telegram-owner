@@ -50,3 +50,9 @@ export function initialThinkingText(percent: number | null | undefined): string 
 		? "Thinking (context recalculating)"
 		: `Thinking (${Math.round(percent)}%)`;
 }
+
+export function queuedNoticeText(agentLabel: string, position: number): string {
+	return position === 0
+		? `Queued: ${agentLabel} is busy and will start this next.`
+		: `Queued: ${agentLabel} is busy and will start this after ${position} earlier ${position === 1 ? "request" : "requests"}.`;
+}

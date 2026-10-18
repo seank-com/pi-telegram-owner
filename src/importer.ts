@@ -7,6 +7,7 @@ import { parse } from "parse5";
 import { parse as parseYaml } from "yaml";
 
 import { TelegramMarkdownProjector, type PublicationResult } from "./markdown-projector.ts";
+import { GROUP_OWNER_SENDER, GroupJournal, type GroupJournalOptions, type GroupMessage } from "./group-journal.ts";
 import { markdownCompatibilityKey, markdownToPlainText, TELEGRAM_FORMAT_COMPAT_VERSION, telegramSafeHref } from "./format.ts";
 
 export const IMPORTER_VERSION = "telegram-desktop-pi-v2" as const;
@@ -740,4 +741,217 @@ export class TelegramArchiveImporter {
 		report.publication = publication;
 		return report;
 	}
+}
+
+export const GROUP_IMPORT_PLACEHOLDER = "<placeholder>";
+export const GROUP_SOURCE_FILE = "source.json";
+export const GROUP_SPEAKERS_FILE = "group-speakers.json";
+
+export interface GroupSpeakerMap {
+	schema: "pi-telegram-owner/group-speaker-map/v1";
+	/** Keyed by each sender's name exactly as the export shows it. */
+	speakers: Record<string, { kind: "owner" | "agent" | "other"; userId: number }>;
+}
+
+export interface GroupImportOptions {
+	exportRoot: string;
+	/** Directory holding source.json and group-speakers.json; defaults to defaultGroupControlDir(exportRoot). */
+	controlDir?: string;
+	chatId: number;
+	sharedRoot: string;
+	commit?: boolean;
+	journalOptions?: GroupJournalOptions;
+}
+
+export interface GroupImportReport {
+	schema: "pi-telegram-owner/group-import-report/v1";
+	mode: "dry-run" | "commit";
+	messages: number;
+	alreadyPresent: number;
+	imported: number;
+	photos: number;
+}
+
+export interface GroupPrepareReport {
+	schema: "pi-telegram-owner/group-import-prepare/v1";
+	controlDir: string;
+	pages: number;
+	messages: number;
+	senders: string[];
+	/** Speaker entries still holding a placeholder value. */
+	placeholders: string[];
+}
+
+/** The control directory sits next to the export so the export itself stays untouched. */
+export function defaultGroupControlDir(exportRoot: string): string {
+	const root = resolve(exportRoot);
+	return join(dirname(root), `${basename(root)}-import`);
+}
+
+interface ParsedGroupBlock {
+	messageId: number;
+	senderName: string;
+	date: string;
+	text: string;
+	replyToMessageId?: number;
+	photoPath?: string;
+	documentName?: string;
+	hasDocument: boolean;
+}
+
+function imageMime(bytes: Buffer): "image/jpeg" | "image/png" | "image/webp" | undefined {
+	if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "image/png";
+	if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+	if (bytes.length > 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+	return undefined;
+}
+
+function parseGroupPage(html: string, pagePath: string): ParsedGroupBlock[] {
+	if (html.includes("�")) throw new ImportValidationError("HTML_INVALID_UTF8");
+	const document = parse(html) as any;
+	const blocks: ParsedGroupBlock[] = [];
+	let sender: string | undefined;
+	for (const block of descendants(document, (node) => element(node, "div", "message"))) {
+		if (classes(block).has("service")) continue;
+		const idMatch = /^message(\d+)$/.exec(attrs(block).id ?? "");
+		if (!idMatch) throw new ImportValidationError("HTML_STRUCTURE_UNSUPPORTED", `A message in ${pagePath} has no message ID`);
+		const senderNode = first(block, (node) => element(node, "div", "from_name"));
+		if (senderNode) sender = textContent(senderNode).trim();
+		else if (!classes(block).has("joined")) sender = undefined;
+		if (!sender) throw new ImportValidationError("DIRECTION_UNKNOWN", `Message ${idMatch[1]} has no sender`);
+		const date = attrs(first(block, (node) => element(node, "div", "date")) ?? {}).title;
+		if (!date) throw new ImportValidationError("HTML_DATE_INVALID");
+		const textNode = first(block, (node) => element(node, "div", "text"));
+		const replyLink = first(block, (node) => element(node, "a") && /^#go_to_message\d+$/.test(attrs(node).href ?? ""));
+		const photoLink = first(block, (node) => element(node, "a") && classes(node).has("photo_wrap"));
+		const otherMedia = !photoLink ? first(block, (node) => (element(node, "div") || element(node, "a")) && [...classes(node)].some((name) => name.startsWith("media_") && name !== "media_wrap")) : undefined;
+		const otherTitle = otherMedia ? first(otherMedia, (node) => element(node, "div", "title")) : undefined;
+		blocks.push({
+			messageId: Number(idMatch[1]),
+			senderName: sender,
+			date,
+			text: textNode ? normalized(semanticText(textNode)).trim() : "",
+			...(replyLink ? { replyToMessageId: Number(/\d+$/.exec(attrs(replyLink).href!)![0]) } : {}),
+			...(photoLink ? { photoPath: join(dirname(pagePath), decodeURIComponent(attrs(photoLink).href ?? "")) } : {}),
+			...(otherTitle ? { documentName: textContent(otherTitle).trim() } : {}),
+			hasDocument: Boolean(otherMedia),
+		});
+	}
+	return blocks;
+}
+
+/** Telegram Desktop names export pages messages.html, messages2.html, and so on. */
+async function exportPages(exportRoot: string): Promise<string[]> {
+	const names = (await readdir(exportRoot)).filter((name) => /^messages(\d*)\.html$/.test(name));
+	if (!names.length) throw new ImportValidationError("SOURCE_SET_INVALID", "The export root has no messages*.html pages");
+	return names.sort((a, b) => Number(/\d+/.exec(a)?.[0] ?? 1) - Number(/\d+/.exec(b)?.[0] ?? 1));
+}
+
+async function writeControlFile(path: string, value: unknown): Promise<void> {
+	await atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function placeholderEntries(map: { speakers: Record<string, Record<string, unknown>> }): string[] {
+	return Object.entries(map.speakers).filter(([, speaker]) => Object.values(speaker).some((value) => value === GROUP_IMPORT_PLACEHOLDER)).map(([name]) => name);
+}
+
+/**
+ * Writes the control files for a group import next to the export: a complete
+ * source-set manifest pinning every page, and a speaker map listing every
+ * sender with placeholders to fill in. Existing speaker entries are kept.
+ */
+export async function prepareTelegramGroupImport(options: { exportRoot: string; controlDir?: string }): Promise<GroupPrepareReport> {
+	const exportRoot = resolve(options.exportRoot);
+	const controlDir = resolve(options.controlDir ?? defaultGroupControlDir(exportRoot));
+	await mkdir(controlDir, { recursive: true, mode: 0o700 });
+	const pages: SourceSetManifest["pages"] = [];
+	const senders = new Set<string>();
+	let messages = 0;
+	for (const path of await exportPages(exportRoot)) {
+		const file = await safeSource(exportRoot, path, MAX_PAGE_BYTES);
+		pages.push({ path, size: file.bytes.length, sha256: hash(file.bytes) });
+		for (const block of parseGroupPage(file.bytes.toString("utf8"), path)) {
+			senders.add(block.senderName);
+			messages += 1;
+		}
+	}
+	await writeControlFile(join(controlDir, GROUP_SOURCE_FILE), { schema: "pi-telegram-owner/source-set/v1", sourceSetId: basename(exportRoot).replace(/[^A-Za-z0-9._-]/g, "-") || "group-export", pages, messageCount: messages });
+	const speakersPath = join(controlDir, GROUP_SPEAKERS_FILE);
+	const existing = await protectedJson(speakersPath).then((loaded) => loaded.value as { speakers?: Record<string, Record<string, unknown>> }).catch(() => undefined);
+	const speakers: Record<string, Record<string, unknown>> = { ...(existing?.speakers ?? {}) };
+	for (const name of senders) speakers[name] ??= { kind: GROUP_IMPORT_PLACEHOLDER, userId: GROUP_IMPORT_PLACEHOLDER };
+	const map = { schema: "pi-telegram-owner/group-speaker-map/v1", speakers };
+	await writeControlFile(speakersPath, map);
+	return { schema: "pi-telegram-owner/group-import-prepare/v1", controlDir, pages: pages.length, messages, senders: [...senders].sort(), placeholders: placeholderEntries(map) };
+}
+
+function validateGroupSpeakerMap(value: unknown, path: string): GroupSpeakerMap {
+	const map = value as GroupSpeakerMap;
+	if (!map || typeof map !== "object" || map.schema !== "pi-telegram-owner/group-speaker-map/v1" || !exactKeys(map as unknown as Record<string, unknown>, ["schema", "speakers"]) || !map.speakers || typeof map.speakers !== "object") throw new ImportValidationError("MANIFEST_INVALID", `${path} is not a group speaker map`);
+	const unfilled = placeholderEntries(map as unknown as { speakers: Record<string, Record<string, unknown>> });
+	if (unfilled.length) throw new ImportValidationError("MANIFEST_INCOMPLETE", `Fill in ${GROUP_IMPORT_PLACEHOLDER} values in ${path} for: ${unfilled.join(", ")}`);
+	for (const [name, speaker] of Object.entries(map.speakers)) {
+		if (!speaker || !["owner", "agent", "other"].includes(speaker.kind) || !Number.isSafeInteger(speaker.userId) || speaker.userId <= 0) throw new ImportValidationError("MANIFEST_INVALID", `${path}: "${name}" needs kind owner, agent or other and a positive numeric userId`);
+	}
+	return map;
+}
+
+/**
+ * Imports a Telegram Desktop HTML export of the group into the shared journal,
+ * using the control files written by prepareTelegramGroupImport. Messages
+ * already journaled are left as they are, so an export restores only missing
+ * history. Dry run is the default.
+ */
+export async function importTelegramGroupExport(options: GroupImportOptions): Promise<GroupImportReport> {
+	const exportRoot = resolve(options.exportRoot);
+	const controlDir = resolve(options.controlDir ?? defaultGroupControlDir(exportRoot));
+	const source = (await protectedJson(join(controlDir, GROUP_SOURCE_FILE))).value as SourceSetManifest;
+	if (!source || source.schema !== "pi-telegram-owner/source-set/v1" || !Array.isArray(source.pages) || !Number.isSafeInteger(source.messageCount)) throw new ImportValidationError("MANIFEST_INVALID", "Source set manifest is invalid");
+	const speakersPath = join(controlDir, GROUP_SPEAKERS_FILE);
+	const speakers = validateGroupSpeakerMap((await protectedJson(speakersPath)).value, speakersPath);
+	if (!Number.isSafeInteger(options.chatId) || options.chatId >= 0) throw new ImportValidationError("MANIFEST_INVALID", "chatId must be the negative supergroup ID");
+	const journal = new GroupJournal(options.sharedRoot, options.journalOptions);
+	const messages: Array<GroupMessage & { photoPath?: string }> = [];
+	for (const page of source.pages) {
+		const file = await safeSource(exportRoot, page.path, MAX_PAGE_BYTES);
+		if (file.info.size !== page.size || hash(file.bytes) !== page.sha256) throw new ImportValidationError("SOURCE_CHANGED", `${page.path} changed since the import was prepared; prepare it again and review a new dry run`);
+		for (const block of parseGroupPage(file.bytes.toString("utf8"), page.path)) {
+			const speaker = speakers.speakers[block.senderName];
+			if (!speaker) throw new ImportValidationError("DIRECTION_UNKNOWN", `"${block.senderName}" is not in ${speakersPath}; prepare the import again`);
+			messages.push({
+				chatId: options.chatId,
+				messageId: block.messageId,
+				senderId: speaker.userId,
+				sender: speaker.kind === "owner" ? GROUP_OWNER_SENDER : block.senderName,
+				senderKind: speaker.kind,
+				date: Math.floor(new Date(telegramExportTimestamp(block.date)).valueOf() / 1000),
+				text: block.text,
+				entities: [],
+				...(block.replyToMessageId ? { replyToMessageId: block.replyToMessageId } : {}),
+				...(block.hasDocument ? { media: { kind: "document" as const, ...(block.documentName ? { fileName: block.documentName } : {}) } } : {}),
+				...(block.photoPath ? { photoPath: block.photoPath } : {}),
+			});
+		}
+	}
+	if (messages.length !== source.messageCount) throw new ImportValidationError("SOURCE_SET_INVALID", "Validated message count differs from manifest");
+	let alreadyPresent = 0;
+	let imported = 0;
+	let photos = 0;
+	const journaled = await journal.messageIds(options.chatId);
+	for (const { photoPath, ...message } of messages) {
+		if (journaled.has(message.messageId)) {
+			alreadyPresent += 1;
+			continue;
+		}
+		if (photoPath) {
+			const bytes = (await safeSource(exportRoot, photoPath, 10 * 1024 * 1024)).bytes;
+			const mimeType = imageMime(bytes);
+			if (!mimeType) throw new ImportValidationError("ATTACHMENT_UNSAFE");
+			photos += 1;
+			if (options.commit) message.media = { kind: "photo", mimeType, attachment: await journal.storeAttachment(bytes, mimeType) };
+		}
+		if (options.commit) await journal.recordMessage(message, "import");
+		imported += 1;
+	}
+	return { schema: "pi-telegram-owner/group-import-report/v1", mode: options.commit ? "commit" : "dry-run", messages: messages.length, alreadyPresent, imported, photos };
 }

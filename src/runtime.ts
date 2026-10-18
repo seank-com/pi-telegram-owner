@@ -29,6 +29,77 @@ export interface ConnectionStatus {
 	retryDelayMs?: number;
 }
 
+/** Another agent in the group chat. */
+export interface GroupAgentConfig {
+	/** Bot username without @. */
+	telegramAccount: string;
+	/** How the agent is named to the others. */
+	telegramName: string;
+	botUserId: number;
+	queuePort: number;
+}
+
+export interface GroupChatConfig {
+	chatId: number;
+	sharedRoot: string;
+	datastore: DatastorePolicy;
+	electionStepMs: number;
+	otherAgents: GroupAgentConfig[];
+}
+
+export const DEFAULT_GROUP_DATASTORE_STORE = "telegram-group";
+export const DEFAULT_ELECTION_STEP_MS = 2_000;
+const BOT_USERNAME = /^[A-Za-z][A-Za-z0-9_]{3,31}$/;
+
+function validPort(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 1024 && (value as number) <= 65_535;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
+	const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+	if (unknown.length) throw new ConfigurationError(`${label} has unknown field ${unknown.join(", ")}`);
+}
+
+/** Validates the optional groupChat section against the rest of the configuration. */
+export function parseGroupChatConfig(value: unknown, context: { ownerUserId: number; queuePort?: number }): GroupChatConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new ConfigurationError("groupChat must be an object");
+	const item = value as Record<string, unknown>;
+	exactKeys(item, ["chatId", "sharedRoot", "datastore", "electionStepMs", "otherAgents"], "groupChat");
+	if (context.queuePort === undefined) throw new ConfigurationError("groupChat requires queuePort");
+	if (!Number.isSafeInteger(item.chatId) || (item.chatId as number) >= 0) throw new ConfigurationError("groupChat.chatId must be the negative supergroup ID");
+	if (typeof item.sharedRoot !== "string" || !isAbsolute(item.sharedRoot)) throw new ConfigurationError("groupChat.sharedRoot must be an absolute path");
+	const electionStepMs = item.electionStepMs ?? DEFAULT_ELECTION_STEP_MS;
+	if (!Number.isSafeInteger(electionStepMs) || (electionStepMs as number) < 250 || (electionStepMs as number) > 30_000) throw new ConfigurationError("groupChat.electionStepMs must be an integer from 250 through 30000");
+	let datastore: DatastorePolicy;
+	try {
+		const policy = item.datastore === undefined ? {} : item.datastore;
+		if (!policy || typeof policy !== "object" || Array.isArray(policy)) throw new Error("groupChat.datastore must be an object");
+		datastore = parseDatastorePolicy({ store: DEFAULT_GROUP_DATASTORE_STORE, ...(policy as object) });
+	} catch (error) {
+		throw new ConfigurationError(`groupChat.${(error as Error).message.replace(/^groupChat\./, "")}`);
+	}
+	if (!Array.isArray(item.otherAgents) || item.otherAgents.length === 0) throw new ConfigurationError("groupChat.otherAgents must list at least one other agent");
+	const accounts = new Set<string>();
+	const ids = new Set<number>([context.ownerUserId]);
+	const ports = new Set<number>([context.queuePort]);
+	const otherAgents = item.otherAgents.map((entry, index): GroupAgentConfig => {
+		const label = `groupChat.otherAgents[${index}]`;
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new ConfigurationError(`${label} must be an object`);
+		const agent = entry as Record<string, unknown>;
+		exactKeys(agent, ["telegramAccount", "telegramName", "botUserId", "queuePort"], label);
+		const account = typeof agent.telegramAccount === "string" ? agent.telegramAccount.replace(/^@/, "") : "";
+		if (!BOT_USERNAME.test(account)) throw new ConfigurationError(`${label}.telegramAccount must be a Telegram bot username`);
+		if (!Number.isSafeInteger(agent.botUserId) || (agent.botUserId as number) <= 0) throw new ConfigurationError(`${label}.botUserId must be a positive integer`);
+		if (!validPort(agent.queuePort)) throw new ConfigurationError(`${label}.queuePort must be an integer from 1024 through 65535`);
+		if (accounts.has(account.toLowerCase()) || ids.has(agent.botUserId as number) || ports.has(agent.queuePort)) throw new ConfigurationError(`${label} repeats a username, user ID or port`);
+		accounts.add(account.toLowerCase());
+		ids.add(agent.botUserId as number);
+		ports.add(agent.queuePort);
+		return { telegramAccount: account, telegramName: validateAgentLabel(agent.telegramName, `${label}.telegramName`), botUserId: agent.botUserId as number, queuePort: agent.queuePort };
+	});
+	return { chatId: item.chatId as number, sharedRoot: resolve(item.sharedRoot), datastore, electionStepMs: electionStepMs as number, otherAgents };
+}
+
 export interface TelegramOwnerConfig {
 	datastore: DatastorePolicy;
 	ownerUserId: number;
@@ -37,11 +108,14 @@ export interface TelegramOwnerConfig {
 	formattedDelivery: boolean;
 	inboundQuietWindowMs: number;
 	markdownProjection?: TelegramMarkdownProjectorConfig;
+	/** Local queue endpoint port on 127.0.0.1, when configured. */
+	queuePort?: number;
+	groupChat?: GroupChatConfig;
 	baseDir: string;
 	journalPath: string;
 	lockPath: string;
-	/** Creates a client without exposing or serializing the configured token. */
-	createApiClient(): TelegramApiClient;
+	/** Creates a client without exposing or serializing the configured token; the private chat by default. */
+	createApiClient(options?: { chatId?: number; allowedUpdates?: readonly string[] }): TelegramApiClient;
 }
 
 export interface LoadedConfig {
@@ -112,10 +186,7 @@ async function requireProtectedDirectory(path: string): Promise<void> {
 	}
 }
 
-/**
- * Loads one project-local configuration. `tokenFile` is deprecated migration
- * compatibility; new configurations must use `tokenEnv`.
- */
+/** Loads one project-local configuration. */
 export async function loadTelegramOwnerConfig(
 	configPath: string,
 	environment: NodeJS.ProcessEnv = process.env,
@@ -147,9 +218,8 @@ export async function loadTelegramOwnerConfig(
 		formattedDelivery?: unknown;
 		inboundQuietWindowMs?: unknown;
 		markdownProjection?: unknown;
-		archive?: unknown;
-		/** @deprecated Migration compatibility only. Use tokenEnv. */
-		tokenFile?: unknown;
+		queuePort?: unknown;
+		groupChat?: unknown;
 	};
 	for (const [name, id] of [
 		["ownerUserId", value.ownerUserId],
@@ -159,31 +229,15 @@ export async function loadTelegramOwnerConfig(
 			throw new ConfigurationError(`${name} must be a positive integer`);
 		}
 	}
-	const hasTokenEnv = value.tokenEnv !== undefined;
-	const hasTokenFile = value.tokenFile !== undefined;
-	if (hasTokenEnv === hasTokenFile) {
-		throw new ConfigurationError("Telegram owner config must specify exactly one of tokenEnv or deprecated tokenFile");
+	if (typeof value.tokenEnv !== "string" || !ENVIRONMENT_IDENTIFIER.test(value.tokenEnv)) {
+		throw new ConfigurationError("tokenEnv must be a conventional environment variable name");
 	}
-	let token: string;
-	if (hasTokenEnv) {
-		if (typeof value.tokenEnv !== "string" || !ENVIRONMENT_IDENTIFIER.test(value.tokenEnv)) {
-			throw new ConfigurationError("tokenEnv must be a conventional environment variable name");
-		}
-		const selected = environment[value.tokenEnv];
-		if (selected === undefined || selected.length === 0) {
-			throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} is not set or empty`);
-		}
-		token = selected;
-		if (/\s/.test(token)) {
-			throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} must contain one non-empty token`);
-		}
-	} else {
-		if (typeof value.tokenFile !== "string" || !isAbsolute(value.tokenFile)) {
-			throw new ConfigurationError("deprecated tokenFile must be an absolute path");
-		}
-		await requireProtectedFile(value.tokenFile, "Telegram bot token file");
-		token = (await readFile(value.tokenFile, "utf8")).trim();
-		if (!token || /\s/.test(token)) throw new ConfigurationError("Telegram bot token file must contain one non-empty token");
+	const token = environment[value.tokenEnv];
+	if (token === undefined || token.length === 0) {
+		throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} is not set or empty`);
+	}
+	if (/\s/.test(token)) {
+		throw new ConfigurationError(`Telegram bot token environment variable ${value.tokenEnv} must contain one non-empty token`);
 	}
 	const datastore = parseDatastorePolicy(value.datastore);
 	const ownerUserId = value.ownerUserId as number;
@@ -193,9 +247,11 @@ export async function loadTelegramOwnerConfig(
 	const formattedDelivery = value.formattedDelivery !== false;
 	const inboundQuietWindowMs = value.inboundQuietWindowMs ?? DEFAULT_INBOUND_QUIET_WINDOW_MS;
 	if (!Number.isSafeInteger(inboundQuietWindowMs) || Number(inboundQuietWindowMs) < 100 || Number(inboundQuietWindowMs) > 5_000) throw new ConfigurationError("inboundQuietWindowMs must be an integer from 100 through 5000");
-	if (value.markdownProjection !== undefined && value.archive !== undefined) throw new ConfigurationError("Configure markdownProjection, not both markdownProjection and deprecated archive");
+	const queuePort = value.queuePort;
+	if (queuePort !== undefined && (!Number.isSafeInteger(queuePort) || (queuePort as number) < 1024 || (queuePort as number) > 65_535)) throw new ConfigurationError("queuePort must be an integer from 1024 through 65535");
+	const groupChat = value.groupChat === undefined ? undefined : parseGroupChatConfig(value.groupChat, { ownerUserId: value.ownerUserId as number, queuePort: queuePort as number | undefined });
 	let markdownProjection: TelegramMarkdownProjectorConfig | undefined;
-	const projectionValue = value.markdownProjection ?? value.archive ?? { enabled: true };
+	const projectionValue = value.markdownProjection ?? { enabled: true };
 	if (projectionValue !== false) {
 		if (!projectionValue || typeof projectionValue !== "object" || Array.isArray(projectionValue)) throw new ConfigurationError("markdownProjection must be false or an object");
 		const item = projectionValue as { enabled?: unknown; root?: unknown; sessionRoot?: unknown; rootId?: unknown; roleSlugs?: unknown };
@@ -224,10 +280,12 @@ export async function loadTelegramOwnerConfig(
 			formattedDelivery,
 			inboundQuietWindowMs: Number(inboundQuietWindowMs),
 			markdownProjection,
+			...(queuePort === undefined ? {} : { queuePort: queuePort as number }),
+			...(groupChat ? { groupChat } : {}),
 			baseDir,
 			journalPath: join(baseDir, "state.jsonl"),
 			lockPath: join(baseDir, "poller.lock"),
-			createApiClient: () => new TelegramApiClient(token, privateChatId),
+			createApiClient: (options = {}) => new TelegramApiClient(token, options.chatId ?? privateChatId, undefined, undefined, options.allowedUpdates),
 		},
 	};
 }
@@ -298,17 +356,53 @@ export class TelegramApiClient {
 	private readonly chatId: number;
 	private readonly fetchImpl: FetchLike;
 	private readonly requestDeadlineMs: number;
+	private readonly allowedUpdates: readonly string[];
 
 	constructor(
 		token: string,
 		chatId: number,
 		fetchImpl: FetchLike = fetch as unknown as FetchLike,
 		requestDeadlineMs = 35_000,
+		allowedUpdates: readonly string[] = ["message"],
 	) {
 		this.#token = token;
 		this.chatId = chatId;
 		this.fetchImpl = fetchImpl;
 		this.requestDeadlineMs = requestDeadlineMs;
+		this.allowedUpdates = allowedUpdates;
+	}
+
+	/** The bot's own Telegram identity. */
+	async getMe(signal?: AbortSignal): Promise<{ id: number; username: string; firstName: string }> {
+		const result = await this.callBotMethod<{ id?: unknown; username?: unknown; first_name?: unknown }>("getMe", {}, signal);
+		if (!Number.isSafeInteger(result.id) || typeof result.username !== "string") throw new Error("Telegram getMe returned an invalid identity");
+		return { id: result.id as number, username: result.username, firstName: validateAgentLabel(result.first_name, "Telegram getMe first_name") };
+	}
+
+	async getChat(signal?: AbortSignal): Promise<{ id: number; type: string }> {
+		const result = await this.callBotMethod<{ id?: unknown; type?: unknown }>("getChat", { chat_id: this.chatId }, signal);
+		return { id: Number(result.id), type: String(result.type) };
+	}
+
+	async getChatMember(userId: number, signal?: AbortSignal): Promise<{ status: string; canRestrictMembers?: boolean; canDeleteMessages?: boolean }> {
+		const result = await this.callBotMethod<{ status?: unknown; can_restrict_members?: unknown; can_delete_messages?: unknown }>("getChatMember", { chat_id: this.chatId, user_id: userId }, signal);
+		return { status: String(result.status), canRestrictMembers: result.can_restrict_members === true, canDeleteMessages: result.can_delete_messages === true };
+	}
+
+	async getChatMemberCount(signal?: AbortSignal): Promise<number> {
+		const result = await this.callBotMethod<unknown>("getChatMemberCount", { chat_id: this.chatId }, signal);
+		if (!Number.isSafeInteger(result)) throw new Error("Telegram getChatMemberCount returned an invalid count");
+		return result as number;
+	}
+
+	/** Removes a member without leaving a lasting ban. */
+	async removeChatMember(userId: number, signal?: AbortSignal): Promise<void> {
+		await this.callBotMethod("banChatMember", { chat_id: this.chatId, user_id: userId }, signal);
+		await this.callBotMethod("unbanChatMember", { chat_id: this.chatId, user_id: userId, only_if_banned: true }, signal);
+	}
+
+	async leaveChat(chatId: number, signal?: AbortSignal): Promise<void> {
+		await this.callBotMethod("leaveChat", { chat_id: chatId }, signal);
 	}
 
 	/** Resolves and validates the configured bot's Telegram display name. */
@@ -331,20 +425,30 @@ export class TelegramApiClient {
 		}
 	}
 
-	/** Idempotently reconciles the configured bot's server-side command menu. */
+	/**
+	 * Idempotently reconciles the configured bot's server-side command menu.
+	 * Commands are private-chat only, so the default scope that groups fall
+	 * back to is cleared.
+	 */
 	async setOwnerCommandMenu(signal?: AbortSignal): Promise<void> {
+		await this.callBotMethod("setMyCommands", { commands: telegramOwnerMenuCommands(), scope: { type: "all_private_chats" } }, signal);
+		await this.callBotMethod("deleteMyCommands", {}, signal);
+	}
+
+	private async callBotMethod<T = unknown>(method: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
 		try {
-			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/setMyCommands`, {
+			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/${method}`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ commands: telegramOwnerMenuCommands() }),
+				body: JSON.stringify(body),
 				signal: deadline.signal,
 			});
-			const payload = (await response.json()) as { ok?: boolean };
+			const payload = (await response.json()) as { ok?: boolean; result?: unknown };
 			if (!response.ok || payload.ok !== true) {
-				throw new Error(`Telegram setMyCommands failed (HTTP ${response.status ?? "unknown"})`);
+				throw new Error(`Telegram ${method} failed (HTTP ${response.status ?? "unknown"})`);
 			}
+			return payload.result as T;
 		} catch (error) {
 			throw new Error(sanitizeError(error, this.#token));
 		} finally {
@@ -355,7 +459,7 @@ export class TelegramApiClient {
 	async getUpdates(cursor?: number, signal?: AbortSignal): Promise<TelegramUpdate[]> {
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
 		try {
-			return await fetchUpdateBatch(this.fetchImpl, this.#token, cursor, deadline.signal, 25);
+			return await fetchUpdateBatch(this.fetchImpl, this.#token, cursor, deadline.signal, 25, this.allowedUpdates);
 		} catch (error) {
 			throw new Error(sanitizeError(error, this.#token));
 		} finally {
@@ -640,6 +744,10 @@ export interface TelegramActivityMessageOptions {
 	sleep?: Sleep;
 	now?: () => number;
 	minimumEditIntervalMs?: number;
+	/** An already journaled message for this job, such as its queued notice, to edit instead of sending. */
+	existingMessageId?: string;
+	/** A line shown above every status, naming what the work is about. */
+	prefix?: string;
 }
 
 /** Owns the single ephemeral activity message for one confirmed Telegram job. */
@@ -658,27 +766,49 @@ export class TelegramActivityMessage {
 	constructor(jobId: string, options: TelegramActivityMessageOptions, initialText = "Thinking…") {
 		this.jobId = jobId;
 		this.options = options;
-		this.initialText = boundedActivityText(initialText);
+		this.initialText = this.withPrefix(boundedActivityText(initialText));
 		this.desired = this.initialText;
+		this.messageId = options.existingMessageId;
 	}
 
 	start(): void {
 		this.ensureWorker();
 	}
 
+	private withPrefix(text: string): string {
+		return this.options.prefix ? `${this.options.prefix}\n${text}` : text;
+	}
+
 	update(text: string): void {
-		if (!this.acceptingUpdates || !text || text === this.desired) return;
-		this.desired = boundedActivityText(text);
+		if (!this.acceptingUpdates || !text) return;
+		const desired = this.withPrefix(boundedActivityText(text));
+		if (desired === this.desired) return;
+		this.desired = desired;
 		this.ensureWorker();
 	}
 
-	async stopAndDelete(): Promise<void> {
-		if (!this.acceptingUpdates && !this.worker) return;
+	/** Stops further updates and leaves the message in place. Returns its ID, if one was sent. */
+	async halt(): Promise<string | undefined> {
 		this.acceptingUpdates = false;
 		this.controller.abort(new Error("Telegram activity stopped"));
 		await this.worker?.catch(() => undefined);
 		this.worker = undefined;
-		const messageId = this.messageId;
+		return this.messageId;
+	}
+
+	/** Best-effort final text for a halted activity that must stay visible. */
+	async annotate(text: string): Promise<void> {
+		if (this.acceptingUpdates || !this.messageId) return;
+		try {
+			await this.options.edit(this.messageId, this.withPrefix(boundedActivityText(text)), new AbortController().signal);
+		} catch (error) {
+			this.fail("edit", error);
+		}
+	}
+
+	async stopAndDelete(): Promise<void> {
+		if (!this.acceptingUpdates && !this.worker && !this.messageId) return;
+		const messageId = await this.halt();
 		if (!messageId) return;
 		try {
 			await this.options.delete(messageId, new AbortController().signal);
@@ -708,11 +838,12 @@ export class TelegramActivityMessage {
 		if (!this.messageId) {
 			this.attempted = this.initialText;
 			try {
-				this.messageId = await this.options.send(this.initialText, this.controller.signal);
+				// Never abort the first send: once Telegram may have posted it, its ID is needed to delete it later.
+				this.messageId = await this.options.send(this.initialText, new AbortController().signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
 				await this.options.onStarted(this.jobId, this.messageId);
 			} catch (error) {
-				if (!this.controller.signal.aborted) this.fail(this.messageId ? "journal" : "send", error);
+				this.fail(this.messageId ? "journal" : "send", error);
 				return;
 			}
 		}

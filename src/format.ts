@@ -141,7 +141,8 @@ function parse(markdown: string): any {
 
 export function markdownToTelegramHtml(markdown: string): string {
 	const tree = parse(markdown);
-	const rendered = tree.children.map((node: any) => renderBlock(node)).join("\n\n");
+	// Telegram already sets a blockquote apart, so a blank line after one shows as an extra empty line.
+	const rendered = tree.children.map((node: any, index: number) => `${index && tree.children[index - 1].type === "blockquote" ? "\n" : index ? "\n\n" : ""}${renderBlock(node)}`).join("");
 	if (!rendered || Buffer.byteLength(rendered, "utf8") > MAX_RENDERED_HTML_BYTES) throw new TelegramFormatError("Rendered Telegram HTML exceeds output limit");
 	return rendered;
 }

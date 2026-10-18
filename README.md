@@ -22,6 +22,13 @@ bot token environment variable. Never commit a token. Configuration absence
 registers tools/commands but starts no poller and writes no state.
 See [setup](docs/setup.md) for configuration and CLI arguments.
 
+Optionally, an agent can share an owner-controlled Telegram group with other
+agents. Every message in the room is recorded in one shared journal; agents
+address each other with mentions, and an unaddressed owner message is claimed
+by whichever agent is free. A local queue endpoint on `127.0.0.1` lets
+automation running under the same account queue owner-authority instructions.
+See [design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
+
 The optional `datastore` object selects `mode: "auto"` (default), `"off"`, or
 `"required"`, and an exact `store` (default `"telegram"`). Auto enables recall
 and lexical refresh only when the active datastore advertises that store.
@@ -34,19 +41,23 @@ No companion npm dependency or ambient namespace discovery is used.
 Observability enriches activity from validated persisted v1 `tool-intent` entries.
 Without them activity shows `Using <tool>…`; raw arguments are never used.
 
-Two compiled CLIs are included:
+Three compiled CLIs are included:
 
 ```bash
 pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]
 pi-telegram-archive-import --export-root EXPORT --source-set-manifest SOURCE.json \
   --first-pi-anchor BOUNDARY.json --speaker-map SPEAKERS.json \
   --pi-session-root SESSIONS --checkpoint CHECKPOINT.json --dry-run
+pi-telegram-group-import --export-root EXPORT
+pi-telegram-group-import --export-root EXPORT --chat-id CHAT_ID --shared-root ROOT --dry-run
 ```
 
 Menu registration contacts Telegram and is an explicit operator action. Archive
 import defaults to dry-run; commit requires the matching checkpoint and explicit
-`--commit --output-root ROOT`. Both CLIs run as native Node programs without
-loading Pi. Pure helpers are exported as `/format`, `/archive` and `/importer`.
+`--commit --output-root ROOT`. Group import first prepares control files with
+placeholders to fill in, then defaults to dry-run and adds only messages
+missing from the shared journal with `--commit`. The CLIs run as
+native Node programs without loading Pi. Pure helpers are exported as `/format`, `/markdown-projector` and `/importer`.
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
 `npm pack --dry-run`, `npm run test:package`. Default tests need no companion or
@@ -56,6 +67,14 @@ real Telegram. Explicit composition checks use actual candidate tarballs:
 DATASTORE_TARBALL=/path/to/datastore.tgz OBSERVABILITY_TARBALL=/path/to/observability.tgz \
   npm run test:integration
 ```
+
+To keep private terms and secrets out of commits, run `npm run hooks:install`
+once per clone. Commits and pushes are then refused when an added line or a
+commit message contains a line of `~/.pii` (one term per line, matched
+case-insensitively; `#` lines are comments) or a value of 8 or more characters
+from `~/.env`. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
+files. `npm run check:private -- --all` checks every staged file, including
+unchanged ones.
 
 Public README/MIT history and extracted implementation attribution are preserved.
 Only compiled code/declarations, generic docs, README, LICENSE and metadata ship.

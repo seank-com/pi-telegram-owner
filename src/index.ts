@@ -8,20 +8,29 @@ import { formatTelegramToolActivity } from "./activity.ts";
 import { TelegramMarkdownProjector } from "./markdown-projector.ts";
 import {
 	initialThinkingText,
+	queuedNoticeText,
 	telegramOwnerHelpText,
 	unsupportedTelegramCommandText,
 } from "./commands.ts";
 import {
+	DEFAULT_INBOUND_QUIET_WINDOW_MS,
 	extractAssistantText,
 	JsonlJournal,
 	type Journal,
 	type Job,
+	type WorkItem,
+	type TurnOutcome,
+	replyContextLine,
 	type ArchivedTelegramAttachment,
 	type ResolvedArchivedImage,
 	TelegramOwnerBridge,
 	type TelegramImageRef,
 	type TelegramUpdate,
 } from "./core.ts";
+import { parseQueueRequest, postToPeer, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
+import { GroupJournal, type GroupJournalOptions } from "./group-journal.ts";
+import { GroupRuntime, type GroupRuntimeOptions, type GroupTelegramApi } from "./group-runtime.ts";
+import { GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, registerGroupRecallTool, registerGroupTimelineTool } from "./group-tools.ts";
 import { registerTelegramRecallTool } from "./recall.ts";
 import { registerTelegramTimelineTool } from "./timeline.ts";
 import {
@@ -33,7 +42,9 @@ import {
 	readSafeOutboundImage,
 	sanitizeError,
 	TelegramActivityMessage,
+	TelegramReplyAnchorError,
 	TelegramTypingActivity,
+	type GroupChatConfig,
 } from "./runtime.ts";
 
 export interface PrototypeSource {
@@ -61,14 +72,35 @@ export interface PrototypeDependencies {
 	source: PrototypeSource;
 	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
 	reconcileCommandMenu?(signal?: AbortSignal): Promise<void>;
-	sendActivity?(text: string, signal: AbortSignal): Promise<string>;
+	/** Sends a transient activity or queued notice, as a reply when a message is given. */
+	sendActivity?(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
 	editActivity?(messageId: string, text: string, signal: AbortSignal): Promise<void>;
 	deleteActivity?(messageId: string, signal: AbortSignal): Promise<void>;
 	resolveImages?(images: TelegramImageRef[], archived: readonly ArchivedTelegramAttachment[]): Promise<ResolvedArchivedImage[]>;
 	stageOutboundPhoto?(path: string, projectRoot: string): Promise<{ image: { bytes: Buffer; filename: string; mimeType: string }; attachment: ArchivedTelegramAttachment }>;
 	sendPhoto?(image: { bytes: Buffer; filename: string; mimeType: string }, caption: string | undefined, replyToMessageId?: number, signal?: AbortSignal): Promise<string>;
 	sendTyping?(signal: AbortSignal): Promise<void>;
+	/** Group chat configuration and Telegram access, when this agent joins a group. */
+	groupChat?: {
+		config: GroupChatConfig;
+		api: GroupTelegramApi;
+		journalOptions?: GroupJournalOptions;
+		wake?: GroupRuntimeOptions["wake"];
+		coordinate?: GroupRuntimeOptions["coordinate"];
+		retryDelayMs?: GroupRuntimeOptions["retryDelayMs"];
+	};
+	/** Local queue endpoint port on 127.0.0.1; 0 selects a free port. */
+	queuePort?: number;
 	close?(): Promise<void>;
+}
+
+/** Sends, edits and deletes messages in one chat. */
+export interface ChatTransport {
+	chatId: number;
+	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
+	sendActivity(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
+	editActivity(messageId: string, text: string, signal: AbortSignal): Promise<void>;
+	deleteActivity(messageId: string, signal: AbortSignal): Promise<void>;
 }
 
 export interface ExtensionOptions {
@@ -87,6 +119,18 @@ export interface ExtensionOptions {
 }
 
 const GENERIC_AGENT_LABEL = "The agent";
+
+/** Reads how a turn ended from its final assistant message. */
+export function turnOutcome(messages: unknown[]): TurnOutcome {
+	const last = [...messages].reverse().find((message) => (message as { role?: string }).role === "assistant") as { stopReason?: string; errorMessage?: unknown } | undefined;
+	const detail = typeof last?.errorMessage === "string" ? sanitizeError(last.errorMessage).slice(0, 300) : undefined;
+	if (last?.stopReason === "length") return { failure: "LENGTH" };
+	if (last?.stopReason === "aborted") return { failure: "ABORTED" };
+	if (last?.stopReason === "error") return { failure: "MODEL_ERROR", ...(detail ? { detail } : {}) };
+	const text = extractAssistantText(messages);
+	return text ? { text } : { failure: "NO_REPLY" };
+}
+const GROUP_SEND_TOOL = "telegram_group_send";
 export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 	// Capture this once, before any session can change its active cwd.
 	const projectRoot = resolve(options.projectRoot ?? process.cwd());
@@ -97,10 +141,16 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		let datastorePolicy = overridePolicy ?? parseDatastorePolicy(undefined);
 		const integration = createDatastoreIntegration(pi.events, () => datastorePolicy, options.datastoreTimeoutMs);
 		const datastoreClient = integration.service;
+		let groupPolicy: DatastorePolicy = { mode: "off", store: "telegram-group" };
+		const groupIntegration = createDatastoreIntegration(pi.events, () => groupPolicy, options.datastoreTimeoutMs);
+		let groupConfigured = false;
 		const updateRecall = () => {
 			const enabled = datastorePolicy.mode === "required" || integration.available();
-			const active = pi.getActiveTools?.() ?? [];
-			pi.setActiveTools?.(enabled ? [...new Set([...active, "telegram_recall"])] : active.filter(name => name !== "telegram_recall"));
+			const groupRecall = groupConfigured && (groupPolicy.mode === "required" || groupIntegration.available());
+			const toggles: Array<[string, boolean]> = [["telegram_recall", enabled], [GROUP_RECALL_TOOL, groupRecall], [GROUP_TIMELINE_TOOL, groupConfigured], [GROUP_SEND_TOOL, groupConfigured]];
+			let active = pi.getActiveTools?.() ?? [];
+			for (const [name, on] of toggles) active = on ? [...new Set([...active, name])] : active.filter((candidate) => candidate !== name);
+			pi.setActiveTools?.(active);
 		};
 		const projectionRefreshDebounceMs = options.projectionRefreshDebounceMs ?? 250;
 		let bridge: TelegramOwnerBridge | undefined;
@@ -126,6 +176,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		let lastTypingError: string | undefined;
 		let lastActivityError: string | undefined;
 		let lastIndexError: string | undefined;
+		let lastEndpointError: string | undefined;
+		let endpoint: QueueEndpoint | undefined;
+		let groupRuntime: GroupRuntime | undefined;
+		let groupJournal: GroupJournal | undefined;
+		let lastGroupError: string | undefined;
 		let compacting = false;
 		let switching = false;
 		let agentLabel = GENERIC_AGENT_LABEL;
@@ -149,12 +204,35 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			if (lastTypingError) details.push(`typingError=${lastTypingError}`);
 			if (lastActivityError) details.push(`activityError=${lastActivityError}`);
 			if (lastIndexError) details.push(`indexError=${lastIndexError}`);
+			if (endpoint) details.push(`endpoint=${QUEUE_ENDPOINT_HOST}:${endpoint.port}`);
+			if (groupRuntime) details.push(groupRuntime.statusText());
+			if (lastGroupError) details.push(`groupError=${lastGroupError}`);
+			if (lastEndpointError) details.push(`endpointError=${lastEndpointError}`);
 			return details.join(" ");
 		};
 
 		const updateStatus = (): void => {
 			currentContext?.ui.setStatus("telegram-owner", `telegram: ${statusText()}`);
 		};
+
+		/** The chat that shows a job's activity and receives its reply, or undefined when it has none. */
+		const transportFor = (item: WorkItem | undefined): ChatTransport | undefined => {
+			const deps = runtimeDependencies;
+			if (!deps) return undefined;
+			if (item?.reply.kind === "none") return undefined;
+			if (item?.reply.kind === "group") return groupRuntime?.transport;
+			if (!deps.sendActivity && !deps.editActivity && !deps.deleteActivity) return undefined;
+			const missing = (operation: string) => async (): Promise<never> => { throw new Error(`Telegram activity ${operation} is not configured`); };
+			return {
+				chatId: deps.privateChatId,
+				sendReply: deps.sendReply,
+				sendActivity: deps.sendActivity ?? missing("send"),
+				editActivity: deps.editActivity ?? missing("edit"),
+				deleteActivity: deps.deleteActivity ?? missing("delete"),
+			};
+		};
+		const anchorOf = (job: Job): number | undefined => (job.messageId > 0 ? job.messageId : undefined);
+		const routeItemReply = (item: WorkItem) => (item.reply.kind === "group" ? groupRuntime?.transport.sendReply : undefined);
 
 		const serialized = <T>(work: () => Promise<T>): Promise<T> => {
 			const result = operationTail.then(work);
@@ -208,13 +286,16 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		const stopTyping = (): Promise<void> => typing?.stop() ?? Promise.resolve();
 
-		const startActivity = (jobId: string, ctx: ExtensionContext): void => {
-			if (!bridge || !runtimeDependencies?.sendActivity || !runtimeDependencies.editActivity || !runtimeDependencies.deleteActivity) return;
+		const startActivity = (job: Job, ctx: ExtensionContext): void => {
+			const transport = transportFor(job.item);
+			if (!bridge || !transport) return;
 			lastActivityError = undefined;
-			activity = new TelegramActivityMessage(jobId, {
-				send: runtimeDependencies.sendActivity,
-				edit: runtimeDependencies.editActivity,
-				delete: runtimeDependencies.deleteActivity,
+			activity = new TelegramActivityMessage(job.jobId, {
+				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
+				existingMessageId: bridge.openActivity(job.jobId),
+				...(replyContextLine(job.item) ? { prefix: replyContextLine(job.item) } : {}),
+				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
+				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
 				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId),
 				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId),
 				onFailure: (operation, error) => {
@@ -225,10 +306,51 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			activity.start();
 		};
 
-		const stopActivity = async (): Promise<void> => {
+		/** Stops activity updates; the message stays until its job's reply is sent. */
+		const haltActivity = async (): Promise<TelegramActivityMessage | undefined> => {
 			const current = activity;
 			activity = undefined;
-			await current?.stopAndDelete();
+			await current?.halt();
+			return current;
+		};
+
+		const failedActivityDeletes = new Set<string>();
+		/** Deletes activity and queued-notice messages whose job has finished. */
+		const cleanupFinishedActivities = async (): Promise<void> => {
+			if (!bridge) return;
+			for (const finished of bridge.finishedActivities()) {
+				const transport = transportFor(bridge.itemFor(finished.jobId));
+				if (!transport || failedActivityDeletes.has(finished.messageId)) continue;
+				try {
+					await transport.deleteActivity(finished.messageId, new AbortController().signal);
+				} catch (error) {
+					failedActivityDeletes.add(finished.messageId);
+					lastActivityError = `delete: ${sanitizeError(error)}`;
+					updateStatus();
+					continue;
+				}
+				await bridge.recordActivityCleared(finished.jobId, finished.messageId);
+			}
+		};
+
+		/** Tells the owner which accepted requests are waiting behind other work. */
+		const postQueuedNotices = async (): Promise<void> => {
+			if (!bridge || connection.phase === "stopping") return;
+			for (const { job, position } of bridge.jobsAwaitingQueuedNotice()) {
+				const transport = transportFor(job.item);
+				if (!transport) continue;
+				let messageId: string;
+				try {
+					const context = replyContextLine(job.item);
+					messageId = await transport.sendActivity(`${context ? `${context}\n` : ""}${queuedNoticeText(agentLabel, position)}`, new AbortController().signal, anchorOf(job));
+				} catch (error) {
+					// One unavailable destination, such as a paused group, must not hide private notices.
+					lastActivityError = `queued: ${sanitizeError(error)}`;
+					updateStatus();
+					continue;
+				}
+				await bridge.recordActivityStarted(job.jobId, messageId);
+			}
 		};
 
 		const syncMediaEvents = async (): Promise<void> => {
@@ -256,6 +378,20 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					void pi.sendUserMessage(content, { expandPromptTemplates: false });
 				},
 				runtimeDependencies?.resolveImages,
+				async (item) => {
+					// An image that cannot be read is left out rather than holding the queue.
+					const images = [];
+					for (const image of item.images ?? []) {
+						try {
+							if (!groupJournal) throw new Error("the group chat is not configured");
+							images.push({ data: (await groupJournal.readAttachment(image.path)).toString("base64"), mimeType: image.mimeType });
+						} catch (error) {
+							lastGroupError = `image: ${sanitizeError(error)}`;
+						}
+					}
+					return images;
+				},
+				(job) => job.item?.reply.kind !== "group" || Boolean(groupRuntime?.verified),
 			);
 			updateStatus();
 		};
@@ -265,7 +401,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			quietTimer = undefined;
 			const delay = bridge?.nextBatchReadyDelayMs;
 			if (delay === undefined || (delay === 0 && !ctx.isIdle())) return;
-			quietTimer = setTimeout(() => { quietTimer = undefined; void serialized(async () => { await bridge?.sealReadyBatches(); await dispatchIfIdle(ctx); scheduleQuietDispatch(ctx); }); }, delay);
+			quietTimer = setTimeout(() => { quietTimer = undefined; void serialized(async () => { await bridge?.sealReadyBatches(); await dispatchIfIdle(ctx); await postQueuedNotices(); scheduleQuietDispatch(ctx); }); }, delay);
 			quietTimer.unref?.();
 		};
 
@@ -310,12 +446,14 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const retryPendingReplies = async (): Promise<void> => {
 			if (!bridge || !runtimeDependencies) return;
 			try {
-				const sent = await bridge.retryReadyReplies(runtimeDependencies.sendReply);
+				const sent = await bridge.retryReadyReplies(runtimeDependencies.sendReply, routeItemReply);
 				if (sent > 0) lastOperationError = undefined;
 			} catch (error) {
 				noteError(error);
 			} finally {
 				await reconcileMarkdown(currentContext);
+				await cleanupFinishedActivities().catch((error) => noteError(error));
+				groupRuntime?.notifyReplies();
 			}
 		};
 
@@ -331,11 +469,17 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unavailable";
 			const state = switching ? "switching" : compacting ? "compacting" : ctx.isIdle() ? "idle" : "working";
 			const active = bridge?.activeJob ? `, active ${bridge.activeJob.jobId.slice(0, 8)}` : "";
+			const queued = bridge?.queueDepthByTier;
+			const group = groupRuntime?.state;
+			const failure = bridge?.lastTurnFailure;
 			return [
 				`State: ${state}`,
 				contextText(ctx),
 				`Model: ${model}, ${ctx.thinkingLevel ?? "off"}`,
-				`Telegram: ${connection.phase}, queue ${bridge?.queueDepth ?? 0}${active}`,
+				`Telegram: ${connection.phase}, queue ${queued ? `${queued.owner} owner, ${queued.peer} peer` : "0"}${active}`,
+				...(group ? [`Group: ${group.state === "unverified" ? `paused, ${group.reason}` : group.state}${lastGroupError ? ` (last error: ${lastGroupError})` : ""}`] : []),
+				...(runtimeDependencies?.queuePort !== undefined ? [`Queue endpoint: ${endpoint ? `${QUEUE_ENDPOINT_HOST}:${endpoint.port}` : `unavailable${lastEndpointError ? `, ${lastEndpointError}` : ""}`}`] : []),
+				...(failure ? [`Last failed turn: ${failure.code} at ${failure.timestamp}${failure.detail ? ` (${failure.detail})` : ""}`] : []),
 			].join("\n");
 		};
 
@@ -370,7 +514,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					ctx.abort();
 					await stopTyping();
-					await stopActivity();
+					await haltActivity();
 					await bridge.interruptActive("Stopped by Telegram owner command", "Stopped by /stop.");
 					await completeCommand(job, "Stop requested.");
 					return "continue";
@@ -435,6 +579,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			for (const job of bridge.uncertainCommands) {
 				if (job.command === "new" && reason === "new") {
 					await bridge.completeCommand(job, `Started a new session.\nSession: ${ctx.sessionManager.getSessionId()}\n${contextText(ctx)}`);
+					// Queued group and endpoint work ends visibly; a requesting agent is woken by the notice.
+					await bridge.interruptQueuedItems("Owner started a new session", `Not handled: the owner reset ${agentLabel}'s session.`);
+					await bridge.appendGroupRecord({ type: "group_requests_closed", timestamp: new Date().toISOString() });
 				} else {
 					await bridge.interruptCommand(
 						job,
@@ -443,6 +590,123 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					);
 				}
 			}
+		};
+
+		/** Idle for elections: nothing running, queued, being collected in the quiet window, or awaiting delivery. */
+		const electionIdle = (): boolean => {
+			if (!bridge || !currentContext || compacting || switching || !currentContext.isIdle()) return false;
+			const queued = bridge.queueDepthByTier;
+			return !bridge.activeJob && queued.owner + queued.peer === 0 && bridge.nextBatchReadyDelayMs === undefined && bridge.pendingReplyCount === 0;
+		};
+
+		const isBusy = (): boolean => !electionIdle();
+
+		/** Durably admits a work item, then dispatches it or posts its queued notice. */
+		const admitAndDispatch = async (input: Parameters<TelegramOwnerBridge["admitItem"]>[0]) => {
+			if (!bridge) throw new Error("The agent's Telegram transport is not running");
+			const result = await bridge.admitItem(input);
+			try {
+				if (currentContext) {
+					await dispatchIfIdle(currentContext);
+					await postQueuedNotices();
+				}
+			} catch (error) {
+				noteError(error);
+			}
+			updateStatus();
+			return result;
+		};
+
+		const endpointHandlers = (ownGeneration: number): QueueEndpointHandlers => ({
+			queue: async (body) => {
+				const parsed = parseQueueRequest(body);
+				if (!parsed.ok) return { status: 400, body: { error: parsed.error } };
+				if (generation !== ownGeneration || !bridge) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
+				const request = parsed.value;
+				const group = groupRuntime;
+				if (!group && (request.kind === "group-message" || request.reply === "group")) return { status: 409, body: { error: "The group chat is not configured" } };
+				if (request.kind === "group-message") return group!.acceptWakeUp(request.messageId);
+				const reply = request.reply === "group" ? { kind: "group" as const, chatId: group!.config.chatId } : { kind: request.reply };
+				const admitted = await serialized(async () => (generation === ownGeneration && bridge ? admitAndDispatch({ channel: "endpoint", authority: "owner", sender: request.source, text: request.text, reply, ...(request.id ? { idempotencyKey: request.id } : {}) }) : undefined));
+				if (!admitted) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
+				return { status: 202, body: { itemId: admitted.item.itemId, duplicate: admitted.duplicate } };
+			},
+			coordinate: async (body) => (groupRuntime ? groupRuntime.acceptCoordination(body) : { status: 409, body: { error: "The group chat is not configured" } }),
+			status: async () => ({
+				status: 200,
+				body: {
+					state: isBusy() ? "busy" : "idle",
+					queue: bridge?.queueDepthByTier ?? { owner: 0, peer: 0 },
+					group: groupRuntime ? groupRuntime.state.state : "unconfigured",
+				},
+			}),
+		});
+
+		let groupRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+		/** Coalesces lexical refreshes of the group store; never queued against an absent integration. */
+		const scheduleGroupRefresh = (): void => {
+			if (groupRefreshTimer || groupPolicy.mode === "off" || !groupIntegration.available()) return;
+			groupRefreshTimer = setTimeout(() => {
+				groupRefreshTimer = undefined;
+				if (!groupIntegration.available()) return;
+				void groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" }).catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
+			}, projectionRefreshDebounceMs);
+			groupRefreshTimer.unref?.();
+		};
+
+		const stopGroup = async (): Promise<void> => {
+			if (groupRefreshTimer) clearTimeout(groupRefreshTimer);
+			groupRefreshTimer = undefined;
+			const current = groupRuntime;
+			groupRuntime = undefined;
+			groupJournal = undefined;
+			groupConfigured = false;
+			groupIntegration.stop();
+			const groupTools = new Set([GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, GROUP_SEND_TOOL]);
+			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter((name) => !groupTools.has(name)));
+			await current?.stop().catch((error) => noteError(error));
+		};
+
+		const startGroup = async (deps: PrototypeDependencies, ownGeneration: number): Promise<void> => {
+			const group = deps.groupChat;
+			if (!group) return;
+			groupPolicy = group.config.datastore;
+			groupIntegration.start();
+			groupJournal = new GroupJournal(group.config.sharedRoot, group.journalOptions);
+			groupRuntime = new GroupRuntime({
+				config: group.config,
+				ownerUserId: deps.ownerUserId,
+				api: group.api,
+				journal: groupJournal,
+				bridge: () => (generation === ownGeneration ? bridge : undefined),
+				admit: (input) => serialized(async () => {
+					if (generation !== ownGeneration) throw new Error("The agent's Telegram transport is not running");
+					return admitAndDispatch(input);
+				}),
+				// The same window the bridge applies to private messages.
+				quietWindowMs: deps.inboundQuietWindowMs ?? (options.dependencies ? 0 : DEFAULT_INBOUND_QUIET_WINDOW_MS),
+				wake: group.wake,
+				...(group.retryDelayMs ? { retryDelayMs: group.retryDelayMs } : {}),
+				coordinate: group.coordinate ?? (async (peer, body) => {
+					const response = await postToPeer(peer.queuePort, "/coordinate", body);
+					return "status" in response ? response : undefined;
+				}),
+				isIdle: () => generation === ownGeneration && electionIdle(),
+				report: (text) => { void deps.sendReply(text).catch((error) => noteError(error)); },
+				onError: (error) => { lastGroupError = sanitizeError(error); updateStatus(); },
+				onStatus: updateStatus,
+				onJournalChanged: scheduleGroupRefresh,
+			});
+			groupConfigured = true;
+			updateRecall();
+			lastGroupError = undefined;
+			await groupRuntime.start();
+		};
+
+		const stopEndpoint = async (): Promise<void> => {
+			const current = endpoint;
+			endpoint = undefined;
+			await current?.close();
 		};
 
 		const makeDefaultDependencies = async (): Promise<PrototypeDependencies | undefined> => {
@@ -469,7 +733,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				connection = { phase: "disabled", lastError: disabledReason };
 				return undefined;
 			}
-			const api = config.createApiClient();
+			const groupUpdates = ["message", "chat_member", "my_chat_member"];
+			const api = config.createApiClient(config.groupChat ? { allowedUpdates: groupUpdates } : {});
+			const groupApi = config.groupChat ? config.createApiClient({ chatId: config.groupChat.chatId }) : undefined;
 			const requests = new AbortController();
 			const mediaProjector = new TelegramMarkdownProjector(config.markdownProjection ?? { enabled: true, root: projectRoot, rootId: "pi-sessions" });
 			const poller = new LongPollSource(api, (next) => {
@@ -483,6 +749,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				agentLabel: config.agentLabel,
 				formattedDelivery: config.formattedDelivery,
 				inboundQuietWindowMs: config.inboundQuietWindowMs,
+				queuePort: config.queuePort,
+				...(config.groupChat && groupApi ? { groupChat: { config: config.groupChat, api: groupApi } } : {}),
 				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
 				mediaProjector,
 				requestLexicalRefresh: async (signal) => { if (integration.available()) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
@@ -497,7 +765,14 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				},
 				sendReply: (text, replyTo, format) => api.sendMessage(text, replyTo, requests.signal, format),
 				reconcileCommandMenu: (signal) => api.setOwnerCommandMenu(signal ?? requests.signal),
-				sendActivity: (text, signal) => api.sendMessage(text, undefined, signal),
+				sendActivity: async (text, signal, replyTo) => {
+					try {
+						return await api.sendMessage(text, replyTo, signal);
+					} catch (error) {
+						if (replyTo === undefined || !(error instanceof TelegramReplyAnchorError)) throw error;
+						return api.sendMessage(text, undefined, signal);
+					}
+				},
 				editActivity: (messageId, text, signal) => api.editMessageText(messageId, text, signal),
 				deleteActivity: (messageId, signal) => api.deleteMessage(messageId, signal),
 				resolveImages: async (images, archived) => {
@@ -527,6 +802,37 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		};
 
 		registerTelegramRecallTool(pi, datastoreClient, () => datastorePolicy.store);
+		registerGroupRecallTool(pi, groupIntegration.service, () => groupPolicy.store);
+		registerGroupTimelineTool(pi, () => (groupRuntime?.verified && groupJournal ? { journal: groupJournal, chatId: groupRuntime.config.chatId } : undefined));
+		pi.registerTool({
+			name: GROUP_SEND_TOOL,
+			label: "Send to group chat",
+			description: "Ask another agent a question in the group chat shared with the owner and the other agents. Mention the agent as @username. Its answer comes back to you as a new turn carrying the work that led you to ask. To answer the message you are working on, do not use this tool: just write your reply, which is posted automatically. Only the supplied text is sent.",
+			promptSnippet: "Ask another agent a question in the shared group chat",
+			promptGuidelines: [
+				"Use telegram_group_send only to ask another agent something, mentioning it as @username, then end your turn; the answer wakes you. To answer the message you are working on, write your reply normally; it is posted automatically.",
+				"A telegram_group_send that replies to the message you are working on, such as a clarifying question, is your response to that message: your final reply to it is not posted.",
+			],
+			parameters: {
+				type: "object",
+				properties: {
+					text: { type: "string", minLength: 1, description: "The request, including @username mentions of the agents it is for." },
+					replyToMessageId: { type: "integer", minimum: 1, description: "A group message ID to reply to, such as the owner's request being passed on." },
+				},
+				required: ["text"],
+				additionalProperties: false,
+			} as any,
+			executionMode: "sequential",
+			execute: async (toolCallId, params) => {
+				const input = params as { text: string; replyToMessageId?: number };
+				if (!groupRuntime) throw new Error("CAPABILITY_UNAVAILABLE: the group chat is not configured.");
+				const messageId = await groupRuntime.sendRequest(`tool:${toolCallId}`, input.text, input.replyToMessageId, bridge?.activeJob?.jobId);
+				if (bridge && await bridge.recordRespondedByRequest(input.replyToMessageId, messageId)) {
+					return { content: [{ type: "text" as const, text: `Posted group message ${messageId} as a question replying to message ${input.replyToMessageId}, the message you are working on. That question is your response to it: your final reply will not be posted, and the answer will come back to you as a new turn. End your turn now.` }], details: { messageId, respondedToCurrentMessage: true } };
+				}
+				return { content: [{ type: "text" as const, text: `Posted group message ${messageId}. The answer will come back to you as a new turn.` }], details: { messageId, respondedToCurrentMessage: false } };
+			},
+		});
 		pi.on("resources_discover", () => { updateRecall(); updateStatus(); });
 		registerTelegramTimelineTool(pi, () => runtimeDependencies?.markdownProjector);
 
@@ -640,7 +946,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					runtimeDependencies.journal,
 					runtimeDependencies.ownerUserId,
 					runtimeDependencies.privateChatId,
-					{ formattedDelivery: runtimeDependencies.formattedDelivery, inboundQuietWindowMs: runtimeDependencies.inboundQuietWindowMs ?? (options.dependencies ? 0 : undefined) },
+					{ formattedDelivery: runtimeDependencies.formattedDelivery, inboundQuietWindowMs: runtimeDependencies.inboundQuietWindowMs ?? (options.dependencies ? 0 : undefined), groupChatId: runtimeDependencies.groupChat?.config.chatId },
 				);
 				typing = runtimeDependencies.sendTyping
 					? new TelegramTypingActivity(runtimeDependencies.sendTyping, (error) => {
@@ -660,17 +966,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						updateStatus();
 					}
 				}
-				if (runtimeDependencies.deleteActivity) {
-					for (const orphan of recovered.orphanedActivities) {
-						try {
-							await runtimeDependencies.deleteActivity(orphan.messageId, new AbortController().signal);
-							await bridge.recordActivityCleared(orphan.jobId, orphan.messageId);
-						} catch (error) {
-							lastActivityError = `restart-delete: ${sanitizeError(error)}`;
-							updateStatus();
-						}
-					}
-				}
+				await cleanupFinishedActivities();
 				await bridge.interruptUncertain(
 					"Pi restarted before dispatch outcome was durable",
 					"Previous request was interrupted by Pi restart; please resend.",
@@ -680,30 +976,46 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					serialized(async () => {
 						if (generation !== ownGeneration || !bridge) return bridge?.cursor;
 						const state = await bridge.ingestBatch(updates);
+						groupRuntime?.notifyUpdates();
+						groupRuntime?.notifyIdle();
 						for (let index = 0; index < state.acceptedModelInputCount; index++) startReceiptTyping();
 						await capturePendingInboundMedia();
 						await retryPendingReplies();
 						await processPendingCommands(ctx);
 						await dispatchIfIdle(ctx);
+						await postQueuedNotices();
 						scheduleQuietDispatch(ctx);
 						return state.cursor;
 					}),
 					recovered.cursor,
 				);
+				await startGroup(runtimeDependencies, ownGeneration);
+				if (runtimeDependencies.queuePort !== undefined) {
+					lastEndpointError = undefined;
+					try {
+						endpoint = await startQueueEndpoint(runtimeDependencies.queuePort, endpointHandlers(ownGeneration));
+					} catch (error) {
+						lastEndpointError = sanitizeError(error);
+					}
+					updateStatus();
+				}
 				await serialized(async () => {
 					await retryPendingReplies();
 					await processPendingCommands(ctx);
 					await dispatchIfIdle(ctx);
+					await postQueuedNotices();
 					scheduleQuietDispatch(ctx);
 				});
 			} catch (error) {
 				noteError(error);
+				await stopEndpoint().catch((endpointError) => noteError(endpointError));
 				await stopReceiptTyping();
 				await stopTyping();
 				typing = undefined;
 				const stop = stopSource;
 				stopSource = undefined;
 				if (stop) await stop().catch((stopError) => noteError(stopError));
+				await stopGroup();
 				const close = runtimeDependencies.close;
 				runtimeDependencies = undefined;
 				bridge = undefined;
@@ -727,7 +1039,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				const began = await bridge.beforeAgentStart(event.prompt, ctx.sessionManager.getSessionId());
 				if (began && bridge.activeJob) {
 					startTyping();
-					startActivity(bridge.activeJob.jobId, ctx);
+					startActivity(bridge.activeJob, ctx);
 				}
 				updateStatus();
 			});
@@ -743,29 +1055,32 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		});
 
 		pi.on("agent_end", (event) => {
-			bridge?.captureAgentEnd(extractAssistantText(event.messages));
+			bridge?.captureAgentEnd(turnOutcome(event.messages));
 		});
 
 		pi.on("agent_settled", async (_event, ctx) => {
-			// Stop transient indicators immediately. The activity delete is attempted
-			// before durable reply settlement; failures never suppress that reply.
+			// The final reply is sent and recorded before the activity message is
+			// deleted. A failed or uncertain final leaves the activity visible.
 			const typingStopped = stopTyping();
 			await serialized(async () => {
-				await stopActivity();
+				const halted = await haltActivity();
 				if (bridge && runtimeDependencies) {
 					try {
-						const sent = await bridge.settle(runtimeDependencies.sendReply);
+						const sent = await bridge.settle(runtimeDependencies.sendReply, routeItemReply);
 						if (sent) lastOperationError = undefined;
 						await reconcileMarkdown(ctx);
 					} catch (error) {
 						noteError(error);
+						await halted?.annotate("Reply delivery failed; it will be retried.");
 					}
 				}
 				await typingStopped;
 				await retryPendingReplies();
 				await dispatchIfIdle(ctx);
+				await postQueuedNotices();
 				updateStatus();
 			});
+			groupRuntime?.notifyIdle();
 		});
 
 		pi.on("session_before_switch", () => (bridge?.activeJob ? { cancel: true } : undefined));
@@ -786,6 +1101,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			projectionRefreshInFlight = undefined;
 			connection = { phase: "stopping" };
 			updateStatus();
+			await stopEndpoint().catch((error) => noteError(error));
 			const receiptTypingStopped = stopReceiptTyping();
 			const typingStopped = stopTyping();
 			const stop = stopSource;
@@ -795,8 +1111,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			await typingStopped;
 			await operationTail;
 			await stopTyping();
-			await stopActivity();
-			if (bridge) await bridge.shutdown(event.reason);
+			await haltActivity();
+			await stopGroup();
+			if (bridge) {
+				await bridge.shutdown(event.reason);
+				await cleanupFinishedActivities().catch((error) => noteError(error));
+			}
 			bridge = undefined;
 			typing = undefined;
 			activity = undefined;
