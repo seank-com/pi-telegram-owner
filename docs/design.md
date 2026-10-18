@@ -64,7 +64,9 @@ starting real services.
 Activity consumes only validated versioned persisted audit data. Existing safe
 activity validation remains a Telegram display responsibility; it does not copy
 observability's sanitizer/redactor. Without a valid audit entry, activity falls
-back to a bounded tool name. Raw tool arguments are never displayed. Persisted
+back to a bounded tool name. Validated intents are displayed in full up to the
+1,000-character audit limit, without a separate activity-display truncation.
+Raw tool arguments are never displayed. Persisted
 identifiers/types are checked against the owner's actual packed contract.
 
 Native CLIs/archive helpers import no Pi runtime values. The extension supplies

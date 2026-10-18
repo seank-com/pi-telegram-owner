@@ -727,13 +727,6 @@ export class TelegramTypingActivity {
 	}
 }
 
-const MAX_ACTIVITY_TEXT = 160;
-
-function boundedActivityText(text: string): string {
-	if (text.length <= MAX_ACTIVITY_TEXT) return text;
-	return `${text.slice(0, MAX_ACTIVITY_TEXT - 1)}…`;
-}
-
 export interface TelegramActivityMessageOptions {
 	send(text: string, signal: AbortSignal): Promise<string>;
 	edit(messageId: string, text: string, signal: AbortSignal): Promise<void>;
@@ -766,7 +759,7 @@ export class TelegramActivityMessage {
 	constructor(jobId: string, options: TelegramActivityMessageOptions, initialText = "Thinking…") {
 		this.jobId = jobId;
 		this.options = options;
-		this.initialText = this.withPrefix(boundedActivityText(initialText));
+		this.initialText = this.withPrefix(initialText);
 		this.desired = this.initialText;
 		this.messageId = options.existingMessageId;
 	}
@@ -781,7 +774,7 @@ export class TelegramActivityMessage {
 
 	update(text: string): void {
 		if (!this.acceptingUpdates || !text) return;
-		const desired = this.withPrefix(boundedActivityText(text));
+		const desired = this.withPrefix(text);
 		if (desired === this.desired) return;
 		this.desired = desired;
 		this.ensureWorker();
@@ -800,7 +793,7 @@ export class TelegramActivityMessage {
 	async annotate(text: string): Promise<void> {
 		if (this.acceptingUpdates || !this.messageId) return;
 		try {
-			await this.options.edit(this.messageId, this.withPrefix(boundedActivityText(text)), new AbortController().signal);
+			await this.options.edit(this.messageId, this.withPrefix(text), new AbortController().signal);
 		} catch (error) {
 			this.fail("edit", error);
 		}

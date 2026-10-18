@@ -363,8 +363,35 @@ test("activity message sends once, coalesces parallel updates, rate limits edits
 	assert.deepEqual(journal, ["start:job-1:51", "clear:job-1:51"]);
 });
 
-test("Telegram activity renders only safe versioned observability entries", () => {
-	const long = "Describe the safe operation ".repeat(20).trim();
+test("activity messages preserve full audit-length text in sends, updates and annotations", async () => {
+	const initial = `Inspect ${"a".repeat(991)}.`;
+	const updated = `Inspect ${"b".repeat(991)}.`;
+	const annotated = `Inspect ${"c".repeat(991)}.`;
+	assert.equal(initial.length, 1_000);
+	const prefix = "RE: A peer request";
+	const calls: string[] = [];
+	const activity = new TelegramActivityMessage("full-intent", {
+		async send(text) { calls.push(text); return "51"; },
+		async edit(_id, text) { calls.push(text); },
+		async delete() {},
+		async onStarted() {},
+		async onCleared() {},
+		onFailure: (operation) => assert.fail(`unexpected ${operation} failure`),
+		minimumEditIntervalMs: 0,
+		prefix,
+	}, initial);
+	activity.start();
+	await waitFor(() => calls.length === 1);
+	activity.update(updated);
+	await waitFor(() => calls.length === 2);
+	await activity.halt();
+	await activity.annotate(annotated);
+	assert.deepEqual(calls, [initial, updated, annotated].map((text) => `${prefix}\n${text}`));
+	await activity.stopAndDelete();
+});
+
+test("Telegram activity renders full safe versioned observability entries up to the audit limit", () => {
+	const long = `Inspect ${"a".repeat(991)}.`;
 	const entries = [{
 		type: "custom",
 		customType: TOOL_INTENT_ENTRY_TYPE,
@@ -377,8 +404,12 @@ test("Telegram activity renders only safe versioned observability entries", () =
 		},
 	}];
 	const status = formatTelegramToolActivity(entries, "long", "read");
-	assert.equal(status.length, 160);
-	assert.equal(status.endsWith("…"), true);
+	assert.equal(status.length, 1_000);
+	assert.equal(status, long);
+	assert.equal(formatTelegramToolActivity([{
+		...entries[0],
+		data: { ...entries[0].data, intent: `${long}x` },
+	}], "long", "read"), "Using read…");
 	assert.equal(formatTelegramToolActivity(entries, "missing", "bash"), "Using bash…");
 	assert.equal(formatTelegramToolActivity(entries, "missing", "bad name; secret"), "Using tool…");
 	assert.equal(formatTelegramToolActivity([{
