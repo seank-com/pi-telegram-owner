@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import {existsSync} from "node:fs";
-import {mkdir,writeFile} from "node:fs/promises";
-import {join} from "node:path";import {pathToFileURL} from "node:url";
+import {mkdir,readFile,readdir,writeFile} from "node:fs/promises";
+import {createHash} from "node:crypto";
+import {basename,join,relative} from "node:path";import {pathToFileURL} from "node:url";
 const project=process.cwd(),host=process.env.TEST_PI_HOST!;
 for(const name of ["@earendil-works","typebox","@seank/pi-markdown-datastore","@seank/pi-observability"])assert.equal(existsSync(join(project,"node_modules",name)),false,name);
 const packageRoot=join(project,"node_modules/@seank/pi-telegram-owner");
@@ -40,18 +41,75 @@ if(process.env.TEST_COMPANIONS){
  const local=await import(pathToFileURL(join(packageRoot,"dist/datastore.js")).href),activityWire=await import(pathToFileURL(join(packageRoot,"dist/observability.js")).href),activity=await import(pathToFileURL(join(packageRoot,"dist/activity.js")).href);
  assert.equal(local.CAPABILITY_REQUEST,dsContract.MARKDOWN_DATASTORE_CAPABILITY_REQUEST);assert.equal(local.CAPABILITY_REPLY,dsContract.MARKDOWN_DATASTORE_CAPABILITY_REPLY);assert.equal(local.REQUEST_EVENT,dsContract.MARKDOWN_DATASTORE_REQUEST_EVENT);assert.equal(activityWire.TOOL_INTENT_ENTRY_TYPE,obsContract.TOOL_INTENT_ENTRY_TYPE);assert.equal(activityWire.OBSERVABILITY_CONTRACT_VERSION,obsContract.OBSERVABILITY_CONTRACT_VERSION);
  const {createMarkdownDatastoreClient}=await import(pathToFileURL(join(dsRoot,"dist/client.js")).href);
- const configDir=join(project,".pi/markdown-datastore");await mkdir(configDir,{recursive:true,mode:0o700});await mkdir(join(project,"notes"));await writeFile(join(project,"notes/alpha.md"),"# Fixture\nPrior decision\n");
- const config={schemaVersion:1,defaults:{maxResultBytes:4096,maxResultLines:100,operationTimeoutMs:3000},qmd:{enabled:true,installation:{packageRoot:join(project,"synthetic-qmd")},minimumVersion:"2.8.3"},stores:{telegram:{root:"notes",include:["**/*.md"],exclude:[],maxFileBytes:4096,search:{defaultMode:"hybrid",qmdCollection:"telegram"}}}};
- await writeFile(join(configDir,"config.json"),JSON.stringify(config),{mode:0o600});
+ const configDir=join(project,".pi/markdown-datastore");await mkdir(configDir,{recursive:true,mode:0o700});
+ const {TelegramMarkdownProjector}=await import(pathToFileURL(join(packageRoot,"dist/markdown-projector.js")).href);
+ const projector=new TelegramMarkdownProjector({enabled:true,root:project,rootId:"fixture"});
+ const evidence=join(project,"evidence");await mkdir(evidence,{mode:0o700});
+ const png=Buffer.from([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1]);
+ const photo=join(evidence,"source.png");await writeFile(photo,png);
+ await writeFile(join(evidence,"source.html"),"<html>Original export evidence</html>\n");
+ await writeFile(join(evidence,"session.jsonl"),'{"type":"session","version":3,"id":"source-session"}\n');
+ await writeFile(join(evidence,"journal.jsonl"),'{"type":"fixture-source-evidence"}\n');
+ const sha=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex");
+ await projector.publishImport([
+  {messageId:"tgmsg:v1:telegram-export-history:root-boundary:1",identityKind:"telegram-export-history",direction:"in",markdown:"Prior decision",occurredAt:"2026-02-24T10:00:00Z",confidence:"historical-html-sequence",html:{page:"source.html",globalMessageOrdinal:1,pageSha256:sha(await readFile(join(evidence,"source.html")))},attachments:[{sourcePath:photo,sha256:sha(png),mimeType:"image/png",size:png.length}]},
+  {messageId:"tgmsg:v1:telegram-export-history:root-boundary:2",identityKind:"telegram-export-history",direction:"out",markdown:"Acknowledged",occurredAt:"2026-02-24T10:01:00Z",confidence:"historical-html-sequence",html:{page:"source.html",globalMessageOrdinal:2,pageSha256:sha(await readFile(join(evidence,"source.html")))},attachments:[]},
+ ],{sourceSetId:"root-boundary",sourceSetManifestSha256:sha("source-set"),speakerMapRevision:1,boundaryManifestSha256:sha("boundary")});
+ const timeline=await projector.timeline({operation:"recent",limit:50});
+ const first=timeline.messages.find((message:any)=>message.messageId==="tgmsg:v1:telegram-export-history:root-boundary:1");
+ const second=timeline.messages.find((message:any)=>message.messageId==="tgmsg:v1:telegram-export-history:root-boundary:2");
+ assert.ok(first&&second);assert.ok(first.path.startsWith("messages/"));
+ const messageRoot=join(project,"messages"),messagePath=relative(messageRoot,join(project,first.path));
+ assert.match(messagePath,/^2026\/02\/[^/]+\.md$/);
+ const firstText=await readFile(join(project,first.path),"utf8"),secondText=await readFile(join(project,second.path),"utf8");
+ assert.ok(secondText.includes(`Previous: [[${basename(first.path,".md")}]]`));
+ const imageLink=/!\[\[([^|\]]+)\|512\]\]/.exec(firstText);assert.ok(imageLink,"canonical message retains its attachment wikilink");
+ const attachmentPath=join(messageRoot,"_attachments",imageLink[1]);
+ assert.ok(firstText.includes(`path: messages/_attachments/${imageLink[1]}`),"attachment provenance remains projection-relative");
+ assert.deepEqual(await readFile(attachmentPath),png);
+ await writeFile(join(project,"sibling.md"),"# Unrelated project note\nWorkspace-only boundary marker\n");
+ const sharedRoot=join(project,"shared-group");await mkdir(sharedRoot,{mode:0o700});await writeFile(join(sharedRoot,"room.md"),"# Shared group source\n");
+ async function snapshot(root:string,prefix=""):Promise<Record<string,string>>{
+  const result:Record<string,string>={};
+  for(const entry of await readdir(join(root,prefix),{withFileTypes:true})){
+   const path=join(prefix,entry.name);
+   if(entry.isDirectory())Object.assign(result,await snapshot(root,path));
+   else if(entry.isFile())result[path]=(await readFile(join(root,path))).toString("base64");
+  }
+  return result;
+ }
+ const sourceSnapshot=await snapshot(evidence),messageSnapshot=await snapshot(messageRoot);
+ const config={schemaVersion:1,defaults:{maxResultBytes:12288,maxResultLines:300,operationTimeoutMs:3000},qmd:{enabled:true,installation:{packageRoot:join(project,"synthetic-qmd")},minimumVersion:"2.8.3"},stores:{telegram:{root:"messages",include:["**/*.md"],exclude:[],maxFileBytes:16384,search:{defaultMode:"hybrid",qmdCollection:"telegram"}}}};
  const datastoreEntry=join(dsRoot,"dist/index.js"),obsEntry=join(obsRoot,"dist/index.js");
+ // Establish the old projection-relative citation before changing only datastore config.
+ const broad={...config,qmd:{...config.qmd,enabled:false},stores:{...config.stores,telegram:{...config.stores.telegram,root:".",include:["messages/**/*.md"]}}};
+ await writeFile(join(configDir,"config.json"),JSON.stringify(broad),{mode:0o600});
+ const beforeNarrowing=await start([wrapper,datastoreEntry],{mode:"off",store:"telegram"});
+ try{
+  const client=createMarkdownDatastoreClient((globalThis as any).fixtureApi.events,{timeoutMs:5000});
+  assert.equal((await client.find({store:"telegram",selectors:[{kind:"path",path:first.path}]})).data.candidates.length,1);
+  assert.match((await client.read({note:{store:"telegram",path:first.path}})).data.content,/Prior decision/);
+ }finally{await stop(beforeNarrowing);}
+ await writeFile(join(configDir,"config.json"),JSON.stringify(config),{mode:0o600});
  for(const mode of ["auto","required"]) for(const order of [[wrapper,datastoreEntry,obsEntry],[obsEntry,datastoreEntry,wrapper]]){
   const state=await start(order,{mode,store:"telegram"});const api=(globalThis as any).fixtureApi;const client=createMarkdownDatastoreClient(api.events,{timeoutMs:5000});
   try{
    assert.ok(state.session.getActiveToolNames().includes("telegram_recall"));
+   const startupDeadline=Date.now()+5000;let status:any;do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<startupDeadline);
+   assert.equal(status.data.stores[0].sourceReconciliation.state,"succeeded",JSON.stringify(status.data));
    const receipt=await client.refresh({action:"start",store:"telegram",mode:"semantic"});const refreshId=receipt.data.qmd.refreshId;assert.ok(refreshId);
-   const deadline=Date.now()+5000;let status:any;do{status=await client.status({store:"telegram"});if(typeof status.data.stores[0].qmd?.semanticAt==="string")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<deadline);
-   assert.ok(typeof status.data.stores[0].qmd?.semanticAt==="string");
-   const recalled=await state.session.getToolDefinition("telegram_recall").execute("recall-fixture",{query:"Prior",limit:2});assert.equal(recalled.details.returned,1);assert.match(recalled.content[0].text,/alpha.md/);
+   const deadline=Date.now()+5000;do{status=await client.status({store:"telegram"});const job=status.data.stores[0].sourceReconciliation.job;if(job?.refreshId===refreshId&&job.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<deadline);
+   assert.equal(status.data.stores[0].sourceReconciliation.job?.refreshId,refreshId);assert.equal(status.data.stores[0].sourceReconciliation.job?.state,"succeeded",JSON.stringify(status.data));
+   const recalled=await state.session.getToolDefinition("telegram_recall").execute("recall-fixture",{query:"Prior",limit:2});assert.equal(recalled.details.returned,1);
+   const hit=JSON.parse(recalled.content[0].text).data.hits[0];assert.equal(hit.path,messagePath);assert.equal(hit.note.path,messagePath);assert.equal(hit.uri,`datastore://telegram/${messagePath}`);
+   assert.equal((await client.find({store:"telegram",selectors:[{kind:"path",path:messagePath}]})).data.candidates[0].uri,hit.uri);
+   const read=await client.read({uri:hit.uri});assert.match(read.data.content,/Prior decision/);assert.ok(read.data.content.includes(imageLink[1]));
+   assert.deepEqual((await client.find({store:"telegram",selectors:[{kind:"path",path:first.path}]})).data.candidates,[],"old parent-relative references must be re-found, not relabeled");
+   await assert.rejects(client.read({note:{store:"telegram",path:"../sibling.md"}}),(error:any)=>error.code==="INVALID_NOTE_REF");
+   assert.deepEqual((await client.find({store:"telegram",selectors:[{kind:"path",path:"sibling.md"}]})).data.candidates,[]);
+   assert.equal((await client.search({store:"telegram",query:"Workspace-only boundary marker",mode:"lexical"})).data.returned,0);
+   assert.equal((await client.search({store:"telegram",query:"Shared group source",mode:"lexical"})).data.returned,0);
+   const liveTimeline=await state.session.getToolDefinition("telegram_timeline").execute("root-timeline",{operation:"recent",limit:50});assert.ok(JSON.parse(liveTimeline.content[0].text).messages.some((message:any)=>message.path===first.path));
    const integration=local.createDatastoreIntegration(api.events,()=>({mode:"auto",store:"telegram"}),1000);integration.start();assert.equal((await integration.service.refresh({action:"start",store:"telegram",mode:"lexical"})).operation,"refresh");integration.stop();
    const lexicalDeadline=Date.now()+5000;do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<lexicalDeadline);assert.equal(status.data.stores[0].sourceReconciliation.state,"succeeded");
    // Actual owner persists the intent before Telegram consumes it.
@@ -72,4 +130,6 @@ if(process.env.TEST_COMPANIONS){
  }
  const off=await start([wrapper,datastoreEntry],{mode:"off",store:"telegram"});try{assert.equal(off.session.getActiveToolNames().includes("telegram_recall"),false);await assert.rejects(off.session.getToolDefinition("telegram_recall").execute("off",{query:"Prior"}),/CAPABILITY_UNAVAILABLE/);}finally{await stop(off);}
  const absent=await start([wrapper,datastoreEntry],{mode:"auto",store:"another"});try{assert.equal(absent.session.getActiveToolNames().includes("telegram_recall"),false);await assert.rejects(absent.session.getToolDefinition("telegram_recall").execute("mismatch",{query:"Prior"}),/CAPABILITY_UNAVAILABLE/);}finally{await stop(absent);}
+ assert.deepEqual(await snapshot(evidence),sourceSnapshot,"source export, media, sessions and journal bytes stay unchanged");
+ assert.deepEqual(await snapshot(messageRoot),messageSnapshot,"message bytes, predecessor links, media and projection metadata stay in place");
 }

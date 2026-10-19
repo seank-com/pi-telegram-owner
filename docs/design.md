@@ -255,8 +255,11 @@ JSONL event log is authoritative, canonical Markdown is its projection, and
 indexes are disposable. The shared root is dedicated to the group, so notes
 sit directly under it by month (`YYYY/MM/`), photos under `_attachments/`,
 and the event log and lock under `.telegram-archive/`. The
-private archive keeps the same layout under `messages/` because its
-projection root is the agent's whole workspace.
+private archive keeps the same layout under `messages/` beneath its projection
+root. Its datastore root is that `messages/` directory itself, with root-relative
+`**/*.md` includes, not the projection parent with a `messages/**/*.md` filter.
+The projection root and the datastore boundary are distinct: narrowing the
+latter changes retrieval-relative paths, not archive placement or source bytes.
 
 Writers take an exclusive lock with the same PID and boot-identity recovery as
 the poller lock, assign the next sequence number, append, flush, and update the

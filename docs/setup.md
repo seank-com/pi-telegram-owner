@@ -32,9 +32,48 @@ Do not share another agent's journal, archive, session root or configured stores
 The group chat's shared root is the one deliberately shared location.
 
 For retrieval, configure the independent datastore extension with the exact
-selected store, pointing to this archive root and including messages/**/*.md.
-Its optional qmd collection belongs
-to the project-local datastore generation; qmd/model setup remains opt-in.
+selected store rooted at the archive's `messages/` directory, not its projection
+parent. Include paths are relative to that narrower root: use `**/*.md`, not
+`messages/**/*.md`. A filter does not narrow a datastore's root boundary.
+
+For a fresh direct-only setup with the default project-root projection, a
+complete `.pi/markdown-datastore/config.json` is:
+
+```json
+{
+  "schemaVersion": 1,
+  "defaults": {
+    "maxResultBytes": 12288,
+    "maxResultLines": 300,
+    "operationTimeoutMs": 10000
+  },
+  "qmd": {
+    "enabled": false,
+    "installation": { "executable": "qmd" },
+    "minimumVersion": "2.8.3"
+  },
+  "stores": {
+    "telegram": {
+      "root": "messages",
+      "include": ["**/*.md"],
+      "exclude": [],
+      "maxFileBytes": 1048576,
+      "search": { "defaultMode": "lexical", "qmdCollection": "telegram" }
+    }
+  }
+}
+```
+
+Create the `messages/` directory first; keep the config directory mode 0700 and
+file mode 0600. With a custom projection root, use the absolute path to its
+`messages/` directory instead. Do not change `markdownProjection.root` to the
+message directory: the projector appends `messages/` itself. The group store
+continues to use its dedicated shared archive root with `**/*.md`.
+
+The example enables direct find/read only. Recall additionally needs the
+supported qmd setup and derived indexes described by the datastore package.
+Its optional qmd collection belongs to the project-local datastore generation;
+qmd/model setup remains opt-in.
 Telegram auto mode discovers only that configured name. Off mode disables all
 integration. Required mode provides a persistent error and immediate recall
 failure if the service is missing/incompatible/unready or advertises another
@@ -44,6 +83,30 @@ required mode through the factory override rather than changing live settings.
 Observability is optional: valid persisted tool-intent records enrich activity,
 otherwise basic tool-name activity works. This package does not discover private
 credentials or install observability automatically.
+
+### Narrowing an existing private datastore root
+
+Keep message files, media, projection metadata, source sessions, and transport
+journals in place. In the existing datastore config, change only the private
+store's `root` to the projection parent's `messages/` directory and its `include`
+to `["**/*.md"]`; preserve its other settings. This is not an archive migration.
+
+Activating the changed configuration requires the separately authorized resource
+reload/restart for the affected runtime. Afterwards, use the datastore's public
+refresh operation for the affected store to regenerate lexical derived state;
+request semantic refresh when semantic/hybrid recall is used. Check public
+status/readiness and exact-path find/read before trusting recall. Do not edit
+backend databases, copy index files, or rewrite journals to make the old index
+appear current.
+
+Datastore paths and URIs now start at `messages/`: for example,
+`messages/2026/01/note.md` becomes `2026/01/note.md` in the `telegram` store.
+Re-find stored retrieval references against the narrowed store rather than
+relabeling backend records. Telegram timeline and attachment-provenance paths
+remain projection-relative, including `messages/_attachments/...`; do not prepend
+the narrowed datastore root to those provenance paths. Embedded attachment and
+predecessor wikilinks retain their names and filesystem targets because no
+source files move.
 
 ## Queue endpoint
 
