@@ -470,10 +470,10 @@ function linearPiSession(messages: PiImportMessage[]): PiImportMessage[] {
 	return ordered;
 }
 
-async function readPiSessions(root: string, rootId: string, requestedPaths: string[], admittedSessionIds: string[], correlations: Map<string, JournalCorrelation>, deadline: number, signal?: AbortSignal): Promise<{ messages: PiImportMessage[]; files: Array<{ path: string; size: number; sha256: string }> }> {
+async function readPiSessions(root: string, rootId: string, requestedPaths: string[], admittedSessionIds: string[] | undefined, correlations: Map<string, JournalCorrelation>, deadline: number, signal?: AbortSignal): Promise<{ messages: PiImportMessage[]; files: Array<{ path: string; size: number; sha256: string }>; sessionIds: string[] }> {
 	if (!/^[A-Za-z0-9._:-]{1,128}$/.test(rootId)) throw new ImportValidationError("OPTIONS_INVALID", "Pi session rootId is invalid");
 	const paths = await selectedPiSessionPaths(root, requestedPaths);
-	const admitted = new Set(admittedSessionIds);
+	const admitted = admittedSessionIds === undefined ? undefined : new Set(admittedSessionIds);
 	const sessions: Array<{ sessionId: string; firstTimestamp: number; lastTimestamp: number; messages: PiImportMessage[] }> = [];
 	const sessionIds = new Set<string>();
 	const files: Array<{ path: string; size: number; sha256: string }> = [];
@@ -492,7 +492,7 @@ async function readPiSessions(root: string, rootId: string, requestedPaths: stri
 		let header: any;
 		try { header = strictJson(lines[0]!); } catch { throw new ImportValidationError("PI_SESSION_CORRUPT"); }
 		if (header?.type !== "session" || header.version !== 3 || typeof header.id !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(header.id)) throw new ImportValidationError("PI_FORMAT_UNSUPPORTED");
-		if (!admitted.has(header.id)) continue;
+		if (admitted && !admitted.has(header.id)) continue;
 		if (sessionIds.has(header.id)) throw new ImportValidationError("PI_SESSION_DUPLICATE", "Pi session ID appears in more than one source file");
 		sessionIds.add(header.id);
 		files.push({ path, size: source.bytes.length, sha256: hash(source.bytes) });
@@ -550,10 +550,10 @@ async function readPiSessions(root: string, rootId: string, requestedPaths: stri
 		if (timestamps.some((timestamp, index) => index > 0 && timestamp < timestamps[index - 1]!)) throw new ImportValidationError("PI_SESSION_ORDER_AMBIGUOUS", "Pi message timestamps regress along the parent chain");
 		if (imported.length) sessions.push({ sessionId: header.id, firstTimestamp: timestamps[0]!, lastTimestamp: timestamps[timestamps.length - 1]!, messages: imported });
 	}
-	if (sessionIds.size !== admitted.size) throw new ImportValidationError("PI_SESSION_COVERAGE_UNSUPPORTED", "Not every admitted Pi session ID has one selected source file");
+	if (admitted && sessionIds.size !== admitted.size) throw new ImportValidationError("PI_SESSION_COVERAGE_UNSUPPORTED", "Not every admitted Pi session ID has one selected source file");
 	sessions.sort((a, b) => a.firstTimestamp - b.firstTimestamp || a.sessionId.localeCompare(b.sessionId));
 	if (sessions.some((session, index) => index > 0 && session.firstTimestamp <= sessions[index - 1]!.lastTimestamp)) throw new ImportValidationError("PI_SESSION_ORDER_AMBIGUOUS", "Pi session time ranges overlap or tie");
-	return { messages: sessions.flatMap((session) => session.messages), files };
+	return { messages: sessions.flatMap((session) => session.messages), files, sessionIds: [...sessionIds] };
 }
 
 function validateManifests(source: unknown, boundary: unknown, speaker: unknown, sourceHash: string): { source: SourceSetManifest; boundary: BoundaryManifest; speaker: SpeakerMap } {
@@ -568,8 +568,7 @@ function validateManifests(source: unknown, boundary: unknown, speaker: unknown,
 	const admittedPiSessionIds = rawBoundary.admittedPiSessionIds;
 	if (!Array.isArray(admittedPiSessionIds) || !admittedPiSessionIds.length || new Set(admittedPiSessionIds).size !== admittedPiSessionIds.length || admittedPiSessionIds.some((id) => typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(id)) || !admittedPiSessionIds.includes(rawBoundary.firstPi.sessionId)) throw new ImportValidationError("BOUNDARY_INVALID");
 	const b: BoundaryManifest = { ...rawBoundary, admittedPiSessionIds };
-	const m = speaker as SpeakerMap;
-	if (m?.schema !== "pi-telegram-owner/speaker-map/v1" || !exactKeys(m as unknown as Record<string, unknown>, ["schema", "revision", "speakers"]) || !Number.isSafeInteger(m.revision) || m.revision < 1 || !m.speakers || Object.values(m.speakers).some((value) => value !== "in" && value !== "out") || Object.keys(m.speakers).some((key) => !validHash(key))) throw new ImportValidationError("SPEAKER_MAP_INVALID");
+	const m = validatePrivateSpeakerMap(speaker);
 	return { source: s, boundary: b, speaker: m };
 }
 
@@ -612,6 +611,7 @@ export class TelegramArchiveImporter {
 		const deadline = Date.now() + (options.deadlineMs ?? 60_000);
 		options.signal?.throwIfAborted();
 		const [sourceDocument, boundaryDocument, speakerDocument] = await Promise.all([protectedJson(options.sourceSetManifestPath), protectedJson(options.boundaryManifestPath), protectedJson(options.speakerMapPath)]);
+		for (const [path, document] of [[options.sourceSetManifestPath, sourceDocument], [options.boundaryManifestPath, boundaryDocument], [options.speakerMapPath, speakerDocument]] as const) requireFilled(document.value, path);
 		const manifests = validateManifests(sourceDocument.value, boundaryDocument.value, speakerDocument.value, sourceDocument.sha256);
 		const { messages: html, attachments } = await parsePages(options.exportRoot, manifests.source, manifests.speaker, deadline, options.signal);
 		const chunkCandidates: ChunkBoundaryCandidate[] = [];
@@ -741,6 +741,152 @@ export class TelegramArchiveImporter {
 		report.publication = publication;
 		return report;
 	}
+}
+
+export const PRIVATE_IMPORT_PLACEHOLDER = "<placeholder>";
+export const PRIVATE_SOURCE_FILE = "source.json";
+export const PRIVATE_SPEAKERS_FILE = "speakers.json";
+export const PRIVATE_BOUNDARY_FILE = "first-pi-boundary.json";
+export const PRIVATE_CANDIDATES_FILE = "boundary-candidates.json";
+export const PRIVATE_CHECKPOINT_FILE = "checkpoint.json";
+
+export interface ReadableSpeakerMap {
+	schema: "pi-telegram-owner/speaker-map/v1";
+	revision: number;
+	keyEncoding: "display-name";
+	speakers: Record<string, Direction | typeof PRIVATE_IMPORT_PLACEHOLDER>;
+}
+
+function requireFilled(value: unknown, path: string, entry = "$", entries: string[] = []): void {
+	if (value === PRIVATE_IMPORT_PLACEHOLDER) entries.push(entry);
+	else if (value && typeof value === "object") for (const [key, child] of Object.entries(value)) requireFilled(child, path, `${entry}[${JSON.stringify(key)}]`, entries);
+	if (entry === "$" && entries.length) throw new ImportValidationError("MANIFEST_INCOMPLETE", `Fill in ${PRIVATE_IMPORT_PLACEHOLDER} in ${path} at ${entries.join(", ")}`);
+}
+
+function validatePrivateSpeakerMap(value: unknown, allowPlaceholders = false): SpeakerMap {
+	const map = value as ReadableSpeakerMap;
+	const readable = map?.keyEncoding === "display-name";
+	if (!map || map.schema !== "pi-telegram-owner/speaker-map/v1" || !exactKeys(map as unknown as Record<string, unknown>, readable ? ["schema", "revision", "keyEncoding", "speakers"] : ["schema", "revision", "speakers"]) || !Number.isSafeInteger(map.revision) || map.revision < 1 || !map.speakers || typeof map.speakers !== "object" || Array.isArray(map.speakers)) throw new ImportValidationError("SPEAKER_MAP_INVALID");
+	const speakers: Record<string, Direction> = Object.create(null);
+	for (const [name, direction] of Object.entries(map.speakers)) {
+		if ((readable ? !name || name !== name.trim() : !validHash(name)) || (direction !== "in" && direction !== "out" && !(allowPlaceholders && direction === PRIVATE_IMPORT_PLACEHOLDER))) throw new ImportValidationError("SPEAKER_MAP_INVALID");
+		speakers[readable ? fingerprint(name) : name] = direction as Direction;
+	}
+	return { schema: map.schema, revision: map.revision, speakers };
+}
+
+async function optionalProtectedJson(path: string): Promise<unknown | undefined> {
+	try { return (await protectedJson(path)).value; }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+}
+
+export interface PrivatePrepareOptions {
+	exportRoot: string;
+	controlDir?: string;
+	piSessionRoot: string;
+	piSessionRootId?: string;
+	piSessionPaths?: string[];
+	journalPath?: string;
+	deadlineMs?: number;
+	signal?: AbortSignal;
+}
+
+export interface PrivatePrepareReport {
+	schema: "pi-telegram-owner/private-import-prepare/v1";
+	controlDir: string;
+	pages: number;
+	messages: number;
+	senders: string[];
+	placeholders: string[];
+	candidates: number;
+	admittedPiSessionIds: string[];
+	nextStep: string;
+}
+
+/** Uses the same sibling control-directory convention as group imports. */
+export function defaultPrivateControlDir(exportRoot: string): string { return defaultGroupControlDir(exportRoot); }
+
+async function physicalDestination(path: string): Promise<string> {
+	try { return await realpath(path); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return join(await physicalDestination(dirname(path)), basename(path));
+	}
+}
+
+/** Generate reviewable controls, never an automatically confirmed first-Pi boundary. */
+export async function prepareTelegramPrivateImport(options: PrivatePrepareOptions): Promise<PrivatePrepareReport> {
+	const exportRoot = resolve(options.exportRoot);
+	const controlDir = resolve(options.controlDir ?? defaultPrivateControlDir(exportRoot));
+	const exportRelative = relative(await realpath(exportRoot), await physicalDestination(controlDir));
+	if (!exportRelative || (!exportRelative.startsWith(`..${sep}`) && exportRelative !== ".." && !isAbsolute(exportRelative))) throw new ImportValidationError("OPTIONS_INVALID", "The control directory must be outside the export root");
+	await protectedDirectory(controlDir);
+	const deadline = Date.now() + (options.deadlineMs ?? 60_000);
+	const pages: SourceSetManifest["pages"] = [];
+	const senders = new Set<string>();
+	let messageCount = 0;
+	for (const path of await exportPages(exportRoot)) {
+		options.signal?.throwIfAborted();
+		if (Date.now() > deadline) throw new ImportValidationError("TIMEOUT");
+		const file = await safeSource(exportRoot, path, MAX_PAGE_BYTES);
+		pages.push({ path, size: file.bytes.length, sha256: hash(file.bytes) });
+		const html = file.bytes.toString("utf8");
+		if (html.includes("\uFFFD")) throw new ImportValidationError("HTML_INVALID_UTF8");
+		let sender: string | undefined;
+		for (const block of descendants(parse(html, { sourceCodeLocationInfo: true }), (node) => element(node, "div", "message"))) {
+			if (classes(block).has("service")) { validateServiceBlock(block); continue; }
+			validateMessageBlock(block);
+			const node = first(block, (candidate) => element(candidate, "div", "from_name"));
+			if (node) sender = textContent(node).trim();
+			else if (!classes(block).has("joined")) sender = undefined;
+			if (!sender) throw new ImportValidationError("DIRECTION_UNKNOWN", `${path}: message ${messageCount + 1} has no sender`);
+			senders.add(sender); messageCount++;
+			if (messageCount > MAX_MESSAGES) throw new ImportValidationError("LIMIT_EXCEEDED");
+		}
+	}
+	const sourcePath = join(controlDir, PRIVATE_SOURCE_FILE);
+	const previousSource = await optionalProtectedJson(sourcePath) as SourceSetManifest | undefined;
+	if (previousSource && previousSource.schema !== "pi-telegram-owner/source-set/v1") throw new ImportValidationError("SOURCE_SET_INVALID", `${sourcePath}: expected a source-set manifest`);
+	const source: SourceSetManifest = { schema: "pi-telegram-owner/source-set/v1", sourceSetId: previousSource ? safeId(previousSource.sourceSetId, "sourceSetId") : `export-${basename(exportRoot).replace(/[^A-Za-z0-9._-]/g, "-")}`.slice(0, 128), pages, messageCount };
+	const sourceBody = `${JSON.stringify(source, null, 2)}\n`;
+	const speakerPath = join(controlDir, PRIVATE_SPEAKERS_FILE);
+	const existingSpeakers = await optionalProtectedJson(speakerPath);
+	const previousSpeakers = existingSpeakers === undefined ? undefined : validatePrivateSpeakerMap(existingSpeakers, true);
+	const speakers: ReadableSpeakerMap["speakers"] = Object.create(null);
+	// Retain readable operator entries, including ones not present in this export.
+	if ((existingSpeakers as ReadableSpeakerMap | undefined)?.keyEncoding === "display-name") Object.assign(speakers, (existingSpeakers as ReadableSpeakerMap).speakers);
+	for (const sender of senders) speakers[sender] = previousSpeakers?.speakers[fingerprint(sender)] ?? PRIVATE_IMPORT_PLACEHOLDER;
+	const speakerMap: ReadableSpeakerMap = { schema: "pi-telegram-owner/speaker-map/v1", revision: previousSpeakers?.revision ?? 1, keyEncoding: "display-name", speakers };
+	const placeholders = Object.entries(speakers).filter(([, direction]) => direction === PRIVATE_IMPORT_PLACEHOLDER).map(([name]) => name);
+	const boundaryPath = join(controlDir, PRIVATE_BOUNDARY_FILE);
+	const previousBoundary = await optionalProtectedJson(boundaryPath) as BoundaryManifest | undefined;
+	if (previousBoundary && (previousBoundary.schema !== "pi-telegram-owner/first-pi-boundary/v1" || !exactKeys(previousBoundary as unknown as Record<string, unknown>, ["schema", "sourceSetManifestSha256", "firstPi", "admittedPiSessionIds"]) || !Array.isArray(previousBoundary.admittedPiSessionIds) || !previousBoundary.admittedPiSessionIds.length || new Set(previousBoundary.admittedPiSessionIds).size !== previousBoundary.admittedPiSessionIds.length || previousBoundary.admittedPiSessionIds.some((id) => typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(id)))) throw new ImportValidationError("BOUNDARY_INVALID", `${boundaryPath}: admittedPiSessionIds must be a nonempty unique list of selected session IDs`);
+	const journal = await readJournal(options.journalPath);
+	const pi = await readPiSessions(options.piSessionRoot, options.piSessionRootId ?? "pi-sessions", options.piSessionPaths ?? [], previousBoundary?.admittedPiSessionIds, journal.correlations, deadline, options.signal);
+	const admittedPiSessionIds = previousBoundary?.admittedPiSessionIds ?? pi.sessionIds;
+	const candidates: BoundaryManifest["firstPi"][] = [];
+	if (!placeholders.length) {
+		const html = await parsePages(exportRoot, source, validatePrivateSpeakerMap(speakerMap), deadline, options.signal);
+		const semantic = new Map<string, PiImportMessage[]>();
+		const raw = new Map<string, PiImportMessage[]>();
+		for (const entry of pi.messages) {
+			const text = entry.transportStrippedMarkdown ?? entry.markdown;
+			for (const [index, key] of [[semantic, `${entry.direction}:${comparisonKey(text)}`], [raw, `${entry.direction}:${normalized(text).trim()}`]] as const) index.set(key, [...(index.get(key) ?? []), entry]);
+		}
+		for (const entry of html.messages) {
+			for (const [matchKind, matches, normalizedSha256] of [
+				["markdown-semantic", semantic.get(`${entry.direction}:${comparisonKey(entry.markdown)}`) ?? [], hash(comparisonKey(entry.markdown))],
+				["raw-source-text", raw.get(`${entry.direction}:${normalized(entry.sourceText).trim()}`) ?? [], hash(normalized(entry.sourceText).trim())],
+			] as const) for (const match of matches) candidates.push({ sessionId: match.sessionId, entryId: match.entryId, globalMessageOrdinal: entry.globalMessageOrdinal, direction: entry.direction, compatibility: TELEGRAM_FORMAT_COMPAT_VERSION, normalizedSha256, matchKind });
+		}
+	}
+	const boundary = { schema: "pi-telegram-owner/first-pi-boundary/v1", sourceSetManifestSha256: hash(sourceBody), firstPi: previousBoundary?.firstPi ?? PRIVATE_IMPORT_PLACEHOLDER, admittedPiSessionIds };
+	options.signal?.throwIfAborted();
+	await atomicWrite(sourcePath, sourceBody);
+	await writeControlFile(speakerPath, speakerMap);
+	await writeControlFile(boundaryPath, boundary);
+	await writeControlFile(join(controlDir, PRIVATE_CANDIDATES_FILE), { schema: "pi-telegram-owner/boundary-candidates/v1", sourceSetManifestSha256: hash(sourceBody), candidates });
+	return { schema: "pi-telegram-owner/private-import-prepare/v1", controlDir, pages: pages.length, messages: messageCount, senders: [...senders].sort(), placeholders, candidates: candidates.length, admittedPiSessionIds, nextStep: placeholders.length ? `Fill directions in ${speakerPath}, then run --prepare again to generate boundary candidates.` : candidates.length ? `Review admittedPiSessionIds in ${boundaryPath}; copy one complete firstPi object from ${PRIVATE_CANDIDATES_FILE}'s candidates array into firstPi, then dry-run and review counts.` : "No exact boundary candidates found. Check the selected Pi sessions, speaker directions, and export; no anchor was guessed." };
 }
 
 export const GROUP_IMPORT_PLACEHOLDER = "<placeholder>";
