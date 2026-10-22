@@ -409,7 +409,8 @@ completes the active
 task; for a peer Request the bridge publishes a correlated `completed` Reply.
 An explicit Reply through the tool can complete that recipient's active task
 earlier, even when children remain pending. Its accepted terminal disposition
-suppresses a redundant automatic final for that task. Later child results are
+suppresses a redundant automatic final only for the task whose obligation it
+completed, not a different task active in the same turn. Later child results are
 informational and cannot reopen it.
 
 A child Reply is not copied automatically to the parent's audience. The
@@ -471,13 +472,15 @@ sending new work semantics to an incompatible agent. Private transport remains
 available. Shared history is still readable without routing it through an older
 work classifier.
 
-`/new` cancels queued and waiting group/endpoint tasks through durable explicit
-transitions. Each incoming Request obligation gets a visible `cancelled` Reply;
-owner work keeps its pinned reset disposition. Outbound dependencies are marked
-locally abandoned, not falsely completed on behalf of remote recipients. This
-local abandonment does not claim to cancel remote execution. Later dependency
-results remain recorded context and do not wake or resume the reset task. A new
-explicit Request or addressed Notify is still new work, not a stale delivery.
+`/new` cancels queued and waiting tasks from the private owner chat, group and
+queue endpoint through durable explicit transitions. This includes a private
+owner assignment waiting for a peer consultation. Each incoming Request
+obligation gets a visible `cancelled` Reply; owner work keeps its pinned reset
+disposition. Outbound dependencies are marked locally abandoned, not falsely
+completed on behalf of remote recipients. This local abandonment does not claim
+to cancel remote execution. Later dependency results remain recorded context and
+do not wake or resume the reset task, including the pre-reset private assignment.
+A new explicit Request or addressed Notify is still new work, not a stale delivery.
 
 ### Election
 
@@ -536,7 +539,9 @@ correct the configuration and restart the affected agents.
   publication/admission, not completion of work requested from another agent.
   Envelopes and timeline results expose correlation metadata for replying to a
   request other than the active one. A tool Reply closes its identified
-  obligation, not every obligation on the active chain.
+  obligation, not every obligation on the active chain. Completing an older
+  request A while handling request B does not discharge B or suppress B's
+  empty-output or model-failure disposition.
 - `telegram_group_timeline`: bounded chronological reads of the shared journal,
   before or after a message.
 - `telegram_group_recall`: datastore search over the group store.
@@ -551,14 +556,18 @@ work continues.
 Every Request obligation ends with a visible terminal disposition, or remains
 explicitly waiting or delivery-uncertain. Owner and endpoint tasks keep their
 own pinned destinations. A normal empty turn is valid after an accepted tool
-Reply, while waiting for accepted child Requests, or when processing information
-with no reply obligation. None of these cases posts a model-failure notice.
-An unanswered Request with no pending dependency cannot disappear silently:
-an empty turn in that case produces a correlated `failed` Reply with a short
-static reason. Model errors, length-limit stops and aborts are failures, not
-successful answers. If a tool Reply already completed an obligation, a later
-model failure is diagnosed locally and does not send another terminal reply.
-An explicit `blocked` Reply reports a dependency problem, not a delivery retry.
+Reply completes the active task's obligation, while waiting for that task's
+accepted child Requests, or when processing information with no reply obligation.
+None of these cases posts a model-failure notice. An unanswered Request with no
+pending dependency cannot disappear silently: an empty turn in that case produces
+a correlated `failed` Reply with a short static reason. Model errors, length-limit
+stops and aborts are failures, not successful answers. If a tool Reply already
+completed an obligation, a later model failure does not send another terminal
+reply for that completed obligation; it is diagnosed locally. Any different
+active task still receives its own applicable failure disposition. In particular,
+replying to older request A while handling request B does not excuse an empty
+turn or model error on B. An explicit `blocked` Reply reports a dependency
+problem, not a delivery retry.
 
 Failures are not automatically retried as work. Existing transport retries
 remain delivery retries of the same accepted message. Diagnostic codes and
