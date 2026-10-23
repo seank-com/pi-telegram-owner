@@ -965,6 +965,17 @@ test('a logical circular result dependency is returned as blocked, not silently 
  const replies=(await shared.timeline({chatId:GROUP,limit:10})).filter(m=>m.work?.kind==='reply');assert.equal(replies.length,1);assert.equal(replies[0]!.work?.kind==='reply'&&replies[0]!.work.disposition,'blocked');
 });
 
+for(const compatible of [false,true])test(`pending peer negotiation keeps sends closed before ${compatible?'compatible':'unsupported'} response`,async(t)=>{
+ const sharedRoot=await mkdtemp(join(tmpdir(),'group-compatibility-gate-'));const entered=Promise.withResolvers<void>();const release=Promise.withResolvers<void>();
+ const agent=startAgent('a',sharedRoot,{next:50000},async()=> 'accepted',{coordinate:async(_peer,body:any)=>{entered.resolve();await release.promise;return {status:200,body:{roster:body.roster,match:true,...(compatible?{groupLifecycleVersion:1}:{})}};}});
+ const startup=agent.emit('session_start',{reason:'startup'});let attempt:Promise<void>|undefined;
+ t.after(async()=>{release.resolve();await startup;await attempt;await agent.emit('session_shutdown',{reason:'exit'});await rm(sharedRoot,{recursive:true,force:true});});
+ await entered.promise;let outcome='pending';attempt=workSend(agent,'before-negotiation',{kind:'request',recipients:['@example_agent_b_bot'],text:'Must not publish during negotiation'}).then(()=>{outcome='published';},()=>{outcome='rejected';});
+ await waitFor(()=>outcome!=='pending'||agent.api.sent.length>0);assert.equal(agent.api.sent.length,0,'no Telegram send while peer compatibility is unresolved');assert.equal(outcome,'rejected');assert.equal(agent.status().includes('group=verified'),false);
+ release.resolve();await startup;assert.equal(agent.status().includes('group=verified'),compatible);
+ if(compatible){await workSend(agent,'after-negotiation',{kind:'request',recipients:['@example_agent_b_bot'],text:'Allowed after compatibility succeeds'});assert.equal(agent.api.sent.length,1);}else await assert.rejects(workSend(agent,'unsupported-after-negotiation',{kind:'request',recipients:['@example_agent_b_bot'],text:'Still prohibited'}),/not available/);
+});
+
 test('unknown lifecycle support pauses group work while private transport remains usable',async(t)=>{
  const {agent}=await oneAgent(t,{coordinate:async(_peer,body:any)=>({status:200,body:{roster:body.roster,match:true}})});
  await waitFor(()=>agent.status().includes('group=unverified'));assert.match(agent.privateReplies.at(-1)!,/protocol/);

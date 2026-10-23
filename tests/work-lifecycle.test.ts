@@ -89,6 +89,77 @@ test("a second result arriving during continuation execution waits for another p
 	assert.doesNotMatch(prompt, /peer result 100/);
 });
 
+for (const recovery of ["restart", "retry"] as const)
+	test(`recorded private terminal delivery completes its task after ${recovery} without resending`, async () => {
+		const journal = new MemoryJournal();
+		const bridge = new TelegramOwnerBridge(journal, 7, 70, { inboundQuietWindowMs: 0 });
+		await bridge.initialize();
+		await bridge.ingestBatch([
+			{
+				update_id: 1,
+				message: { message_id: 10, text: "Return a private final", chat: { id: 70, type: "private" }, from: { id: 7 } },
+			},
+		]);
+		await start(bridge);
+		const taskId = bridge.taskId(bridge.activeJob!);
+		bridge.captureAgentEnd("Delivered terminal result");
+		const append = journal.append.bind(journal);
+		journal.append = async (record) => {
+			if (record.type === "task_state" && record.state === "completed")
+				throw new Error("Synthetic completion persistence failure");
+			await append(record);
+		};
+		let sends = 0;
+		await assert.rejects(
+			bridge.settle(async () => {
+				sends++;
+				return "701";
+			}),
+			/completion persistence/,
+		);
+		journal.append = append;
+		assert.equal(journal.records.filter((r) => r.type === "reply_sent").length, 1);
+		assert.equal(bridge.taskState(taskId)?.state, "executing");
+		const recovered = recovery === "restart" ? new TelegramOwnerBridge(journal, 7, 70) : bridge;
+		if (recovery === "restart") await recovered.initialize();
+		await recovered.retryReadyReplies(async () => {
+			sends++;
+			return "702";
+		});
+		assert.equal(sends, 1);
+		assert.equal(recovered.taskState(taskId)?.state, "completed");
+		assert.equal(recovered.taskState(taskId)?.disposition, "completed");
+		assert.equal(recovered.queueDepth, 0);
+		const transitions = journal.records.filter((r) => r.type === "task_state").length;
+		const again = new TelegramOwnerBridge(journal, 7, 70);
+		await again.initialize();
+		assert.equal(
+			journal.records.filter((r) => r.type === "task_state").length,
+			transitions,
+			"completion reconciliation is idempotent",
+		);
+	});
+
+test("a recorded progress delivery does not complete its waiting parent during recovery", async () => {
+	const { bridge, journal, item } = await fixture();
+	await start(bridge);
+	await bridge.addDependency(item.itemId, "child", [202]);
+	bridge.captureAgentEnd("Still waiting for the child");
+	let sends = 0;
+	await bridge.settle(async () => {
+		sends++;
+		return "703";
+	});
+	const recovered = new TelegramOwnerBridge(journal, 7, 70);
+	await recovered.initialize();
+	await recovered.retryReadyReplies(async () => {
+		sends++;
+		return "704";
+	});
+	assert.equal(sends, 1);
+	assert.equal(recovered.taskState(item.itemId)?.state, "waiting");
+});
+
 test("terminal delivery retry survives restart without repeating execution", async () => {
 	const { bridge, journal, item } = await fixture();
 	await start(bridge);
