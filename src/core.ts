@@ -729,6 +729,21 @@ export class TelegramOwnerBridge {
 			return [{...(original??{channel:'private' as const,authority:'owner' as const,sender:'the owner',text:privateJob!.text,reply:{kind:'private' as const,messageId:privateJob!.messageId}}),taskId:t.taskId,itemId:workItemIdForKey('group',`continue:${t.taskId}:${result.messageId}`),context:[...(original?.context??[]),'Continue the recorded waiting task. Evaluate child results before replying to its pinned audience.']}];
 		});
 	}
+	acceptedTerminalReply(job:Job):Extract<GroupWork,{kind:'reply'}>|undefined{
+		const obligation=job.item?.obligation;
+		if(!obligation)return undefined;
+		const plan=this.records.findLast(r=>r.type==='group_send_planned'&&r.work?.kind==='reply'&&r.work.requestId===obligation.requestId&&r.work.recipientBotId===obligation.recipientBotId&&this.records.some(a=>a.type==='group_send_accepted'&&a.sendId===r.sendId));
+		return plan?.type==='group_send_planned'&&plan.work?.kind==='reply'?plan.work:undefined;
+	}
+	private async retireSuppliedReply(job:Job):Promise<boolean>{
+		const reply=this.acceptedTerminalReply(job);
+		if(!reply)return false;
+		// Telegram acceptance suppresses duplicate output, not metadata recovery or completion.
+		await this.prepareOutput(job,'terminal',reply.disposition);
+		await this.setTaskState(this.taskId(job),'waiting');
+		await this.append({type:'turn_finished',jobId:job.jobId,mode:'waiting',timestamp:new Date(this.now()).toISOString()});
+		return true;
+	}
 	private async prepareOutput(job: Job, mode:'terminal'|'progress', disposition:Disposition='completed'): Promise<void> {
 		const taskId=this.taskId(job), obligation=job.item?.obligation;
 		const work:GroupWork=obligation&&mode==='terminal'?{version:1,kind:'reply',...obligation,disposition}:{version:1,kind:'notify',recipients:[]};
@@ -1128,6 +1143,7 @@ export class TelegramOwnerBridge {
 		const uncertain = recover(this.records, this.now()).uncertain;
 		for (const job of uncertain) {
 			await this.append({ type: "interrupted", jobId: job.jobId, reason });
+			if(await this.retireSuppliedReply(job))continue;
 			if (notice) {await this.prepareOutput(job,'terminal','failed');await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });}
 		}
 		return uncertain;
@@ -1331,6 +1347,10 @@ export class TelegramOwnerBridge {
 		const waiting=!completed&&pending&&(!outcome.failure||outcome.failure==='NO_REPLY');
 		const silent=completed||(job.item?.information&&!!outcome.failure)||(waiting&&!outcome.text);
 		if(outcome.failure&&outcome.failure!=='NO_REPLY') await this.append({type:'turn_failed',jobId:job.jobId,code:outcome.failure,...(outcome.detail?{detail:outcome.detail}:{}),timestamp:new Date(this.now()).toISOString()});
+		if(!completed&&await this.retireSuppliedReply(job)){
+			this.active=undefined;this.dispatchConfirmed=false;this.assistantText=undefined;
+			return true;
+		}
 		if(waiting) await this.setTaskState(taskId,'waiting');
 		if(silent){
 			await this.append({type:'turn_finished',jobId:job.jobId,mode:waiting?'waiting':'silent',timestamp:new Date(this.now()).toISOString()});
@@ -1360,7 +1380,7 @@ export class TelegramOwnerBridge {
 				(record) => record.type === "reply_ready" && record.jobId === this.active?.jobId,
 			);
 			if (!hasReadyReply) {
-				if(this.taskState(this.taskId(this.active))?.state!=='completed'){
+				if(this.taskState(this.taskId(this.active))?.state!=='completed'&&!await this.retireSuppliedReply(this.active)){
 					await this.prepareOutput(this.active,'terminal','failed');
 					await this.append({type:'reply_ready',jobId:this.active.jobId,text:'Interrupted before completion; the model turn was not replayed.',timestamp:new Date(this.now()).toISOString()});
 				}

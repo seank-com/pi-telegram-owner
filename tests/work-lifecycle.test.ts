@@ -140,6 +140,58 @@ test("completion retires a previously queued continuation and recovers its child
 	assert.doesNotMatch(prompt, /Continue the recorded waiting task/);
 });
 
+for (const mode of ["crash", "shutdown"] as const)
+	test(`accepted terminal publication survives ${mode} without a contradictory failure`, async () => {
+		const journal = new MemoryJournal();
+		let bridge = new TelegramOwnerBridge(journal, 7, 70, { groupChatId: group });
+		await bridge.initialize();
+		const { item } = await bridge.admitItem({
+			channel: "group",
+			authority: "peer",
+			sender: "A",
+			text: "Request",
+			reply: { kind: "group", chatId: group },
+			obligation: { requestId: "root", chainId: "root", requesterBotId: 201, recipientBotId: 202 },
+		});
+		await start(bridge);
+		const timestamp = new Date().toISOString();
+		await bridge.appendGroupRecord({
+			type: "group_send_planned",
+			sendId: "terminal",
+			text: "Completed",
+			work: {
+				version: 1,
+				kind: "reply",
+				requestId: "root",
+				chainId: "root",
+				requesterBotId: 201,
+				recipientBotId: 202,
+				disposition: "completed",
+			},
+			originJobId: item.itemId,
+			timestamp,
+		});
+		await bridge.appendGroupRecord({
+			type: "group_send_accepted",
+			sendId: "terminal",
+			messageIds: [700],
+			date: Math.floor(Date.now() / 1000),
+			timestamp,
+		});
+		if (mode === "shutdown") await bridge.shutdown("reload");
+		bridge = new TelegramOwnerBridge(journal, 7, 70, { groupChatId: group });
+		await bridge.initialize();
+		await bridge.interruptUncertain("crash", "Interrupted");
+		assert.equal(
+			journal.records.some((r) => r.type === "reply_ready"),
+			false,
+		);
+		assert.equal(bridge.taskState(item.itemId)?.state, "waiting");
+		assert.equal(bridge.continuations().length, 0);
+		await bridge.completeObligation("root", 202, "completed");
+		assert.equal(bridge.taskState(item.itemId)?.state, "completed");
+	});
+
 test("invalid or regressive lifecycle evidence fails closed and is not edited", () => {
 	const at = new Date().toISOString();
 	for (const records of [

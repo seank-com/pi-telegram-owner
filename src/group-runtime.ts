@@ -891,7 +891,7 @@ export class GroupRuntime {
 		const text=input.text,replyToMessageId=input.replyToMessageId;
 		const active=this.options.bridge()?.activeJob;
 		const taskId=active?this.options.bridge()!.taskId(active):undefined;
-		const originJobId=taskId&&this.options.bridge()?.taskState(taskId)?.state!=='completed'?taskId:undefined;
+		const originJobId=taskId&&active&&!this.options.bridge()?.acceptedTerminalReply(active)&&this.options.bridge()?.taskState(taskId)?.state!=='completed'?taskId:undefined;
 		const parent=originJobId?this.options.bridge()?.obligationFor(originJobId):undefined;
 		const recipients=input.kind==='reply'?[]:(input.recipients??[]).map(account=>{const peer=this.agentByAccount(account.slice(1));if(!peer)throw new Error(`Unknown recipient ${account}`);return peer.botUserId;});
 		let work:GroupWork;

@@ -601,7 +601,9 @@ though it never ran; it receives the existing interrupted-work disposition.
 A waiting task, in contrast, remains resumable when a new dependency result
 arrives. Recovery completes an accepted post's metadata and wake-ups without
 sending Telegram text again, and never closes an obligation on an uncertain
-send. Duplicate admissions, terminal records and continuation scheduling are
+send. An accepted tool Reply awaiting publication or local completion recovery
+suppresses duplicate automatic output without declaring that recovery complete.
+The task remains delivery-pending until its terminal metadata is reconciled. Duplicate admissions, terminal records and continuation scheduling are
 idempotent by identity. No recovery step edits source history, clears queues,
 reclassifies old acknowledgments as fresh Requests, or resends uncertain posts.
 
