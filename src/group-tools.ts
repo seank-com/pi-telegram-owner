@@ -43,6 +43,7 @@ export function timelineEntry(message: GroupMessage): Record<string, unknown> {
 		occurredAt: new Date(message.date * 1000).toISOString(),
 		...(message.replyToMessageId ? { replyToMessageId: message.replyToMessageId } : {}),
 		...(message.posting ? { posting: message.posting.kind } : {}),
+		...(message.work ? { work: message.work } : {}),
 		text: message.text,
 		...(message.media ? { media: message.media } : {}),
 	};
