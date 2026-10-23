@@ -5,7 +5,6 @@ import {
 } from "./observability.ts";
 
 const MAX_AUDIT_INTENT_LENGTH = 1_000;
-const MAX_TELEGRAM_INTENT_LENGTH = 160;
 const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff`$\\|;<>"']|&&|https?:\/\/|(?:^|\s)--?[A-Za-z0-9]|(?:^|\s)(?:~\/|\/(?!\s))/im;
 const SECRET_ASSIGNMENT = /\b(?:token|secret|password|passwd|credential|cookie|authorization|api[-_ ]?key)\s*(?::|=|\bis\b)\s*(\S+)/gi;
 const UNSAFE_BEARER = /\bbearer\s+(?!\[redacted\](?:\s|$))[A-Za-z0-9._~+/=-]+/i;
@@ -60,10 +59,7 @@ export function formatTelegramToolActivity(
 	toolName: string,
 ): string {
 	const persisted = findToolIntent(entries, toolCallId);
-	if (persisted) {
-		if (persisted.intent.length <= MAX_TELEGRAM_INTENT_LENGTH) return persisted.intent;
-		return `${persisted.intent.slice(0, MAX_TELEGRAM_INTENT_LENGTH - 1).trimEnd()}…`;
-	}
+	if (persisted) return persisted.intent;
 	const safeName = typeof toolName === "string" && /^[A-Za-z0-9_.:-]{1,80}$/.test(toolName) ? toolName : "tool";
 	return `Using ${safeName}…`;
 }

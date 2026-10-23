@@ -19,8 +19,15 @@ Photos are captured before dispatch; attachments and media lifecycle receipts
 preserve identity across restart. Source Markdown and binary media are never
 replaced by search output. OS ownership and permissions define authority.
 
-The archive importer validates source manifests, speaker maps, Pi boundary
-anchors and explicit admitted sessions. Dry-run binds a content-free checkpoint
+The archive importer prepares protected controls outside the export, pinning all
+pages and listing readable sender names. Operators fill directions, re-prepare,
+and confirm a generated exact semantic/raw-text boundary candidate, with no
+hand-computed hashes. Preparation preserves filled controls and reviewed session
+admission; discovery is limited to the supplied session input set. Existing
+hashed speaker controls remain supported through explicit paths. Dry-run and
+commit refuse unresolved placeholders with file/entry diagnostics, then validate
+source manifests, speaker maps, Pi boundary anchors and explicit admitted
+sessions. Dry-run binds a content-free checkpoint
 to exact inputs. Commit requires that plan, protected output and atomic idempotent
 publication. Unsupported markup, changed source, corrupt state or cancellation
 fails explicitly. Source files, session JSONL and journals are not indexed.
@@ -57,7 +64,9 @@ starting real services.
 Activity consumes only validated versioned persisted audit data. Existing safe
 activity validation remains a Telegram display responsibility; it does not copy
 observability's sanitizer/redactor. Without a valid audit entry, activity falls
-back to a bounded tool name. Raw tool arguments are never displayed. Persisted
+back to a bounded tool name. Validated intents are displayed in full up to the
+1,000-character audit limit, without a separate activity-display truncation.
+Raw tool arguments are never displayed. Persisted
 identifiers/types are checked against the owner's actual packed contract.
 
 Native CLIs/archive helpers import no Pi runtime values. The extension supplies
@@ -246,8 +255,11 @@ JSONL event log is authoritative, canonical Markdown is its projection, and
 indexes are disposable. The shared root is dedicated to the group, so notes
 sit directly under it by month (`YYYY/MM/`), photos under `_attachments/`,
 and the event log and lock under `.telegram-archive/`. The
-private archive keeps the same layout under `messages/` because its
-projection root is the agent's whole workspace.
+private archive keeps the same layout under `messages/` beneath its projection
+root. Its datastore root is that `messages/` directory itself, with root-relative
+`**/*.md` includes, not the projection parent with a `messages/**/*.md` filter.
+The projection root and the datastore boundary are distinct: narrowing the
+latter changes retrieval-relative paths, not archive placement or source bytes.
 
 Writers take an exclusive lock with the same PID and boot-identity recovery as
 the poller lock, assign the next sequence number, append, flush, and update the
