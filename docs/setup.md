@@ -201,10 +201,20 @@ same name as `groupChat.datastore.store`, rooted at the shared root:
 ```
 
 After starting the agents, `/status` in the private chat reports group
-verification. If membership does not match, the agent names the mismatch and
-sends nothing to the group until it is fixed. To check routing, mention one
+verification. All group agents must support lifecycle protocol version 1. If
+membership or protocol support does not match, the agent names the mismatch and
+sends nothing to the group until it is fixed. Private transport remains usable. To check routing, mention one
 agent in the group and confirm only that agent shows activity; then send an
-unaddressed question and confirm exactly one agent claims it.
+unaddressed question and confirm exactly one agent claims it. Ask that agent to
+consult a peer and verify its Request, the peer's correlated Reply, and the
+original task's result. A normal acknowledgment must not start another request.
+Peer tool calls require explicit semantics, for example:
+
+```json
+{"kind":"request","recipients":["@example_agent_b_bot"],"text":"Check the result."}
+{"kind":"reply","requestId":"REQUEST_ID_FROM_ENVELOPE","text":"Result checked."}
+{"kind":"notify","text":"For room context only; no acknowledgment needed."}
+```
 
 To restore group history, export the group from Telegram Desktop as HTML, then
 prepare the import:

@@ -1,3 +1,4 @@
+import { taskResultContext } from './work.ts';
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
@@ -509,7 +510,7 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 	for (const record of records) {
 		if (record.type !== "work_item" || record.reply.kind !== "private") continue;
 		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
-		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
+		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item)+taskResultContext(records,item.itemId), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
 	}
 	logical.sort((a, b) => a.order - b.order || a.jobId.localeCompare(b.jobId));
 	for (const update of logical) {

@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
+import { validWork, type GroupWork } from "./work.ts";
 
 import { PollerLock, PollerLockError, systemBootIdentity, systemPidState, type BootIdentity, type PidState } from "./runtime.ts";
 
@@ -38,7 +39,8 @@ export interface GroupMessage {
 	entities: TelegramEntity[];
 	replyToMessageId?: number;
 	/** Agent posts: a request sent with telegram_group_send, or an answer. */
-	posting?: { kind: "request" | "answer"; originItemId?: string };
+	posting?: { kind: "request" | "answer" | "notify"; originItemId?: string };
+	work?: GroupWork;
 	/** Recorded from Telegram's copy inside a reply; the sender's own record supersedes it. */
 	source?: "reply-copy";
 	media?: { kind: "photo" | "document" | "other"; fileName?: string; mimeType?: string; size?: number; attachment?: string };
@@ -75,7 +77,7 @@ export interface RecordResult {
 
 /** Identity used to decide whether two observations describe the same message. */
 function fingerprint(message: GroupMessage): string {
-	return JSON.stringify([message.chatId, message.messageId, message.senderId, message.text]);
+	return JSON.stringify([message.chatId, message.messageId, message.senderId, message.text, message.work]);
 }
 
 /** The latest recorded version of each message; an agent's own post supersedes a reply copy. */
@@ -147,6 +149,7 @@ export function renderGroupNote(message: GroupMessage): string {
 		occurredAt: new Date(message.date * 1000).toISOString(),
 		...(message.replyToMessageId ? { replyToMessageId: message.replyToMessageId } : {}),
 		...(message.posting ? { posting: message.posting.kind } : {}),
+		...(message.work ? { work: message.work } : {}),
 		...(message.media ? { media: message.media } : {}),
 	};
 	const parts = [message.text, message.media?.attachment ? `![[${message.media.attachment}|512]]` : message.media ? mediaLabel(message.media) : ""].filter(Boolean);
@@ -207,6 +210,7 @@ export class GroupJournal {
 				// Incomplete fragment from a writer whose lock was recovered.
 			}
 		}
+		for(const event of events) if(event.kind==='message'&&event.message.work&&!validWork(event.message.work)) throw new Error('Invalid group lifecycle metadata');
 		return events;
 	}
 
@@ -245,6 +249,7 @@ export class GroupJournal {
 	 * message supersedes Telegram's reply copy of it.
 	 */
 	recordMessage(message: GroupMessage, recordedBy: string): Promise<RecordResult> {
+		if(message.work&&!validWork(message.work)) return Promise.reject(new Error('Invalid group lifecycle metadata'));
 		return this.withLock(async (events, append) => {
 			const existing = latestMessages(events, message.chatId).get(key(message.chatId, message.messageId));
 			if (!existing || (existing.source === "reply-copy" && message.source !== "reply-copy")) {
