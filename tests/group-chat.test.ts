@@ -1028,3 +1028,11 @@ test('explicit terminal completion with an outstanding child keeps its late resu
  await waitFor(()=>agents.a.prompts.length===3);await agents.a.runTurn('Main report reviewed');assert.equal(agents.a.privateSends.at(-1)?.replyTo,908);
  const replies=(await shared.timeline({chatId:GROUP,limit:20})).filter(m=>m.work?.kind==='reply'&&m.work.requestId===main.details.requestId);assert.equal(replies.length,1);assert.equal(agents.b.prompts.length,2);
 });
+
+test('accepted terminal Reply with interrupted local completion does not publish a contradictory automatic failure',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);const req=await workSend(agents.a,'terminal-receipt-race',{kind:'request',recipients:['@example_agent_b_bot'],text:'Return one terminal result'});await waitFor(()=>agents.b.prompts.length===1);await agents.b.startTurn();
+ const append=agents.b.journal.append.bind(agents.b.journal);let fail=true;agents.b.journal.append=async record=>{if(fail&&record.type==='task_state'&&record.state==='completed'){fail=false;throw new Error('Synthetic local completion persistence failure');}await append(record);};
+ await workSend(agents.b,'terminal-before-local-completion',{kind:'reply',requestId:req.details.requestId,text:'Completed result'});agents.b.journal.append=append;await agents.b.finishTurn('');
+ await waitFor(()=>agents.b.journal.records.some(r=>r.type==='group_post_recorded'&&r.postId==='tool:terminal-before-local-completion'));
+ assert.equal((await shared.timeline({chatId:GROUP,limit:20})).filter(m=>m.work?.kind==='reply'&&m.work.requestId===req.details.requestId).length,1);
+});
