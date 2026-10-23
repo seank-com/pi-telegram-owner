@@ -124,8 +124,9 @@ function extensionHarness() {
 	};
 }
 
-test("an instruction is durably queued, runs as an owner-authority turn and replies privately without an anchor", async () => {
+test("an instruction is durably queued, runs as an owner-authority turn and replies privately without an anchor", async (t) => {
 	const host = extensionHarness();
+	t.after(()=>host.emit('session_shutdown',{type:'session_shutdown',reason:'exit'}));
 	await host.emit("session_start", { type: "session_start", reason: "startup" });
 	const port = host.port();
 	assert.ok(port > 0, host.status());
@@ -135,7 +136,7 @@ test("an instruction is durably queued, runs as an owner-authority turn and repl
 	assert.equal(accepted.body.duplicate, false);
 	assert.ok(host.journal.records.some((record) => record.type === "work_item" && record.itemId === accepted.body.itemId), "202 follows a durable record");
 	assert.equal(host.prompts.length, 1);
-	assert.match(host.prompts[0]!, /^\[telegram-item:[0-9a-f-]{36}\]\nChannel: queue endpoint\nFrom: nightly-calendar \(owner authority\)\nYour final reply goes to the private chat with the owner\.\n\nTell the owner/);
+	assert.match(host.prompts[0]!, /^\[telegram-item:[0-9a-f-]{36}\]\nChannel: queue endpoint\nFrom: nightly-calendar \(owner authority\)\nTask:[^\n]+\n(?:Request obligation:[^\n]+\n)?Your final reply goes to the private chat with the owner\.\n\nTell the owner/);
 
 	const repeated = await post(port, "/queue", { kind: "instruction", source: "nightly-calendar", id: "alarm-1", reply: "private", text: "again" });
 	assert.deepEqual(repeated, { status: 202, body: { itemId: accepted.body.itemId, duplicate: true } });
@@ -150,7 +151,7 @@ test("an instruction is durably queued, runs as an owner-authority turn and repl
 	await host.emit("agent_settled", { type: "agent_settled" });
 	assert.ok(host.calls.includes("reply:undefined:Set an early alarm."));
 	assert.ok(host.calls.includes("activity:undefined:Thinking (context recalculating)"));
-	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "idle", queue: { owner: 0, peer: 0 }, group: "unconfigured" });
+	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "idle", queue: { owner: 0, peer: 0 }, group: "unconfigured", tasks:[{taskId:accepted.body.itemId,state:'completed',disposition:'completed',pending:[]}] });
 	await host.emit("session_shutdown", { type: "session_shutdown", reason: "exit" });
 	await assert.rejects(fetch(`http://127.0.0.1:${port}/status`), "the endpoint stops on shutdown");
 });
@@ -163,7 +164,7 @@ test("an instruction for nobody runs silently, and group requests are refused wi
 	const quiet = await post(port, "/queue", { kind: "instruction", reply: "none", text: "Refresh your notes." });
 	assert.equal(quiet.status, 202);
 	assert.equal(host.calls.length, 0, "an item with no reply destination gets no queued notice");
-	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "busy", queue: { owner: 1, peer: 0 }, group: "unconfigured" });
+	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "busy", queue: { owner: 1, peer: 0 }, group: "unconfigured", tasks: [] });
 	assert.equal((await post(port, "/queue", { kind: "instruction", reply: "group", text: "x" })).status, 409);
 	assert.equal((await post(port, "/queue", { kind: "group-message", messageId: 4 })).status, 409);
 	assert.equal((await post(port, "/queue", { kind: "instruction", reply: "private" })).status, 400);

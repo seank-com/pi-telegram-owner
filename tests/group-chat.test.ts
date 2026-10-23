@@ -20,6 +20,7 @@ const journalOptions = { bootIdentity: () => ({ id: "synthetic-boot", startedAtM
 const AGENTS = {
 	a: { id: 201, username: "example_agent_a_bot", name: "Agent A", privateChat: 71 },
 	b: { id: 202, username: "example_agent_b_bot", name: "Agent B", privateChat: 72 },
+	c: { id: 203, username: "example_agent_c_bot", name: "Agent C", privateChat: 73 },
 } as const;
 type AgentKey = keyof typeof AGENTS;
 
@@ -135,7 +136,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 		async sendActivity(text, _signal, replyTo) { privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
 		async editActivity() {},
 		async deleteActivity() {},
-		groupChat: { config, api, journalOptions, wake, ...(extra.coordinate ? { coordinate: extra.coordinate } : {}), ...(extra.retryDelayMs ? { retryDelayMs: extra.retryDelayMs } : {}) },
+		groupChat: { config, api, journalOptions, wake, coordinate: extra.coordinate ?? (async (_peer,body:any)=>({status:200,body:{roster:body.roster,groupLifecycleVersion:1,match:true}})), ...(extra.retryDelayMs ? { retryDelayMs: extra.retryDelayMs } : {}) },
 	} })(pi);
 	const ctx = {
 		cwd: PROJECT_ROOT, isIdle: () => idle,
@@ -251,7 +252,7 @@ test("an owner mention is published once, runs on the mentioned agent only and i
 	const update = ownerGroupMessage(10, text, { entities: [mention(text, AGENTS.a.username)] });
 	await Promise.all([agents.a.batch([update]), agents.b.batch([update])]);
 	await waitFor(() => agents.a.prompts.length === 1);
-	assert.match(agents.a.prompts[0]!, /^\[telegram-item:[0-9a-f-]{36}\]\nChannel: group chat\nFrom: the owner \(owner authority\)\nYour final reply goes to the group chat, as a reply to message 10\./);
+	assert.match(agents.a.prompts[0]!, /^\[telegram-item:[0-9a-f-]{36}\]\nChannel: group chat\nFrom: the owner \(owner authority\)\nTask:[^\n]+\n(?:Request obligation:[^\n]+\n)?Your final reply goes to the group chat, as a reply to message 10\./);
 	assert.ok(agents.a.prompts[0]!.endsWith(text), "UTF-16 entity offsets resolve the mention after an emoji");
 	assert.doesNotMatch(agents.a.prompts[0]!, /You were chosen/, "only elected items get the fan-out instruction");
 	await new Promise((resolve) => setTimeout(resolve, 30));
@@ -273,10 +274,10 @@ test("a request with telegram_group_send wakes the mentioned peer, whose answer 
 	const { agents, shared } = await twoAgents(t);
 	await waitFor(() => agents.a.status().includes("group=verified") && agents.b.status().includes("group=verified"));
 	const send = agents.a.tools.get("telegram_group_send");
-	const result = await send.execute("call-1", { text: "@example_agent_b_bot what is the deploy status?" });
+	const result = await send.execute("call-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot what is the deploy status?" });
 	const requestId = result.details.messageId as number;
 	await waitFor(() => agents.b.prompts.length === 1);
-	assert.match(agents.b.prompts[0]!, /From: Agent A \(@example_agent_a_bot\) \(peer authority\)\nYour final reply goes to the group chat, as a reply to message \d+\./);
+	assert.match(agents.b.prompts[0]!, /From: Agent A \(@example_agent_a_bot\) \(peer authority\)\nTask:[^\n]+\n(?:Request obligation:[^\n]+\n)?Your final reply goes to the group chat, as a reply to message \d+\./);
 	const request = await shared.message(GROUP, requestId);
 	assert.equal(request?.posting?.kind, "request");
 
@@ -288,7 +289,7 @@ test("a request with telegram_group_send wakes the mentioned peer, whose answer 
 	assert.equal(answer.replyTo, undefined);
 	assert.match(answer.text, /^> Agent A: @example\\_agent\\_b\\_bot what is the deploy status\?\n\n@example_agent_a_bot\nDeploy finished at noon\.$/);
 	assert.equal((await shared.timeline({ chatId: GROUP, limit: 1 }))[0]!.replyToMessageId, requestId, "the journal keeps the reply link");
-	const repeated = await send.execute("call-1", { text: "@example_agent_b_bot what is the deploy status?" });
+	const repeated = await send.execute("call-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot what is the deploy status?" });
 	assert.equal(repeated.details.messageId, requestId, "a repeated tool call returns the original message");
 	assert.equal(agents.a.api.sent.filter((message) => message.text.startsWith("@example_agent_b_bot")).length, 1);
 });
@@ -302,7 +303,7 @@ test("a wake-up that fails is retried until the peer accepts it", async (t) => {
 		return response.status === 202 ? "accepted" : "rejected";
 	});
 	await waitFor(() => agents.a.status().includes("group=verified"));
-	await agents.a.tools.get("telegram_group_send").execute("call-2", { text: "@example_agent_b_bot ping" });
+	await agents.a.tools.get("telegram_group_send").execute("call-2", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot ping" });
 	await waitFor(() => agents.b.prompts.length === 1, 10_000);
 	assert.ok(attempts >= 3);
 	await waitFor(() => agents.a.journal.records.some((record) => record.type === "group_wake_done" && record.outcome === "accepted"));
@@ -343,7 +344,7 @@ test("membership mismatches pause group sends, report privately and remove stran
 	await waitFor(() => agents.a.api.calls.includes("remove:999"));
 	await waitFor(() => agents.a.status().includes("group=unverified"));
 	assert.match(agents.a.privateReplies.at(-1)!, /Group chat paused: the group has 4 members; expected 3/);
-	await assert.rejects(agents.a.tools.get("telegram_group_send").execute("call-3", { text: "hello" }), /not available/);
+	await assert.rejects(agents.a.tools.get("telegram_group_send").execute("call-3", { kind: "notify", text: "hello" }), /not available/);
 
 	agents.a.api.count = 3;
 	agents.a.api.members.delete(999);
@@ -414,7 +415,7 @@ test("a consultation started privately returns its answer to the owner's private
 	await agents.a.batch([ownerPrivate("a", 300, "Ask the other agent whether the deploy finished.")]);
 	await waitFor(() => agents.a.prompts.length === 1);
 	await agents.a.startTurn();
-	const request = await agents.a.tools.get("telegram_group_send").execute("consult-1", { text: "@example_agent_b_bot did the deploy finish?" });
+	const request = await agents.a.tools.get("telegram_group_send").execute("consult-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot did the deploy finish?" });
 	await agents.a.finishTurn("I asked Agent B and will report back.");
 	assert.deepEqual(agents.a.privateSends.at(-1), { text: "I asked Agent B and will report back.", replyTo: 300 });
 
@@ -423,8 +424,9 @@ test("a consultation started privately returns its answer to the owner's private
 	await waitFor(() => agents.a.prompts.length === 2);
 	const prompt = agents.a.prompts[1]!;
 	assert.match(prompt, /Your final reply goes to the private chat with the owner, as a reply to message 300./);
-	assert.match(prompt, new RegExp(`This answers your request ${request.details.messageId} in the group chat: @example_agent_b_bot did the deploy finish\\?`));
-	assert.match(prompt, /You sent that request while working on the owner's private message 300: Ask the other agent whether the deploy finished./);
+	assert.match(prompt, /^\[telegram-item:[^\]]+\]\nChannel: private owner chat/);
+	assert.ok(prompt.includes(`Request ${request.details.requestId}, recipient 202, completed`));
+	assert.match(prompt, /Ask the other agent whether the deploy finished\.[\s\S]*Yes, at noon\./);
 	await agents.a.runTurn("The deploy finished at noon.");
 	assert.deepEqual(agents.a.privateSends.at(-1), { text: "The deploy finished at noon.", replyTo: 300 });
 });
@@ -436,7 +438,7 @@ test("an answer to a request made for the owner's group message returns there an
 	await Promise.all([agents.a.batch([ownerGroupMessage(60, text, { entities: [mention(text, AGENTS.a.username)] })]), agents.b.batch([ownerGroupMessage(60, text, { entities: [mention(text, AGENTS.a.username)] })])]);
 	await waitFor(() => agents.a.prompts.length === 1);
 	await agents.a.startTurn();
-	await agents.a.tools.get("telegram_group_send").execute("fanout-1", { text: "@example_agent_b_bot the owner needs your status", replyToMessageId: 60 });
+	await agents.a.tools.get("telegram_group_send").execute("fanout-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot the owner needs your status", replyToMessageId: 60 });
 	await agents.a.finishTurn("Mine: reviewing the build. Asked Agent B.");
 	await waitFor(() => agents.b.prompts.length === 1);
 	assert.match(agents.b.prompts[0]!, /This replies to the owner's message 60: @example_agent_a_bot I need everyone's status/);
@@ -457,12 +459,12 @@ test("a clarifying question is a request: it wakes the asker, and answers unwind
 	await agents.a.batch([ownerGroupMessage(70, text, { entities: [mention(text, AGENTS.a.username)] })]);
 	await waitFor(() => agents.a.prompts.length === 1);
 	await agents.a.startTurn();
-	const ask = await agents.a.tools.get("telegram_group_send").execute("ask-1", { text: "@example_agent_b_bot which test was flaky for you?" });
+	const ask = await agents.a.tools.get("telegram_group_send").execute("ask-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot which test was flaky for you?" });
 	await agents.a.finishTurn("Looking into it.");
 
 	await waitFor(() => agents.b.prompts.length === 1);
 	await agents.b.startTurn();
-	const clarify = await agents.b.tools.get("telegram_group_send").execute("clarify-1", { text: "Do you mean the unit or the package tests?", replyToMessageId: ask.details.messageId });
+	const clarify = await agents.b.tools.get("telegram_group_send").execute("clarify-1", { kind: "request", recipients:["@example_agent_a_bot"], text: "Do you mean the unit or the package tests?", replyToMessageId: ask.details.messageId });
 	await agents.b.finishTurn("Waiting on your answer.");
 
 	await waitFor(() => agents.a.prompts.length === 2);
@@ -481,11 +483,11 @@ test("/new ends queued group work with a notice that wakes the requester, and cl
 	const { agents } = await twoAgents(t);
 	await verified(agents);
 	agents.b.setIdle(false);
-	const queued = await agents.a.tools.get("telegram_group_send").execute("queued-1", { text: "@example_agent_b_bot please summarize" });
+	const queued = await agents.a.tools.get("telegram_group_send").execute("queued-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot please summarize" });
 	await waitFor(() => agents.b.api.sent.some((message) => /^RE: Agent A: @example\\_agent\\_b\\_bot please summarize\nQueued:/.test(message.text) || /^RE: Agent A: @example_agent_b_bot please summarize\nQueued:/.test(message.text)));
 	assert.equal(agents.b.prompts.length, 0, "the request waits behind B's other work");
 
-	const outstanding = await agents.b.tools.get("telegram_group_send").execute("pending-1", { text: "@example_agent_a_bot can you check logs?" });
+	const outstanding = await agents.b.tools.get("telegram_group_send").execute("pending-1", { kind: "request", recipients: ["@example_agent_a_bot"], text: "@example_agent_a_bot can you check logs?" });
 	await waitFor(() => agents.a.prompts.length === 1);
 	assert.match(agents.a.prompts[0]!, /can you check logs\?$/);
 
@@ -579,7 +581,7 @@ test("agents that disagree on the roster or election step pause the group", asyn
 	const { agents, shared } = await twoAgents(t, undefined, { b: 500 });
 	await waitFor(() => agents.a.status().includes("group=unverified") || agents.b.status().includes("group=unverified"), 3_000);
 	const paused = agents.b.status().includes("group=unverified") ? agents.b : agents.a;
-	assert.match(paused.privateReplies.at(-1)!, /group configuration differs/);
+	assert.match(paused.privateReplies.at(-1)!, /group configuration or lifecycle protocol differs/);
 	assert.ok((await shared.events()).some((event) => event.kind === "roster_check" && event.result === "mismatch"));
 });
 
@@ -638,7 +640,7 @@ test("a group turn is told how many group messages it missed since its previous 
 test("a failed peer request gets a visible notice that wakes the requester", async (t) => {
 	const { agents } = await twoAgents(t);
 	await verified(agents);
-	const request = await agents.a.tools.get("telegram_group_send").execute("fail-1", { text: "@example_agent_b_bot run the migration" });
+	const request = await agents.a.tools.get("telegram_group_send").execute("fail-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot run the migration" });
 	await waitFor(() => agents.b.prompts.length === 1);
 	await agents.b.startTurn();
 	await agents.b.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "rate limited" }] });
@@ -747,7 +749,7 @@ test("a refused peer connection is reported while wake-ups keep retrying", async
 	let attempts = 0;
 	const { agent } = await oneAgent(t, { retryDelayMs: () => 10 }, async () => { attempts += 1; return "unreachable"; });
 	await waitFor(() => agent.status().includes("group=verified"));
-	await agent.tools.get("telegram_group_send").execute("unreachable-1", { text: "@example_agent_b_bot are you there?" });
+	await agent.tools.get("telegram_group_send").execute("unreachable-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot are you there?" });
 	await waitFor(() => agent.privateReplies.some((reply) => reply.startsWith("Cannot connect to @example_agent_b_bot's queue endpoint on port 7000")), 3_000);
 	await waitFor(() => attempts > 6);
 	assert.equal(agent.privateReplies.filter((reply) => reply.startsWith("Cannot connect")).length, 1, "reported once");
@@ -763,7 +765,7 @@ test("a peer that never answers holds no other group work and does not delay shu
 	}), {});
 	await agent.emit("session_start", { type: "session_start", reason: "startup" });
 	await waitFor(() => agent.status().includes("group=verified"));
-	await agent.tools.get("telegram_group_send").execute("slow-1", { text: "@example_agent_b_bot take your time" });
+	await agent.tools.get("telegram_group_send").execute("slow-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot take your time" });
 	await waitFor(() => waiting === 1);
 	const text = "@example_agent_a_bot meanwhile, this";
 	await agent.batch([ownerGroupMessage(190, text, { entities: [mention(text, AGENTS.a.username)] })]);
@@ -774,17 +776,17 @@ test("a peer that never answers holds no other group work and does not delay shu
 	assert.ok(!agent.journal.records.some((record) => record.type === "group_wake_done"), "the wake-up stays pending for the next start");
 });
 
-test("a request replying to the peer message being answered is the turn's response; its final reply is not posted", async (t) => {
+test("an explicit Reply completes its obligation and suppresses only that task's automatic final", async (t) => {
 	const { agents } = await twoAgents(t);
 	await verified(agents);
-	const request = await agents.a.tools.get("telegram_group_send").execute("ask-status", { text: "@example_agent_b_bot what is your status?" });
+	const request = await agents.a.tools.get("telegram_group_send").execute("ask-status", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot what is your status?" });
 	await waitFor(() => agents.b.prompts.length === 1);
 	await agents.b.startTurn();
-	const sent = await agents.b.tools.get("telegram_group_send").execute("answer-by-tool", { text: "Idle; nothing running.", replyToMessageId: request.details.messageId });
-	assert.equal(sent.details.respondedToCurrentMessage, true);
-	assert.match(sent.content[0].text, /your final reply will not be posted/);
+	const sent = await agents.b.tools.get("telegram_group_send").execute("answer-by-tool", { kind: "reply", requestId:request.details.requestId, text: "Idle; nothing running.", replyToMessageId: request.details.messageId });
+	assert.equal(sent.details.kind, 'reply');
+	assert.equal(sent.details.requestId, request.details.requestId);
 	await agents.b.finishTurn("Status posted to the group.");
-	await waitFor(() => agents.b.journal.records.some((record) => record.type === "reply_sent" && "messageIds" in record && record.messageIds.length === 0));
+	await waitFor(() => agents.b.journal.records.some((record) => record.type === 'turn_finished' && record.mode === 'silent'));
 	assert.equal(agents.b.api.sent.some((message) => message.text.includes("Status posted to the group.")), false, "the redundant final is not posted");
 	await waitFor(() => agents.a.prompts.length === 1);
 	assert.match(agents.a.prompts[0]!, /Idle; nothing running\.$/, "the asker is woken once, by the request");
@@ -797,23 +799,24 @@ test("an elected agent asking everyone on the owner's behalf still posts its own
 	await Promise.all([agents.a.batch([update]), agents.b.batch([update])]);
 	await waitFor(() => agents.a.prompts.length === 1);
 	await agents.a.startTurn();
-	const sent = await agents.a.tools.get("telegram_group_send").execute("fanout", { text: "@example_agent_b_bot the owner wants your status", replyToMessageId: 200 });
-	assert.equal(sent.details.respondedToCurrentMessage, false);
+	const sent = await agents.a.tools.get("telegram_group_send").execute("fanout", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot the owner wants your status", replyToMessageId: 200 });
+	assert.equal(sent.details.kind, 'request');
 	await agents.a.finishTurn("Mine: idle.");
 	await waitFor(() => agents.a.api.sent.some((message) => message.text === "Mine: idle." && message.replyTo === 200));
 });
 
-test("a turn that only asks a peer is acknowledged, not reported as failed", async (t) => {
+test("an ask-only turn waits durably without an acknowledgment or model-failure notice", async (t) => {
 	const { agents } = await twoAgents(t);
 	await verified(agents);
 	await agents.a.batch([ownerPrivate("a", 700, "Ask the other agent how many items are on her list.")]);
 	await waitFor(() => agents.a.prompts.length === 1);
 	await agents.a.startTurn();
-	await agents.a.tools.get("telegram_group_send").execute("ask-only", { text: "@example_agent_b_bot how many items are on your list?" });
+	await agents.a.tools.get("telegram_group_send").execute("ask-only", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot how many items are on your list?" });
 	await agents.a.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "toolCall", id: "ask-only", name: "telegram_group_send", arguments: {} }], stopReason: "stop" }] });
 	agents.a.setIdle(true);
 	await agents.a.emit("agent_settled", { type: "agent_settled" });
-	await waitFor(() => agents.a.privateSends.some((send) => send.text === "Asked @example_agent_b_bot in the group; the answer will follow here." && send.replyTo === 700));
+	await waitFor(() => agents.a.journal.records.some(record=>record.type==='task_state'&&record.state==='waiting'));
+	assert.equal(agents.a.privateSends.some(send=>send.text.startsWith('Asked ')),false);
 	assert.equal(agents.a.journal.records.some((record) => record.type === "turn_failed"), false);
 	assert.equal(agents.a.privateSends.some((send) => send.text.startsWith("Couldn't finish this")), false);
 });
@@ -821,7 +824,7 @@ test("a turn that only asks a peer is acknowledged, not reported as failed", asy
 test("activity for another agent's request names what it is about", async (t) => {
 	const { agents } = await twoAgents(t);
 	await verified(agents);
-	await agents.a.tools.get("telegram_group_send").execute("re-line", { text: "@example_agent_b_bot how many items are on your list?" });
+	await agents.a.tools.get("telegram_group_send").execute("re-line", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot how many items are on your list?" });
 	await waitFor(() => agents.b.prompts.length === 1);
 	await agents.b.startTurn();
 	await waitFor(() => agents.b.api.sent.some((message) => message.text.includes("Thinking")));
@@ -831,12 +834,12 @@ test("activity for another agent's request names what it is about", async (t) =>
 	await agents.b.finishTurn("Nine.");
 });
 
-test("only the first asking turn for an owner message is acknowledged", async (t) => {
+test("repeated delegations on a waiting owner task do not produce waiting acknowledgments", async (t) => {
 	const { agents } = await twoAgents(t);
 	await verified(agents);
 	const askOnly = async (callId: string, text: string, replyToMessageId?: number) => {
 		await agents.a.startTurn();
-		await agents.a.tools.get("telegram_group_send").execute(callId, { text, ...(replyToMessageId ? { replyToMessageId } : {}) });
+		await agents.a.tools.get("telegram_group_send").execute(callId, { kind:'request',recipients:['@example_agent_b_bot'],text, ...(replyToMessageId ? { replyToMessageId } : {}) });
 		await agents.a.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "stop" }] });
 		agents.a.setIdle(true);
 		await agents.a.emit("agent_settled", { type: "agent_settled" });
@@ -849,8 +852,179 @@ test("only the first asking turn for an owner message is acknowledged", async (t
 	await waitFor(() => agents.a.prompts.length === 2);
 	assert.match(agents.a.prompts[1]!, /Your final reply goes to the private chat with the owner, as a reply to message 710\./);
 	await askOnly("second-ask", "@example_agent_b_bot this was the whole test.");
-	await waitFor(() => agents.a.journal.records.filter((record) => record.type === "reply_sent").length >= 2);
+	await waitFor(() => agents.a.journal.records.filter((record) => record.type === 'turn_finished' && record.mode==='waiting').length >= 2);
 	const acknowledgements = agents.a.privateSends.filter((send) => send.text.startsWith("Asked @example_agent_b_bot"));
-	assert.equal(acknowledgements.length, 1, "the second asking turn stays quiet");
+	assert.equal(acknowledgements.length, 0, "waiting is a local disposition, not a repeated Telegram acknowledgment");
 	assert.equal(agents.a.privateSends.some((send) => send.text === "Asked again in the group."), false);
+});
+
+async function threeAgents(t:test.TestContext){
+ const sharedRoot=await mkdtemp(join(tmpdir(),'group-lifecycle-'));const ids={next:40000};const agents={} as Record<AgentKey,Agent>;
+ const keys:AgentKey[]=['a','b','c'];
+ for(const key of keys){
+  agents[key]=startAgent(key,sharedRoot,ids,async(peer,messageId)=>{const target=keys.find(k=>AGENTS[k].id===peer.botUserId)!;const response=await fetch(`http://127.0.0.1:${agents[target].port()}/queue`,{method:'POST',body:JSON.stringify({kind:'group-message',messageId})});return response.status===202?'accepted':'rejected';},{otherAgents:keys.filter(k=>k!==key).map(k=>peerConfig(k)),coordinate:async(peer,body)=>{const target=keys.find(k=>AGENTS[k].id===peer.botUserId)!;const port=agents[target]?.port();if(!port)return undefined;const response=await fetch(`http://127.0.0.1:${port}/coordinate`,{method:'POST',body:JSON.stringify(body)});return {status:response.status,body:await response.json()};}});
+  agents[key].api.members.set(203,'administrator');agents[key].api.count=4;
+ }
+ t.after(async()=>{for(const a of Object.values(agents))await a.emit('session_shutdown',{reason:'exit'});await rm(sharedRoot,{recursive:true,force:true});});
+ for(const a of Object.values(agents))await a.emit('session_start',{reason:'startup'});
+ await waitFor(()=>Object.values(agents).every(a=>a.status().includes('group=verified')));
+ return {agents,shared:new GroupJournal(sharedRoot,journalOptions)};
+}
+const workSend=(a:Agent,id:string,input:unknown)=>a.tools.get('telegram_group_send').execute(id,input);
+async function failTurn(a:Agent){await a.emit('agent_end',{messages:[{role:'assistant',content:[],stopReason:'error',errorMessage:'Synthetic model failure'}]});a.setIdle(true);await a.emit('agent_settled',{});}
+async function publications(a:Agent){await waitFor(()=>a.journal.records.filter(r=>r.type==='reply_ready').every(r=>!a.journal.records.some(i=>i.type==='work_item'&&i.itemId===r.jobId&&i.reply.kind==='group')||a.journal.records.some(i=>i.type==='group_post_recorded'&&i.postId===r.jobId)));}
+
+test('strict work kinds and explicit recipients reject ambiguous sends before publication',async(t)=>{
+ const {agents}=await twoAgents(t);await verified(agents);const before=agents.a.api.sent.length;
+ for(const input of [{text:'implicit request'},{kind:'request',text:'missing recipients'},{kind:'request',text:'unknown',recipients:['@unknown_agent_bot']},{kind:'notify',text:'cross-kind',requestId:'wrong'},{kind:'reply',text:'no obligation',requestId:'unknown'}])await assert.rejects(workSend(agents.a,JSON.stringify(input),input));
+ assert.equal(agents.a.api.sent.length,before);
+ const result=await workSend(agents.a,'room-only',{kind:'notify',text:'@example_agent_b_bot merely mentioned'});
+ assert.equal(result.details.kind,'notify');assert.equal(agents.b.prompts.length,0);
+ assert.equal(agents.a.journal.records.some(r=>r.type==='group_wake'),false);
+});
+
+test('terminal Reply, informational acknowledgment and substantive late correction terminate without request cascades',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);
+ const req=await workSend(agents.a,'initial-report',{kind:'request',text:'Report the result',recipients:['@example_agent_b_bot']});
+ await waitFor(()=>agents.b.prompts.length===1);await agents.b.runTurn('Result confirmed.');await waitFor(()=>agents.a.prompts.length===1);
+ assert.match(agents.a.prompts[0]!,/Information only/);await agents.a.runTurn('Acknowledged @example_agent_b_bot.');await publications(agents.a);
+ assert.equal(agents.b.prompts.length,1);
+ await workSend(agents.b,'late-correction',{kind:'reply',requestId:req.details.requestId,text:'Correction: the result changed.'});
+ await waitFor(()=>agents.a.prompts.length===2);assert.match(agents.a.prompts[1]!,/Information only/);await agents.a.runTurn('');
+ const messages=await shared.timeline({chatId:GROUP,limit:20});assert.deepEqual(messages.map(m=>m.work?.kind),['request','reply','notify','reply']);
+ assert.equal(agents.a.journal.records.some(r=>r.type==='turn_failed'),false);
+ assert.equal(agents.b.prompts.length,1);
+});
+
+test('two fast recipient results coalesce into one owner continuation and remain unconsumed until presented',async(t)=>{
+ const {agents,shared}=await threeAgents(t);
+ await agents.a.batch([ownerPrivate('a',900,'Ask both agents for results.')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ const request=await workSend(agents.a,'both-fast',{kind:'request',text:'Return your independent result',recipients:['@example_agent_b_bot','@example_agent_c_bot']});
+ await waitFor(()=>agents.b.prompts.length===1&&agents.c.prompts.length===1);
+ await agents.b.runTurn('B result');await agents.c.runTurn('C result');
+ await waitFor(()=>agents.a.journal.records.filter(r=>r.type==='task_result').length===2);
+ assert.equal(agents.a.prompts.length,1,'the sending turn was not interrupted');assert.equal(agents.a.journal.records.some(r=>r.type==='task_presented'),false);
+ await agents.a.finishTurn('');await waitFor(()=>agents.a.prompts.length===2);
+ const shown=agents.a.journal.records.findLast(r=>r.type==='task_presented');assert.equal(shown?.type==='task_presented'&&shown.messageIds.length,2);
+ assert.match(agents.a.prompts[1]!,/B result/);assert.match(agents.a.prompts[1]!,/C result/);await agents.a.runTurn('Both results reviewed.');
+ assert.equal(agents.a.privateSends.at(-1)?.text,'Both results reviewed.');
+ const messages=await shared.timeline({chatId:GROUP,limit:20});const replies=messages.filter(m=>m.work?.kind==='reply'&&m.work.requestId===request.details.requestId);
+ assert.deepEqual(replies.map(m=>m.work?.kind==='reply'&&m.work.recipientBotId).sort(),[202,203]);
+ assert.equal(agents.a.prompts.length,2);
+});
+
+test('one recipient cannot complete another obligation and remaining dependencies keep the parent waiting',async(t)=>{
+ const {agents}=await threeAgents(t);await agents.a.batch([ownerPrivate('a',901,'Get both results')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ const req=await workSend(agents.a,'both-slow',{kind:'request',text:'Report',recipients:['@example_agent_b_bot','@example_agent_c_bot']});await agents.a.finishTurn('');
+ await waitFor(()=>agents.b.prompts.length===1&&agents.c.prompts.length===1);await agents.b.runTurn('B done');await waitFor(()=>agents.a.prompts.length===2);await agents.a.runTurn('B is done; C is still pending.');
+ const status=await(await fetch(`http://127.0.0.1:${agents.a.port()}/status`)).json() as any;
+ assert.ok(status.tasks.some((task:any)=>task.state==='waiting'&&task.pending.some((p:any)=>p.requestId===req.details.requestId&&p.recipientBotId===203)));
+ await assert.rejects(workSend(agents.a,'wrong-recipient',{kind:'reply',requestId:req.details.requestId,text:'Cannot answer for C'}),/no recipient obligation/);
+ await agents.c.runTurn('C done');await waitFor(()=>agents.a.prompts.length===3);await agents.a.runTurn('All done');assert.equal(agents.a.privateSends.at(-1)?.text,'All done');
+});
+
+test('answering older A while handling B does not suppress B empty-output or model-failure disposition',async(t)=>{
+ for(const failure of [false,true]){
+ const {agents,shared}=await twoAgents(t);await verified(agents);
+ const older=await workSend(agents.a,`older-${failure}`,{kind:'request',recipients:['@example_agent_b_bot'],text:'Older request A'});await waitFor(()=>agents.b.prompts.length===1);await agents.b.startTurn();
+ await workSend(agents.b,`child-${failure}`,{kind:'request',recipients:['@example_agent_a_bot'],text:'Independent dependency'});await agents.b.finishTurn('');await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ const newer=await workSend(agents.a,`newer-${failure}`,{kind:'request',recipients:['@example_agent_b_bot'],text:'New request B'});await waitFor(()=>agents.b.prompts.length===2);await agents.b.startTurn();
+ await workSend(agents.b,`finish-older-${failure}`,{kind:'reply',requestId:older.details.requestId,text:'A completed'});
+ if(failure)await failTurn(agents.b);else await agents.b.finishTurn('');await publications(agents.b);
+ const replies=(await shared.timeline({chatId:GROUP,limit:30})).filter(m=>m.work?.kind==='reply');
+ assert.equal(replies.filter(m=>m.work?.kind==='reply'&&m.work.requestId===older.details.requestId&&m.work.disposition==='completed').length,1);
+ assert.equal(replies.filter(m=>m.work?.kind==='reply'&&m.work.requestId===newer.details.requestId&&m.work.disposition==='failed').length,1);
+ }
+});
+
+test('private waiting consultation abandoned by new never resumes its old task when the child replies',async(t)=>{
+ const {agents}=await twoAgents(t);await verified(agents);await agents.a.batch([ownerPrivate('a',902,'Consult the other agent')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ await workSend(agents.a,'reset-private',{kind:'request',recipients:['@example_agent_b_bot'],text:'Return later'});await agents.a.finishTurn('');await waitFor(()=>agents.b.prompts.length===1);
+ await agents.a.batch([ownerPrivate('a',903,'/new')]);await waitFor(()=>agents.a.journal.records.some(r=>r.type==='command_started'));
+ await agents.a.emit('session_shutdown',{reason:'new'});await agents.a.emit('session_start',{reason:'new'});
+ assert.ok(agents.a.journal.records.some(r=>r.type==='task_abandoned'));
+ await agents.b.runTurn('Late result after reset');await publications(agents.b);await waitFor(()=>agents.a.journal.records.some(r=>r.type==='group_context_recorded'));
+ assert.equal(agents.a.prompts.filter(prompt=>!prompt.startsWith('/telegram-status __new-session__:')).length,1);assert.ok(agents.a.privateSends.some(s=>s.replyTo===902&&s.text.includes('owner reset')));
+});
+
+test('A to B to C to A independent dependency work progresses with serialized waiting tasks',async(t)=>{
+ const {agents,shared}=await threeAgents(t);await agents.a.batch([ownerPrivate('a',904,'Coordinate the dependency chain')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ const ab=await workSend(agents.a,'chain-ab',{kind:'request',recipients:['@example_agent_b_bot'],text:'Ask C for its result'});await agents.a.finishTurn('');await waitFor(()=>agents.b.prompts.length===1);await agents.b.startTurn();
+ const bc=await workSend(agents.b,'chain-bc',{kind:'request',recipients:['@example_agent_c_bot'],text:'Get an independent fact from A'});await agents.b.finishTurn('');await waitFor(()=>agents.c.prompts.length===1);await agents.c.startTurn();
+ const ca=await workSend(agents.c,'chain-ca',{kind:'request',recipients:['@example_agent_a_bot'],text:'Return the independent fact'});await agents.c.finishTurn('');await waitFor(()=>agents.a.prompts.length===2);await agents.a.runTurn('Independent fact');
+ await waitFor(()=>agents.c.prompts.length===2);await agents.c.runTurn('C result');await waitFor(()=>agents.b.prompts.length===2);await agents.b.runTurn('B result');await waitFor(()=>agents.a.prompts.length===3);await agents.a.runTurn('Owner result');
+ assert.equal(agents.a.privateSends.at(-1)?.replyTo,904);
+ const requests=(await shared.timeline({chatId:GROUP,limit:30})).filter(m=>m.work?.kind==='request');
+ assert.ok(requests.every(m=>m.work?.kind==='request'&&m.work.chainId===ab.details.requestId));
+ assert.equal(requests.find(m=>m.work?.kind==='request'&&m.work.requestId===ca.details.requestId)?.work?.kind==='request'&&(requests.find(m=>m.work?.kind==='request'&&m.work.requestId===ca.details.requestId)!.work as any).parentRequestId,bc.details.requestId);
+});
+
+test('a logical circular result dependency is returned as blocked, not silently waited on',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);const req=await workSend(agents.a,'blocked-cycle',{kind:'request',recipients:['@example_agent_b_bot'],text:'Need the unfinished ancestor result'});await waitFor(()=>agents.b.prompts.length===1);await agents.b.startTurn();
+ await workSend(agents.b,'blocked-answer',{kind:'reply',requestId:req.details.requestId,disposition:'blocked',text:'This requires the unfinished ancestor result; coordinate that dependency.'});await agents.b.finishTurn('');await waitFor(()=>agents.a.prompts.length===1);
+ const replies=(await shared.timeline({chatId:GROUP,limit:10})).filter(m=>m.work?.kind==='reply');assert.equal(replies.length,1);assert.equal(replies[0]!.work?.kind==='reply'&&replies[0]!.work.disposition,'blocked');
+});
+
+test('unknown lifecycle support pauses group work while private transport remains usable',async(t)=>{
+ const {agent}=await oneAgent(t,{coordinate:async(_peer,body:any)=>({status:200,body:{roster:body.roster,match:true}})});
+ await waitFor(()=>agent.status().includes('group=unverified'));assert.match(agent.privateReplies.at(-1)!,/protocol/);
+ await assert.rejects(workSend(agent,'incompatible',{kind:'request',recipients:['@example_agent_b_bot'],text:'Do not send'}),/not available/);
+ await agent.batch([ownerPrivate('a',905,'/status')]);assert.ok(agent.privateReplies.some(text=>text.includes('State:')));
+});
+
+test('an accepted tool Reply followed by model failure is diagnosed locally without a second terminal publication',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);const req=await workSend(agents.a,'reply-before-failure',{kind:'request',recipients:['@example_agent_b_bot'],text:'Return a result'});await waitFor(()=>agents.b.prompts.length===1);await agents.b.startTurn();
+ await workSend(agents.b,'accepted-terminal',{kind:'reply',requestId:req.details.requestId,text:'Completed already'});await failTurn(agents.b);await publications(agents.b);
+ assert.equal((await shared.timeline({chatId:GROUP,limit:10})).filter(m=>m.work?.kind==='reply').length,1);assert.ok(agents.b.journal.records.some(r=>r.type==='turn_failed'&&r.code==='MODEL_ERROR'));
+});
+
+test('concurrent duplicate child deliveries record one result and one pending continuation',async(t)=>{
+ let agents:Record<AgentKey,Agent>;const setup=await twoAgents(t,async(to,messageId)=>{if(to==='a')return 'retry';const response=await fetch(`http://127.0.0.1:${agents[to].port()}/queue`,{method:'POST',body:JSON.stringify({kind:'group-message',messageId})});return response.status===202?'accepted':'rejected';});agents=setup.agents;await verified(agents);
+ await agents.a.batch([ownerPrivate('a',906,'Consult B')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();await workSend(agents.a,'duplicate-child',{kind:'request',recipients:['@example_agent_b_bot'],text:'Return once'});await agents.a.finishTurn('');await waitFor(()=>agents.b.prompts.length===1);await agents.b.runTurn('One result');await publications(agents.b);
+ const message=(await setup.shared.timeline({chatId:GROUP,limit:10})).find(m=>m.work?.kind==='reply')!;
+ const responses=await Promise.all(Array.from({length:8},()=>fetch(`http://127.0.0.1:${agents.a.port()}/queue`,{method:'POST',body:JSON.stringify({kind:'group-message',messageId:message.messageId})})));assert.ok(responses.every(r=>r.status===202));await waitFor(()=>agents.a.prompts.length===2);
+ assert.equal(agents.a.journal.records.filter(r=>r.type==='task_result').length,1);assert.equal(agents.a.journal.records.filter(r=>r.type==='work_item'&&r.taskId).length,1);
+});
+
+test('accepted publication recovers across restart without sending Telegram text again',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);const append=agents.a.journal.append.bind(agents.a.journal);let fail=true;
+ agents.a.journal.append=async record=>{if(fail&&record.type==='group_post_recorded'){fail=false;throw new Error('Synthetic publication receipt failure');}await append(record);};
+ const first=await workSend(agents.a,'recover-accepted',{kind:'request',recipients:['@example_agent_b_bot'],text:'Accepted once'});agents.a.journal.append=append;
+ await agents.a.emit('session_shutdown',{reason:'reload'});await agents.a.emit('session_start',{reason:'reload'});await verified(agents);await waitFor(()=>agents.b.prompts.length===1);
+ const repeated=await workSend(agents.a,'recover-accepted',{kind:'request',recipients:['@example_agent_b_bot'],text:'Accepted once'});assert.equal(repeated.details.requestId,first.details.requestId);
+ assert.equal(agents.a.api.sent.filter(m=>m.text.includes('Accepted once')).length,1);assert.equal((await shared.timeline({chatId:GROUP,limit:10})).filter(m=>m.work?.kind==='request').length,1);
+ await assert.rejects(workSend(agents.a,'recover-accepted',{kind:'notify',text:'Conflicting retry'}),/conflicts/);
+});
+
+test('an uncertain group send never resends or fabricates accepted work metadata',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);const append=agents.a.journal.append.bind(agents.a.journal);
+ agents.a.journal.append=async record=>{if(record.type==='group_send_accepted')throw new Error('Synthetic acceptance persistence failure');await append(record);};
+ const input={kind:'request',recipients:['@example_agent_b_bot'],text:'Uncertain request'};await assert.rejects(workSend(agents.a,'uncertain',input));agents.a.journal.append=append;
+ await assert.rejects(workSend(agents.a,'uncertain',input),/uncertain/);assert.equal(agents.a.api.sent.filter(m=>m.text.includes('Uncertain request')).length,1);assert.equal((await shared.timeline({chatId:GROUP,limit:10})).length,0);assert.equal(agents.b.prompts.length,0);
+});
+
+test('legacy origin pointers remain history and never synthesize waiting private tasks',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);
+ await shared.recordMessage({chatId:GROUP,messageId:60000,date:1790000000,senderKind:'agent',senderId:201,sender:'Agent A',senderAccount:AGENTS.a.username,entities:[],text:'@example_agent_b_bot historical request',posting:{kind:'request',originItemId:'00000000-0000-4000-8000-000000000001'}},AGENTS.a.username);
+ await shared.recordMessage({chatId:GROUP,messageId:60001,date:1790000001,senderKind:'agent',senderId:202,sender:'Agent B',senderAccount:AGENTS.b.username,entities:[],text:'Historical answer',replyToMessageId:60000,posting:{kind:'answer'}},AGENTS.b.username);
+ const response=await fetch(`http://127.0.0.1:${agents.a.port()}/queue`,{method:'POST',body:JSON.stringify({kind:'group-message',messageId:60001})});assert.equal(response.status,202,await response.text());await waitFor(()=>agents.a.prompts.length===1);
+ assert.match(agents.a.prompts[0]!,/Information only/);assert.doesNotMatch(agents.a.prompts[0]!,/Channel: private/);assert.equal(agents.a.journal.records.some(r=>r.type==='task_state'&&r.state==='waiting'),false);
+});
+
+test('report, review, correction and acceptance finish a private task without acknowledgment work',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);await agents.a.batch([ownerPrivate('a',907,'Review and accept the corrected report')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ const report=await workSend(agents.a,'review-report',{kind:'request',recipients:['@example_agent_b_bot'],text:'Submit the report'});await agents.a.finishTurn('');await waitFor(()=>agents.b.prompts.length===1);await agents.b.runTurn('Initial report');await waitFor(()=>agents.a.prompts.length===2);await agents.a.startTurn();
+ const correction=await workSend(agents.a,'review-correction',{kind:'request',recipients:['@example_agent_b_bot'],text:'Correct the stated total'});assert.equal(correction.details.chainId,report.details.chainId);assert.notEqual(correction.details.requestId,report.details.requestId);await agents.a.finishTurn('');await waitFor(()=>agents.b.prompts.length===2);await agents.b.runTurn('Corrected report');await waitFor(()=>agents.a.prompts.length===3);await agents.a.startTurn();
+ await workSend(agents.a,'review-accepted',{kind:'notify',text:'Correction accepted. @example_agent_b_bot'});await agents.a.finishTurn('Reviewed and accepted.');assert.equal(agents.a.privateSends.at(-1)?.replyTo,907);
+ assert.deepEqual((await shared.timeline({chatId:GROUP,limit:20})).map(m=>m.work?.kind),['request','reply','request','reply','notify']);assert.equal(agents.b.prompts.length,2);
+});
+
+test('explicit terminal completion with an outstanding child keeps its late result informational',async(t)=>{
+ const {agents,shared}=await twoAgents(t);await verified(agents);await agents.a.batch([ownerPrivate('a',908,'Ask B to report')]);await waitFor(()=>agents.a.prompts.length===1);await agents.a.startTurn();
+ const main=await workSend(agents.a,'outstanding-main',{kind:'request',recipients:['@example_agent_b_bot'],text:'Report independently'});await agents.a.finishTurn('');await waitFor(()=>agents.b.prompts.length===1);await agents.b.startTurn();
+ await workSend(agents.b,'outstanding-child',{kind:'request',recipients:['@example_agent_a_bot'],text:'Check a supplementary fact'});await waitFor(()=>agents.a.prompts.length===2);
+ await workSend(agents.b,'complete-before-child',{kind:'reply',requestId:main.details.requestId,text:'Main report is complete without that fact'});await agents.b.finishTurn('');await waitFor(()=>agents.a.journal.records.some(r=>r.type==='task_result'));
+ await agents.a.runTurn('Supplementary fact');await waitFor(()=>agents.b.prompts.length===2);assert.match(agents.b.prompts[1]!,/Information only/);assert.doesNotMatch(agents.b.prompts[1]!,/Continue the recorded waiting task/);await agents.b.runTurn('');
+ await waitFor(()=>agents.a.prompts.length===3);await agents.a.runTurn('Main report reviewed');assert.equal(agents.a.privateSends.at(-1)?.replyTo,908);
+ const replies=(await shared.timeline({chatId:GROUP,limit:20})).filter(m=>m.work?.kind==='reply'&&m.work.requestId===main.details.requestId);assert.equal(replies.length,1);assert.equal(agents.b.prompts.length,2);
 });

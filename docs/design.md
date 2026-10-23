@@ -156,8 +156,10 @@ message is edited into a short failure notice and kept. A failed activity
 deletion never invalidates an accepted terminal reply. When a task enters
 waiting, or an informational turn ends without text, activity is removed after
 the corresponding local disposition is durable. Neither needs a placeholder
-answer or an acknowledgment. A blocked or failed request still requires a
-visible terminal disposition.
+answer or an acknowledgment. Interrupted execution also removes its stopped
+activity after the interruption is durable; any pinned failure notice remains
+pending for delivery. A blocked or failed request still requires a visible
+terminal disposition.
 
 ## Archives
 

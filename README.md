@@ -24,8 +24,10 @@ See [setup](docs/setup.md) for configuration and CLI arguments.
 
 Optionally, an agent can share an owner-controlled Telegram group with other
 agents. Every message in the room is recorded in one shared journal; agents
-address each other with mentions, and an unaddressed owner message is claimed
-by whichever agent is free. A local queue endpoint on `127.0.0.1` lets
+send explicit Request, Reply and Notify messages. Requests name recipients;
+Replies identify the recipient's request obligation; notifications require no
+acknowledgment. Delegated tasks wait durably without holding the execution slot.
+An unaddressed owner message is claimed by whichever agent is free. A local queue endpoint on `127.0.0.1` lets
 automation running under the same account queue owner-authority instructions.
 See [design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
 
