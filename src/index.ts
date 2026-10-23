@@ -28,6 +28,7 @@ import {
 	type TelegramUpdate,
 } from "./core.ts";
 import { parseQueueRequest, postToPeer, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
+import { GroupSendParameters } from './work.ts';
 import { GroupJournal, type GroupJournalOptions } from "./group-journal.ts";
 import { GroupRuntime, type GroupRuntimeOptions, type GroupTelegramApi } from "./group-runtime.ts";
 import { GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, registerGroupRecallTool, registerGroupTimelineTool } from "./group-tools.ts";
@@ -479,6 +480,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				`Telegram: ${connection.phase}, queue ${queued ? `${queued.owner} owner, ${queued.peer} peer` : "0"}${active}`,
 				...(group ? [`Group: ${group.state === "unverified" ? `paused, ${group.reason}` : group.state}${lastGroupError ? ` (last error: ${lastGroupError})` : ""}`] : []),
 				...(runtimeDependencies?.queuePort !== undefined ? [`Queue endpoint: ${endpoint ? `${QUEUE_ENDPOINT_HOST}:${endpoint.port}` : `unavailable${lastEndpointError ? `, ${lastEndpointError}` : ""}`}`] : []),
+				...(bridge?.taskStatus.filter(t=>t.state!=='completed').map(t=>`Task ${t.taskId}: ${t.state}, pending ${t.pending.map(p=>`${p.requestId}/${p.recipientBotId}`).join(', ')||'none'}`)??[]),
 				...(failure ? [`Last failed turn: ${failure.code} at ${failure.timestamp}${failure.detail ? ` (${failure.detail})` : ""}`] : []),
 			].join("\n");
 		};
@@ -581,7 +583,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					await bridge.completeCommand(job, `Started a new session.\nSession: ${ctx.sessionManager.getSessionId()}\n${contextText(ctx)}`);
 					// Queued group and endpoint work ends visibly; a requesting agent is woken by the notice.
 					await bridge.interruptQueuedItems("Owner started a new session", `Not handled: the owner reset ${agentLabel}'s session.`);
-					await bridge.appendGroupRecord({ type: "group_requests_closed", timestamp: new Date().toISOString() });
+					await bridge.appendGroupRecord({ type: "group_requests_closed", requestIds:bridge.journalRecords.flatMap(r=>r.type==='group_send_planned'&&r.work?.kind==='request'?[r.work.requestId]:[]), timestamp: new Date().toISOString() });
 				} else {
 					await bridge.interruptCommand(
 						job,
@@ -638,6 +640,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					state: isBusy() ? "busy" : "idle",
 					queue: bridge?.queueDepthByTier ?? { owner: 0, peer: 0 },
 					group: groupRuntime ? groupRuntime.state.state : "unconfigured",
+					tasks: bridge?.taskStatus ?? [],
 				},
 			}),
 		});
@@ -807,30 +810,20 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.registerTool({
 			name: GROUP_SEND_TOOL,
 			label: "Send to group chat",
-			description: "Ask another agent a question in the group chat shared with the owner and the other agents. Mention the agent as @username. Its answer comes back to you as a new turn carrying the work that led you to ask. To answer the message you are working on, do not use this tool: just write your reply, which is posted automatically. Only the supplied text is sent.",
-			promptSnippet: "Ask another agent a question in the shared group chat",
+			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text and public work metadata are sent.",
+			promptSnippet: "Send an explicit request, correlated reply or informational notification",
 			promptGuidelines: [
-				"Use telegram_group_send only to ask another agent something, mentioning it as @username, then end your turn; the answer wakes you. To answer the message you are working on, write your reply normally; it is posted automatically.",
-				"A telegram_group_send that replies to the message you are working on, such as a clarifying question, is your response to that message: your final reply to it is not posted.",
+				"Use kind request and explicit recipients to delegate work. End normally without text to wait; accepted child results resume only a recorded waiting task. Normal final text while dependencies remain is progress, not completion.",
+				"Use kind reply with requestId for an explicit terminal result, including failed, blocked or cancelled. Only that recipient obligation is completed. A normal final also completes a request when no dependencies or unconsumed results remain.",
+				"Use kind notify for information; omit recipients for room context without wake-ups. Processing information or an accepted Reply requires no acknowledgment. Completed tasks never reopen merely because a late result arrives.",
+				"Outstanding requests are not execution locks. Handle independent dependency work serially; if an answer logically requires its own unfinished ancestor result, return a blocked Reply explaining that dependency.",
 			],
-			parameters: {
-				type: "object",
-				properties: {
-					text: { type: "string", minLength: 1, description: "The request, including @username mentions of the agents it is for." },
-					replyToMessageId: { type: "integer", minimum: 1, description: "A group message ID to reply to, such as the owner's request being passed on." },
-				},
-				required: ["text"],
-				additionalProperties: false,
-			} as any,
+			parameters: GroupSendParameters as any,
 			executionMode: "sequential",
 			execute: async (toolCallId, params) => {
-				const input = params as { text: string; replyToMessageId?: number };
 				if (!groupRuntime) throw new Error("CAPABILITY_UNAVAILABLE: the group chat is not configured.");
-				const messageId = await groupRuntime.sendRequest(`tool:${toolCallId}`, input.text, input.replyToMessageId, bridge?.activeJob?.jobId);
-				if (bridge && await bridge.recordRespondedByRequest(input.replyToMessageId, messageId)) {
-					return { content: [{ type: "text" as const, text: `Posted group message ${messageId} as a question replying to message ${input.replyToMessageId}, the message you are working on. That question is your response to it: your final reply will not be posted, and the answer will come back to you as a new turn. End your turn now.` }], details: { messageId, respondedToCurrentMessage: true } };
-				}
-				return { content: [{ type: "text" as const, text: `Posted group message ${messageId}. The answer will come back to you as a new turn.` }], details: { messageId, respondedToCurrentMessage: false } };
+				const result=await groupRuntime.sendWork(`tool:${toolCallId}`,params);
+				return {content:[{type:'text' as const,text:`Published ${result.kind} as group message ${result.messageId}. Publication is not completion of requested work.`}],details:result};
 			},
 		});
 		pi.on("resources_discover", () => { updateRecall(); updateStatus(); });
