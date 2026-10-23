@@ -302,10 +302,12 @@ export class GroupRuntime {
 			const expected = 2 + config.otherAgents.length;
 			if (count !== expected) return this.setMembership({ state: "unverified", reason: `the group has ${count} members; expected ${expected}` });
 			if (this.rosterMismatched) return;
-			const wasVerified = this.verified;
+			// Membership alone cannot authorize sends while peer protocol checks are pending.
+			if (!this.verified) {
+				await this.exchangeRoster();
+				if (this.rosterMismatched || config.otherAgents.some(peer => !this.compatiblePeers.has(peer.telegramAccount.toLowerCase()))) return;
+			}
 			this.setMembership({ state: "verified" });
-			// Ranks only agree if every agent has the same configuration.
-			if (!wasVerified) await this.exchangeRoster();
 		} catch (error) {
 			this.setMembership({ state: "unverified", reason: `membership check failed (${error instanceof Error ? error.message : String(error)})` });
 			this.scheduleRetry();

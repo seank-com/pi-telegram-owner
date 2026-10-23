@@ -754,6 +754,16 @@ export class TelegramOwnerBridge {
 		if(output?.mode==='terminal') {await this.setTaskState(output.taskId,'completed',output.disposition);await this.reconcileCompletedResults(output.taskId);}
 	}
 
+	/** Delivery can commit before completion; reconcile that boundary without transport calls. */
+	private async reconcileDeliveredTasks(): Promise<void> {
+		const sent = new Set(this.records.filter(record => record.type === "reply_sent").map(record => record.jobId));
+		for (const record of this.records) {
+			if (record.type !== "task_output" || record.mode !== "terminal" || !sent.has(record.jobId)) continue;
+			await this.setTaskState(record.taskId, "completed", record.disposition);
+			await this.reconcileCompletedResults(record.taskId);
+		}
+	}
+
 	appendGroupRecord(record: GroupProgressRecord): Promise<void> {
 		return this.append(record);
 	}
@@ -762,6 +772,7 @@ export class TelegramOwnerBridge {
 		this.records = await this.journal.load();
 		validateMediaLifecycle(this.records);
 		recover(this.records,this.now());
+		await this.reconcileDeliveredTasks();
 		for(const task of this.taskStatus)await this.reconcileCompletedResults(task.taskId);
 		return recover(this.records,this.now());
 	}
@@ -1252,6 +1263,7 @@ export class TelegramOwnerBridge {
 	}
 
 	async retryReadyReplies(send: SendReply, route?: ItemReplyRoute): Promise<number> {
+		await this.reconcileDeliveredTasks();
 		const retries = recover(this.records, this.now()).repliesToRetry;
 		let delivered = 0;
 		let firstError: unknown;

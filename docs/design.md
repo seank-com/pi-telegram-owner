@@ -487,7 +487,8 @@ A late answer can still arrive as information. Ambiguous or conflicting lifecycl
 evidence is retained and diagnosed instead of guessed into new work.
 
 Agents exchange group lifecycle protocol version 1 with their roster check.
-Missing or incompatible support pauses group work with a diagnostic rather than
+Group sends remain disabled until compatibility is established, including while
+peer negotiation is pending. Missing or incompatible support pauses group work with a diagnostic rather than
 sending new work semantics to an incompatible agent. Private transport remains
 available. Shared history is still readable without routing it through an older
 work classifier.
@@ -596,8 +597,10 @@ output never creates a requirement to acknowledge a diagnostic.
 
 Startup recovery reconciles received, queued, claimed, executing, waiting,
 completed, send-planned, accepted and uncertain states from the forward-only
-journals. An executing model turn interrupted by restart is not replayed as
-though it never ran; it receives the existing interrupted-work disposition.
+journals. Startup and delivery maintenance reconcile recorded terminal delivery
+receipts into local task completion without sending again; a progress receipt
+does not complete its waiting parent. An executing model turn interrupted by
+restart is not replayed as though it never ran; it receives the existing interrupted-work disposition.
 A waiting task, in contrast, remains resumable when a new dependency result
 arrives. Recovery completes an accepted post's metadata and wake-ups without
 sending Telegram text again, and never closes an obligation on an uncertain
