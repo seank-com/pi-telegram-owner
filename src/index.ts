@@ -810,7 +810,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.registerTool({
 			name: GROUP_SEND_TOOL,
 			label: "Send to group chat",
-			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text and public work metadata are sent.",
+			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients, automatically prepend any missing recipient @mentions to the body, and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text, recipient mentions and public work metadata are sent.",
 			promptSnippet: "Send an explicit request, correlated reply or informational notification",
 			promptGuidelines: [
 				"Use kind request and explicit recipients to delegate work. End normally without text to wait; accepted child results resume only a recorded waiting task. Normal final text while dependencies remain is progress, not completion.",

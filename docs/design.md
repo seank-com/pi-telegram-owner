@@ -378,7 +378,13 @@ An obligation is identified by `(requestId, recipientBotId)`; one recipient's
 Reply cannot close another's obligation. Group identity scopes all references.
 The tool resolves explicit recipient accounts to configured bot IDs before
 sending; unknown recipients and attempts to answer another agent's obligation
-fail before publication.
+fail before publication. New Request bodies prepend any missing recipient
+@mentions, preserving existing case-insensitive mentions and the supplied text.
+Both the send plan and published group text include those mentions. Routing
+still uses the explicit recipient metadata: additional names mentioned in prose
+are not recipients. Replies and notifications do not gain automatic mentions.
+Recovery of an already accepted historical send never republishes it just to
+add a mention.
 
 A Reply identifies its request and has one of four terminal dispositions:
 `completed`, `failed`, `blocked`, or `cancelled`. The text supplies the result or
