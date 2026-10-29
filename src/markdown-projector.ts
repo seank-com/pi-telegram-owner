@@ -482,6 +482,15 @@ async function persistedEntries(session: ReadonlySessionManager, sessionRoot: st
 	return { path: rel.split(sep).join("/"), entries };
 }
 
+// Pre-lifecycle work items used the same envelope without the Task header.
+// Accept only that exact historical shape, never arbitrary prompt/body changes.
+function legacyWorkItemPrompt(item: WorkItem): string | undefined {
+	if (item.channel === 'private' || item.taskId !== undefined || item.obligation !== undefined || item.information !== undefined) return undefined;
+	const lines = renderWorkItemPrompt(item).split('\n');
+	lines.splice(2, 1);
+	return lines.join('\n');
+}
+
 async function buildCandidates(records: readonly JournalRecord[], mediaEvents: readonly TelegramMediaEvent[], session: ReadonlySessionManager, sessionRoot: string): Promise<{ candidates: Candidate[]; deferred: Array<{ jobId: string; direction: "in" | "out"; code: string }> }> {
 	validateMediaLifecycle(records);
 	const sessionId = session.getSessionId();
@@ -499,7 +508,7 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 	for (const plan of photoPlans) validateArchivedAttachment(plan.attachment);
 	// Journal position orders private jobs (as Telegram update order does) and work items together.
 	const position = new Map<JournalRecord, number>(records.map((record, index) => [record, index]));
-	const logical: Array<{ jobId: string; text: string; command?: string; timestamp: string; telegramDate?: number; updateId: number | null; messageId?: number; batch?: Extract<JournalRecord, { type: "inbound_batch" }>; item?: WorkItem; order: number }> = updates.filter((update) => update.command || !batchMembers.has(update.jobId!)).map((update) => ({ jobId: update.jobId!, text: update.text!, command: update.command, timestamp: update.timestamp, telegramDate: update.telegramDate, updateId: update.updateId, messageId: update.messageId, order: position.get(update)! }));
+	const logical: Array<{ jobId: string; text: string; legacyText?: string; command?: string; timestamp: string; telegramDate?: number; updateId: number | null; messageId?: number; batch?: Extract<JournalRecord, { type: "inbound_batch" }>; item?: WorkItem; order: number }> = updates.filter((update) => update.command || !batchMembers.has(update.jobId!)).map((update) => ({ jobId: update.jobId!, text: update.text!, command: update.command, timestamp: update.timestamp, telegramDate: update.telegramDate, updateId: update.updateId, messageId: update.messageId, order: position.get(update)! }));
 	for (const batch of latestBatches.values()) {
 		const members = batch.memberJobIds.map((jobId) => updates.find((update) => update.jobId === jobId));
 		if (members.some((member) => !member)) throw new ArchiveCorruptionError("Inbound batch member update is missing");
@@ -510,7 +519,8 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 	for (const record of records) {
 		if (record.type !== "work_item" || record.reply.kind !== "private") continue;
 		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
-		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item)+taskResultContext(records,item.itemId), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
+		const resultContext = taskResultContext(records, item.itemId);
+		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item)+resultContext, legacyText: resultContext ? undefined : legacyWorkItemPrompt(item), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
 	}
 	logical.sort((a, b) => a.order - b.order || a.jobId.localeCompare(b.jobId));
 	for (const update of logical) {
@@ -534,7 +544,10 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 		}
 		const marker = update.item ? `${WORK_ITEM_MARKER_PREFIX}${jobId}]\n` : update.batch ? `[telegram-batch:${jobId}]\n` : `[telegram-job:${jobId}]\n`;
 		const markerUsers = branch.map((entry, index) => ({ entry, index })).filter(({ entry }) => messageText(entry)?.startsWith(marker));
-		const userMatches = markerUsers.filter(({ entry }) => messageText(entry)!.slice(marker.length) === update.text);
+		const userMatches = markerUsers.filter(({ entry }) => {
+			const persistedText = messageText(entry)!.slice(marker.length);
+			return persistedText === update.text || (update.legacyText !== undefined && persistedText === update.legacyText);
+		});
 		if (userMatches.length !== 1) {
 			if (markerUsers.length === 1 && userMatches.length === 0) throw new ArchiveCorruptionError("Canonical Pi user content changed under a stable job marker");
 			const code = userMatches.length ? "PI_USER_ENTRY_AMBIGUOUS" : "PI_USER_ENTRY_MISSING";
