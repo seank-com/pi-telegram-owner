@@ -257,8 +257,8 @@ export type JournalRecord =
 	| { type: "projection_needed"; jobId: string; direction: "in" | "out"; reason: "content" | "metadata"; canonical: { kind: "pi"; sessionId: string; entryId: string } | { kind: "local-response" }; timestamp: string }
 	| { type: "projection_committed"; jobId: string; direction: "in" | "out"; messageId: string; contentRevision: number; contentSha256: string; metadataRevision: number; metadataSha256: string; timestamp: string }
 	| { type: "projection_deferred"; jobId: string; direction: "in" | "out"; code: string; timestamp: string }
-	| { type: "activity_started"; jobId: string; messageId: string }
-	| { type: "activity_cleared"; jobId: string; messageId: string }
+	| { type: "activity_started"; jobId: string; messageId: string; destination?: "private" | "group" }
+	| { type: "activity_cleared"; jobId: string; messageId: string; destination?: "private" | "group" }
 	| { type: "interrupted"; jobId: string; reason: string };
 
 export interface Job {
@@ -526,6 +526,19 @@ function validateBatch(record: Extract<JournalRecord, { type: "inbound_batch" }>
 	if (cursor !== record.text.length) throw new StateCorruptionError("Inbound batch boundaries are invalid");
 }
 
+function activityDestination(records: readonly JournalRecord[], record: { jobId: string; destination?: 'private' | 'group' }): 'private' | 'group' {
+	if (record.destination !== undefined) {
+		if (record.destination !== 'private' && record.destination !== 'group') throw new StateCorruptionError('Activity destination is invalid');
+		return record.destination;
+	}
+	// Before private-only activity, transient messages followed the reply target.
+	const item=records.find(r=>r.type==='work_item'&&r.itemId===record.jobId);
+	return item?.type==='work_item'&&item.reply.kind==='group'?'group':'private';
+}
+function activityKey(records: readonly JournalRecord[], record: { jobId: string; messageId: string; destination?: 'private' | 'group' }): string {
+	return `${record.jobId}:${activityDestination(records,record)}:${record.messageId}`;
+}
+
 export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 	validateTaskRecords(records);
 	const updates: Job[] = [];
@@ -583,8 +596,8 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 		else if (record.type === "command_started") commandsStarted.add(record.jobId);
 		else if (record.type === "reply_ready") ready.set(record.jobId, record.text);
 		else if (record.type === "reply_sent") sent.add(record.jobId);
-		else if (record.type === "activity_started") activities.set(`${record.jobId}:${record.messageId}`, record);
-		else if (record.type === "activity_cleared") activities.delete(`${record.jobId}:${record.messageId}`);
+		else if (record.type === "activity_started") activities.set(activityKey(records,record), record);
+		else if (record.type === "activity_cleared") activities.delete(activityKey(records,record));
 		else if (record.type === "interrupted") interrupted.add(record.jobId);
 	}
 	const memberJobIds = new Set([...batches.values()].flatMap((batch) => batch.memberJobIds));
@@ -1065,19 +1078,19 @@ export class TelegramOwnerBridge {
 		return job;
 	}
 
-	async recordActivityStarted(jobId: string, messageId: string): Promise<void> {
-		await this.append({ type: "activity_started", jobId, messageId });
+	async recordActivityStarted(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
+		await this.append({ type: "activity_started", jobId, messageId, ...(destination?{destination}:{}) });
 	}
 
-	async recordActivityCleared(jobId: string, messageId: string): Promise<void> {
-		await this.append({ type: "activity_cleared", jobId, messageId });
+	async recordActivityCleared(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
+		await this.append({ type: "activity_cleared", jobId, messageId, ...(destination?{destination}:{}) });
 	}
 
-	private openActivities(): Array<{ jobId: string; messageId: string }> {
-		const open = new Map<string, { jobId: string; messageId: string }>();
+	private openActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
+		const open = new Map<string, { jobId: string; messageId: string; destination: 'private' | 'group' }>();
 		for (const record of this.records) {
-			if (record.type === "activity_started") open.set(`${record.jobId}:${record.messageId}`, { jobId: record.jobId, messageId: record.messageId });
-			else if (record.type === "activity_cleared") open.delete(`${record.jobId}:${record.messageId}`);
+			if (record.type === "activity_started") open.set(activityKey(this.records,record), { jobId: record.jobId, messageId: record.messageId, destination: activityDestination(this.records,record) });
+			else if (record.type === "activity_cleared") open.delete(activityKey(this.records,record));
 		}
 		return [...open.values()];
 	}
@@ -1126,12 +1139,12 @@ export class TelegramOwnerBridge {
 	}
 
 	/** The open activity or queued-notice message for a job, if any. */
-	openActivity(jobId: string): string | undefined {
-		return this.openActivities().find((activity) => activity.jobId === jobId)?.messageId;
+	openActivity(jobId: string, destination?: 'private' | 'group'): string | undefined {
+		return this.openActivities().find((activity) => activity.jobId === jobId && (destination === undefined || activity.destination === destination))?.messageId;
 	}
 
 	/** Open activities whose job no longer needs them: its reply was sent, or it ended without one. */
-	finishedActivities(): Array<{ jobId: string; messageId: string }> {
+	finishedActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
 		const sent = new Set<string>();
 		const interrupted = new Set<string>();
 		for (const record of this.records) {
