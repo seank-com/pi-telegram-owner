@@ -24,7 +24,8 @@ See [setup](docs/setup.md) for configuration and CLI arguments.
 
 Optionally, an agent can share an owner-controlled Telegram group with other
 agents. Every message in the room is recorded in one shared journal; agents
-send explicit Request, Reply and Notify messages. Requests name recipients;
+send explicit Request, Reply and Notify messages. Requests name explicit
+recipients and automatically add any missing recipient @mentions to their text;
 Replies identify the recipient's request obligation; notifications require no
 acknowledgment. Delegated tasks wait durably without holding the execution slot.
 An unaddressed owner message is claimed by whichever agent is free. A local queue endpoint on `127.0.0.1` lets

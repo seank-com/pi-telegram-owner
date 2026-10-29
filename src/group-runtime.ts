@@ -890,7 +890,9 @@ export class GroupRuntime {
 	/** Posts explicit work. Accepted receipt recovery never repeats a send. */
 	async sendWork(sendId:string,value:unknown):Promise<{kind:GroupSendInput['kind'];messageId:number;requestId?:string;chainId?:string;disposition?:string}>{
 		const input=parseGroupSend(value);
-		const text=input.text,replyToMessageId=input.replyToMessageId;
+		const present=new Set(mentionedAccounts(input.text));
+		const missing=input.kind==='request'?(input.recipients??[]).filter(account=>!present.has(account.slice(1).toLowerCase())):[];
+		const text=missing.length?`${missing.join(' ')}\n\n${input.text}`:input.text,replyToMessageId=input.replyToMessageId;
 		const active=this.options.bridge()?.activeJob;
 		const taskId=active?this.options.bridge()!.taskId(active):undefined;
 		const originJobId=taskId&&active&&!this.options.bridge()?.acceptedTerminalReply(active)&&this.options.bridge()?.taskState(taskId)?.state!=='completed'?taskId:undefined;
@@ -911,7 +913,9 @@ export class GroupRuntime {
 		const accepted = bridge.journalRecords.find((record): record is Extract<GroupProgressRecord, { type: "group_send_accepted" }> => record.type === "group_send_accepted" && record.sendId === sendId);
 		if (accepted) {
 			const plan=bridge.journalRecords.find((r)=>r.type==='group_send_planned'&&r.sendId===sendId);
-			if(plan?.type!=='group_send_planned'||plan.text!==text||plan.replyToMessageId!==replyToMessageId||(plan.work&&plan.work.kind!==work.kind))throw new Error('Send identity conflicts with its accepted plan');
+			// Accepted historical sends may predate automatic mention insertion. Never
+			// republish or rewrite them merely to add the new display prefix.
+			if(plan?.type!=='group_send_planned'||(plan.text!==text&&plan.text!==input.text)||plan.replyToMessageId!==replyToMessageId||(plan.work&&plan.work.kind!==work.kind))throw new Error('Send identity conflicts with its accepted plan');
 			if(plan.work){
 				if(plan.work.kind==='reply'&&work.kind==='reply'&&(plan.work.requestId!==work.requestId||plan.work.disposition!==work.disposition))throw new Error('Send identity conflicts with its accepted Reply');
 				if(plan.work.kind!=='reply'&&work.kind!=='reply'&&JSON.stringify([...plan.work.recipients].sort())!==JSON.stringify([...work.recipients].sort()))throw new Error('Send identity conflicts with its accepted recipients');

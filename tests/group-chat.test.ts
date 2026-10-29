@@ -874,6 +874,39 @@ const workSend=(a:Agent,id:string,input:unknown)=>a.tools.get('telegram_group_se
 async function failTurn(a:Agent){await a.emit('agent_end',{messages:[{role:'assistant',content:[],stopReason:'error',errorMessage:'Synthetic model failure'}]});a.setIdle(true);await a.emit('agent_settled',{});}
 async function publications(a:Agent){await waitFor(()=>a.journal.records.filter(r=>r.type==='reply_ready').every(r=>!a.journal.records.some(i=>i.type==='work_item'&&i.itemId===r.jobId&&i.reply.kind==='group')||a.journal.records.some(i=>i.type==='group_post_recorded'&&i.postId===r.jobId)));}
 
+test('Requests insert missing recipient mentions in published and journaled text without duplicate inference or sends',async t=>{
+ const {agents,shared}=await threeAgents(t);
+ const input={kind:'request',recipients:['@example_agent_b_bot','@example_agent_c_bot'],text:'Return one marker each.'};
+ const first=await workSend(agents.a,'mention-both',input);
+ const expected='@example_agent_b_bot @example_agent_c_bot\n\nReturn one marker each.';
+ const plan=agents.a.journal.records.find(r=>r.type==='group_send_planned'&&r.work?.kind==='request'&&r.work.requestId===first.details.requestId);assert.equal(plan?.type==='group_send_planned'&&plan.text,expected);
+ const messages=await shared.timeline({chatId:GROUP,limit:10});assert.equal(messages[0]?.text,expected);assert.deepEqual(messages[0]?.work?.kind==='request'&&messages[0].work.recipients,[202,203]);
+ const sent=agents.a.api.sent.length;
+ const again=await workSend(agents.a,'mention-both',input);assert.equal(again.details.requestId,first.details.requestId);assert.equal(agents.a.api.sent.length,sent);
+ await assert.rejects(workSend(agents.a,'mention-both',{...input,text:'Changed assignment.'}),/conflicts/);
+});
+
+test('Requests preserve existing case-insensitive mentions and do not turn unrelated mentions into recipients',async t=>{
+ const {agents,shared}=await threeAgents(t);
+ await workSend(agents.a,'mention-part',{kind:'request',recipients:['@example_agent_b_bot','@example_agent_c_bot'],text:'@EXAMPLE_AGENT_B_BOT return a marker.'});
+ await workSend(agents.a,'mention-complete',{kind:'request',recipients:['@example_agent_b_bot'],text:'Ask @example_agent_b_bot; @example_agent_c_bot is context only.'});
+ const messages=await shared.timeline({chatId:GROUP,limit:10});
+ assert.equal(messages[0]?.text,'@example_agent_c_bot\n\n@EXAMPLE_AGENT_B_BOT return a marker.');
+ assert.equal(messages[1]?.text,'Ask @example_agent_b_bot; @example_agent_c_bot is context only.');
+ assert.deepEqual(messages[1]?.work?.kind==='request'&&messages[1].work.recipients,[202]);
+});
+
+test('accepted Requests predating mention insertion recover without rewriting or reposting',async t=>{
+ const {agents}=await twoAgents(t);await verified(agents);
+ const input={kind:'request',recipients:['@example_agent_b_bot'],text:'Historical accepted request.'};
+ const first=await workSend(agents.a,'mention-old',input);
+ const plan=agents.a.journal.records.find(r=>r.type==='group_send_planned'&&r.work?.kind==='request'&&r.work.requestId===first.details.requestId);assert.equal(plan?.type,'group_send_planned');
+ // Model the persisted pre-upgrade send plan, which lacked the new prefix.
+ if(plan?.type==='group_send_planned')plan.text=input.text;
+ const sent=agents.a.api.sent.length;const again=await workSend(agents.a,'mention-old',input);
+ assert.equal(again.details.requestId,first.details.requestId);assert.equal(agents.a.api.sent.length,sent);assert.equal(plan?.type==='group_send_planned'&&plan.text,input.text);
+});
+
 test('strict work kinds and explicit recipients reject ambiguous sends before publication',async(t)=>{
  const {agents}=await twoAgents(t);await verified(agents);const before=agents.a.api.sent.length;
  for(const input of [{text:'implicit request'},{kind:'request',text:'missing recipients'},{kind:'request',text:'unknown',recipients:['@unknown_agent_bot']},{kind:'notify',text:'cross-kind',requestId:'wrong'},{kind:'reply',text:'no obligation',requestId:'unknown'}])await assert.rejects(workSend(agents.a,JSON.stringify(input),input));
