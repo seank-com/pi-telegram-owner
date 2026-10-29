@@ -485,10 +485,20 @@ async function persistedEntries(session: ReadonlySessionManager, sessionRoot: st
 // Pre-lifecycle work items used the same envelope without the Task header.
 // Accept only that exact historical shape, never arbitrary prompt/body changes.
 function legacyWorkItemPrompt(item: WorkItem): string | undefined {
-	if (item.channel === 'private' || item.taskId !== undefined || item.obligation !== undefined || item.information !== undefined) return undefined;
-	const lines = renderWorkItemPrompt(item).split('\n');
-	lines.splice(2, 1);
-	return lines.join('\n');
+	if (item.channel === 'private' || item.reply.kind !== 'private' || item.taskId !== undefined || item.obligation !== undefined || item.information !== undefined) return undefined;
+	// Reconstruct the historical logical fields. Sender/context values can
+	// contain newlines, so a physical line number cannot identify a field.
+	const destination = item.reply.messageId
+		? `the private chat with the owner, as a reply to message ${item.reply.messageId}`
+		: 'the private chat with the owner';
+	const lines = [
+		`Channel: ${item.channel === 'group' ? 'group chat' : 'queue endpoint'}`,
+		`From: ${item.sender} (${item.authority} authority)`,
+		`Your final reply goes to ${destination}.`,
+		...(item.channel === 'group' ? ['The owner and every configured agent can read the group chat.'] : []),
+		...(item.context ?? []),
+	];
+	return `${lines.join('\n')}\n\n${item.text}`;
 }
 
 async function buildCandidates(records: readonly JournalRecord[], mediaEvents: readonly TelegramMediaEvent[], session: ReadonlySessionManager, sessionRoot: string): Promise<{ candidates: Candidate[]; deferred: Array<{ jobId: string; direction: "in" | "out"; code: string }> }> {

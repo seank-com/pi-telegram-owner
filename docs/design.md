@@ -201,8 +201,9 @@ projector treats them as turn boundaries, never as private-chat turns.
 
 Projection validates persisted Pi text against its journal identity. Historical
 work items without lifecycle metadata may use the exact pre-lifecycle envelope
-without a Task header; task bodies and the rest of the envelope still match
-exactly. This compatibility does not rewrite canonical session entries or relax
+without a Task header. The historical envelope is reconstructed from logical
+fields, preserving multiline sender/context values; task bodies and the rest of
+the envelope still match exactly. This compatibility does not rewrite canonical session entries or relax
 validation for arbitrary changed content.
 
 Normal session-start and delivery-maintenance reconciliation can recover a
