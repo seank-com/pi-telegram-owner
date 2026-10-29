@@ -193,6 +193,20 @@ They are not Telegram messages, so neither archive holds them. Turns started by
 group or queue endpoint items carry their own session marker, and the private
 projector treats them as turn boundaries, never as private-chat turns.
 
+Projection validates persisted Pi text against its journal identity. Historical
+work items without lifecycle metadata may use the exact pre-lifecycle envelope
+without a Task header; task bodies and the rest of the envelope still match
+exactly. This compatibility does not rewrite canonical session entries or relax
+validation for arbitrary changed content.
+
+Normal session-start and delivery-maintenance reconciliation can recover a
+projection backlog from the supplied persisted session and transport journal.
+Replaying reconciliation preserves existing notes and source history, appends
+projection receipts, and is idempotent. Index refresh follows newly projected
+notes; rebuilding an index cannot replace missing projection. Preserve source
+sessions, journals and archive manifests during repair: do not delete records,
+edit old prompts, reset the conversation, or clear queues to bypass an error.
+
 ## Group chat
 
 The group is an owner-controlled Telegram supergroup whose members are exactly
