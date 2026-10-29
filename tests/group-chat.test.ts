@@ -10,6 +10,7 @@ import { MemoryJournal, type TelegramUpdate, type TelegramMessage } from "../src
 import { GroupJournal } from "../src/group-journal.ts";
 import type { GroupTelegramApi, WakeResult } from "../src/group-runtime.ts";
 import { createTelegramOwnerExtension } from "../src/index.ts";
+import { TOOL_INTENT_ENTRY_TYPE } from '../src/observability.ts';
 import { ConfigurationError, loadTelegramOwnerConfig, TelegramReplyAnchorError, type GroupAgentConfig, type GroupChatConfig } from "../src/runtime.ts";
 
 const OWNER = 7;
@@ -91,6 +92,8 @@ interface Agent {
 	promptImages: Array<Array<{ data: string; mimeType: string }>>;
 	privateReplies: string[];
 	privateSends: Array<{ text: string; replyTo?: number }>;
+	privateActivityCalls: string[];
+	sessionEntries: any[];
 	tools: Map<string, any>;
 	startTurn(): Promise<string>;
 	finishTurn(answer: string): Promise<void>;
@@ -111,6 +114,8 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 	const promptImages: Array<Array<{ data: string; mimeType: string }>> = [];
 	const privateReplies: string[] = [];
 	const privateSends: Array<{ text: string; replyTo?: number }> = [];
+	const privateActivityCalls: string[] = [];
+	const sessionEntries: any[] = [];
 	const tools = new Map<string, any>();
 	let status = "";
 	let idle = true;
@@ -134,13 +139,13 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 		source: { async start(handler) { onBatch = handler; return async () => {}; } },
 		async sendReply(text, replyTo) { privateReplies.push(text); privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
 		async sendActivity(text, _signal, replyTo) { privateSends.push({ text, ...(replyTo ? { replyTo } : {}) }); return String(ids.next++); },
-		async editActivity() {},
-		async deleteActivity() {},
+		async editActivity(id,text) { privateActivityCalls.push(`edit:${id}:${text}`); },
+		async deleteActivity(id) { privateActivityCalls.push(`delete:${id}`); },
 		groupChat: { config, api, journalOptions, wake, coordinate: extra.coordinate ?? (async (_peer,body:any)=>({status:200,body:{roster:body.roster,groupLifecycleVersion:1,match:true}})), ...(extra.retryDelayMs ? { retryDelayMs: extra.retryDelayMs } : {}) },
 	} })(pi);
 	const ctx = {
 		cwd: PROJECT_ROOT, isIdle: () => idle,
-		sessionManager: { getSessionId: () => `session-${key}`, getBranch: () => [] },
+		sessionManager: { getSessionId: () => `session-${key}`, getBranch: () => sessionEntries },
 		ui: { setStatus: (_key: string, value?: string) => { status = value ?? ""; }, notify() {} },
 	} as unknown as ExtensionContext;
 	const emit = async (name: string, event: object) => {
@@ -159,7 +164,7 @@ function startAgent(key: AgentKey, sharedRoot: string, ids: { next: number }, wa
 		await emit("agent_settled", { type: "agent_settled" });
 	};
 	return {
-		key, journal, api, prompts, promptImages, privateReplies, privateSends, tools, emit, startTurn, finishTurn,
+		key, journal, api, prompts, promptImages, privateReplies, privateSends, privateActivityCalls, sessionEntries, tools, emit, startTurn, finishTurn,
 		status: () => status,
 		port: () => Number(/endpoint=127\.0\.0\.1:(\d+)/.exec(status)?.[1]),
 		batch: (updates) => onBatch!(updates),
@@ -484,7 +489,7 @@ test("/new ends queued group work with a notice that wakes the requester, and cl
 	await verified(agents);
 	agents.b.setIdle(false);
 	const queued = await agents.a.tools.get("telegram_group_send").execute("queued-1", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot please summarize" });
-	await waitFor(() => agents.b.api.sent.some((message) => /^RE: Agent A: @example\\_agent\\_b\\_bot please summarize\nQueued:/.test(message.text) || /^RE: Agent A: @example_agent_b_bot please summarize\nQueued:/.test(message.text)));
+	await waitFor(() => agents.b.privateSends.some((message) => /^RE: Agent A: @example\\_agent\\_b\\_bot please summarize\nQueued:/.test(message.text) || /^RE: Agent A: @example_agent_b_bot please summarize\nQueued:/.test(message.text)));
 	assert.equal(agents.b.prompts.length, 0, "the request waits behind B's other work");
 
 	const outstanding = await agents.b.tools.get("telegram_group_send").execute("pending-1", { kind: "request", recipients: ["@example_agent_a_bot"], text: "@example_agent_a_bot can you check logs?" });
@@ -827,11 +832,36 @@ test("activity for another agent's request names what it is about", async (t) =>
 	await agents.a.tools.get("telegram_group_send").execute("re-line", { kind: "request", recipients: ["@example_agent_b_bot"], text: "@example_agent_b_bot how many items are on your list?" });
 	await waitFor(() => agents.b.prompts.length === 1);
 	await agents.b.startTurn();
-	await waitFor(() => agents.b.api.sent.some((message) => message.text.includes("Thinking")));
-	const thinking = agents.b.api.sent.find((message) => message.text.includes("Thinking"))!;
+	await waitFor(() => agents.b.privateSends.some((message) => message.text.includes("Thinking")));
+	const thinking = agents.b.privateSends.find((message) => message.text.includes("Thinking"))!;
 	assert.equal(thinking.replyTo, undefined);
 	assert.match(thinking.text, /^RE: Agent A: @example_agent_b_bot how many items are on your list\?\nThinking/);
-	await agents.b.finishTurn("Nine.");
+	assert.equal(agents.b.api.sent.some(message=>/Thinking|Queued:/.test(message.text)),false);
+	const activity=agents.b.journal.records.findLast(r=>r.type==='activity_started');assert.ok(activity?.type==='activity_started');
+	assert.equal(activity.destination,'private');
+	agents.b.sessionEntries.push({type:'custom',customType:TOOL_INTENT_ENTRY_TYPE,data:{version:1,toolCallId:'group-activity-call',toolName:'bash',intent:'Inspect the synthetic fixture.',timestamp:'2026-10-29T00:00:00.000Z'}});
+	await agents.b.emit('tool_execution_start',{type:'tool_execution_start',toolCallId:'group-activity-call',toolName:'bash',args:{command:'synthetic-not-for-status'}});
+	await waitFor(()=>agents.b.privateActivityCalls.some(c=>c.includes('Inspect the synthetic fixture.')));
+	assert.equal(agents.b.api.calls.some(c=>c.includes('Inspect the synthetic fixture.')),false);
+	assert.equal(agents.b.privateActivityCalls.some(c=>c.includes('synthetic-not-for-status')),false);
+	await agents.b.finishTurn("Nine.");await publications(agents.b);
+	assert.ok(agents.b.api.sent.some(message=>message.text.endsWith('Nine.')));
+	assert.equal(agents.b.privateReplies.includes('Nine.'),false);
+	await waitFor(()=>agents.b.privateActivityCalls.includes(`delete:${activity.messageId}`));
+	assert.equal(agents.b.api.calls.includes(`delete:${activity.messageId}`),false);
+	const cleared=agents.b.journal.records.filter(r=>r.type==='activity_cleared'&&r.jobId===activity.jobId&&r.messageId===activity.messageId);
+	assert.deepEqual(cleared.map(r=>r.type==='activity_cleared'&&r.destination),['private']);
+});
+
+test('startup cleans historical group activity and new private activity in their own chats',async t=>{
+ const {agents}=await twoAgents(t);await verified(agents);const agent=agents.b,jobId='11111111-2222-4333-8444-555555555555';
+ await agent.emit('session_shutdown',{reason:'exit'});
+ for(const record of [{type:'work_item',schemaVersion:1,itemId:jobId,channel:'group',authority:'owner',sender:'fixture',text:'Completed group work.',reply:{kind:'group',chatId:GROUP,messageId:5},timestamp:'2026-10-29T00:00:00.000Z'},{type:'activity_started',jobId,messageId:'42'},{type:'activity_started',jobId,messageId:'42',destination:'private'},{type:'reply_sent',jobId,messageIds:['43'],timestamp:'2026-10-29T00:00:01.000Z'}])await agent.journal.append(record as any);
+ await agent.emit('session_start',{reason:'startup'});
+ await waitFor(()=>agent.privateActivityCalls.includes('delete:42')&&agent.api.calls.includes('delete:42'));
+ assert.equal(agent.privateActivityCalls.filter(c=>c==='delete:42').length,1);assert.equal(agent.api.calls.filter(c=>c==='delete:42').length,1);
+ const cleared=agent.journal.records.filter(r=>r.type==='activity_cleared'&&r.jobId===jobId);
+ assert.deepEqual(cleared.map(r=>r.type==='activity_cleared'&&r.destination).sort(),['group','private']);
 });
 
 test("repeated delegations on a waiting owner task do not produce waiting acknowledgments", async (t) => {
@@ -873,6 +903,39 @@ async function threeAgents(t:test.TestContext){
 const workSend=(a:Agent,id:string,input:unknown)=>a.tools.get('telegram_group_send').execute(id,input);
 async function failTurn(a:Agent){await a.emit('agent_end',{messages:[{role:'assistant',content:[],stopReason:'error',errorMessage:'Synthetic model failure'}]});a.setIdle(true);await a.emit('agent_settled',{});}
 async function publications(a:Agent){await waitFor(()=>a.journal.records.filter(r=>r.type==='reply_ready').every(r=>!a.journal.records.some(i=>i.type==='work_item'&&i.itemId===r.jobId&&i.reply.kind==='group')||a.journal.records.some(i=>i.type==='group_post_recorded'&&i.postId===r.jobId)));}
+
+test('Requests insert missing recipient mentions in published and journaled text without duplicate inference or sends',async t=>{
+ const {agents,shared}=await threeAgents(t);
+ const input={kind:'request',recipients:['@example_agent_b_bot','@example_agent_c_bot'],text:'Return one marker each.'};
+ const first=await workSend(agents.a,'mention-both',input);
+ const expected='@example_agent_b_bot @example_agent_c_bot\n\nReturn one marker each.';
+ const plan=agents.a.journal.records.find(r=>r.type==='group_send_planned'&&r.work?.kind==='request'&&r.work.requestId===first.details.requestId);assert.equal(plan?.type==='group_send_planned'&&plan.text,expected);
+ const messages=await shared.timeline({chatId:GROUP,limit:10});assert.equal(messages[0]?.text,expected);assert.deepEqual(messages[0]?.work?.kind==='request'&&messages[0].work.recipients,[202,203]);
+ const sent=agents.a.api.sent.length;
+ const again=await workSend(agents.a,'mention-both',input);assert.equal(again.details.requestId,first.details.requestId);assert.equal(agents.a.api.sent.length,sent);
+ await assert.rejects(workSend(agents.a,'mention-both',{...input,text:'Changed assignment.'}),/conflicts/);
+});
+
+test('Requests preserve existing case-insensitive mentions and do not turn unrelated mentions into recipients',async t=>{
+ const {agents,shared}=await threeAgents(t);
+ await workSend(agents.a,'mention-part',{kind:'request',recipients:['@example_agent_b_bot','@example_agent_c_bot'],text:'@EXAMPLE_AGENT_B_BOT return a marker.'});
+ await workSend(agents.a,'mention-complete',{kind:'request',recipients:['@example_agent_b_bot'],text:'Ask @example_agent_b_bot; @example_agent_c_bot is context only.'});
+ const messages=await shared.timeline({chatId:GROUP,limit:10});
+ assert.equal(messages[0]?.text,'@example_agent_c_bot\n\n@EXAMPLE_AGENT_B_BOT return a marker.');
+ assert.equal(messages[1]?.text,'Ask @example_agent_b_bot; @example_agent_c_bot is context only.');
+ assert.deepEqual(messages[1]?.work?.kind==='request'&&messages[1].work.recipients,[202]);
+});
+
+test('accepted Requests predating mention insertion recover without rewriting or reposting',async t=>{
+ const {agents}=await twoAgents(t);await verified(agents);
+ const input={kind:'request',recipients:['@example_agent_b_bot'],text:'Historical accepted request.'};
+ const first=await workSend(agents.a,'mention-old',input);
+ const plan=agents.a.journal.records.find(r=>r.type==='group_send_planned'&&r.work?.kind==='request'&&r.work.requestId===first.details.requestId);assert.equal(plan?.type,'group_send_planned');
+ // Model the persisted pre-upgrade send plan, which lacked the new prefix.
+ if(plan?.type==='group_send_planned')plan.text=input.text;
+ const sent=agents.a.api.sent.length;const again=await workSend(agents.a,'mention-old',input);
+ assert.equal(again.details.requestId,first.details.requestId);assert.equal(agents.a.api.sent.length,sent);assert.equal(plan?.type==='group_send_planned'&&plan.text,input.text);
+});
 
 test('strict work kinds and explicit recipients reject ambiguous sends before publication',async(t)=>{
  const {agents}=await twoAgents(t);await verified(agents);const before=agents.a.api.sent.length;

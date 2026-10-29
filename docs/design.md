@@ -146,18 +146,24 @@ claims, so nothing else can start between the claim and the turn.
 ## Activity and queued notices
 
 When an item is accepted while the agent is busy, the agent immediately sends
-a short queued notice as a Telegram reply to the message that delivered it, so
-the sender can see it was received. This applies to owner messages in the
-private chat and the group, and to peer requests in the group, where the
-owner can see the request arrived. When the item starts, the same message is
-edited into the activity display (`Thinking (NN%)` and tool intents). Activity
-messages are Telegram replies to the message being worked on, in both the
-private chat and the group, so concurrent work is attributable. Work on another
-agent's message cannot be a Telegram reply, so its queued notice and activity
-start with a line naming it instead, such as "RE: Agent B: Can you check…". Queue endpoint
-items show activity in their reply destination, when they have one. Queued
-notices and activity are transient: they are not recorded in either archive
-and never wake another agent.
+a short queued notice in that agent's private owner chat. When the item starts,
+the same private message is edited into the activity display (`Thinking (NN%)`
+and tool intents). This private-only destination also applies to work whose
+final reply goes to the group, and to queue endpoint work with a reply target.
+Items with no reply target do not create activity. Typing remains private.
+
+Private-chat work can anchor activity to its private input. Group message IDs
+are never used as reply anchors in the private chat. Group work is labeled
+"Group chat", or names the peer request with a line such as "RE: Agent B: Can
+you check…". Actual Request/Reply/Notify messages and terminal answers retain
+their intended destinations; only ephemeral status is private. Queued notices
+and activity are transient: they are not recorded in either archive and never
+wake another agent.
+
+Activity receipts include their destination, so cleanup does not confuse equal
+message IDs in different chats. Retained unscoped activity receipts resolve to
+the original reply-target chat. Recovery cleans those historical messages in
+that chat rather than editing or deleting a same-numbered private message.
 
 A terminal reply is sent and its Telegram acceptance is recorded before the
 activity message is deleted. If that send fails or is uncertain, the activity
@@ -186,6 +192,21 @@ Queue endpoint instructions are recorded in the agent's transport journal.
 They are not Telegram messages, so neither archive holds them. Turns started by
 group or queue endpoint items carry their own session marker, and the private
 projector treats them as turn boundaries, never as private-chat turns.
+
+Projection validates persisted Pi text against its journal identity. Historical
+work items without lifecycle metadata may use the exact pre-lifecycle envelope
+without a Task header. The historical envelope is reconstructed from logical
+fields, preserving multiline sender/context values; task bodies and the rest of
+the envelope still match exactly. This compatibility does not rewrite canonical session entries or relax
+validation for arbitrary changed content.
+
+Normal session-start and delivery-maintenance reconciliation can recover a
+projection backlog from the supplied persisted session and transport journal.
+Replaying reconciliation preserves existing notes and source history, appends
+projection receipts, and is idempotent. Index refresh follows newly projected
+notes; rebuilding an index cannot replace missing projection. Preserve source
+sessions, journals and archive manifests during repair: do not delete records,
+edit old prompts, reset the conversation, or clear queues to bypass an error.
 
 ## Group chat
 
@@ -358,7 +379,13 @@ An obligation is identified by `(requestId, recipientBotId)`; one recipient's
 Reply cannot close another's obligation. Group identity scopes all references.
 The tool resolves explicit recipient accounts to configured bot IDs before
 sending; unknown recipients and attempts to answer another agent's obligation
-fail before publication.
+fail before publication. New Request bodies prepend any missing recipient
+@mentions, preserving existing case-insensitive mentions and the supplied text.
+Both the send plan and published group text include those mentions. Routing
+still uses the explicit recipient metadata: additional names mentioned in prose
+are not recipients. Replies and notifications do not gain automatic mentions.
+Recovery of an already accepted historical send never republishes it just to
+add a mention.
 
 A Reply identifies its request and has one of four terminal dispositions:
 `completed`, `failed`, `blocked`, or `cancelled`. The text supplies the result or

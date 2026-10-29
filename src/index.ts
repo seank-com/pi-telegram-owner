@@ -216,12 +216,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			currentContext?.ui.setStatus("telegram-owner", `telegram: ${statusText()}`);
 		};
 
-		/** The chat that shows a job's activity and receives its reply, or undefined when it has none. */
+		/** Transient status always belongs to this agent's private owner chat, not its final reply target. */
 		const transportFor = (item: WorkItem | undefined): ChatTransport | undefined => {
 			const deps = runtimeDependencies;
 			if (!deps) return undefined;
 			if (item?.reply.kind === "none") return undefined;
-			if (item?.reply.kind === "group") return groupRuntime?.transport;
 			if (!deps.sendActivity && !deps.editActivity && !deps.deleteActivity) return undefined;
 			const missing = (operation: string) => async (): Promise<never> => { throw new Error(`Telegram activity ${operation} is not configured`); };
 			return {
@@ -232,7 +231,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				deleteActivity: deps.deleteActivity ?? missing("delete"),
 			};
 		};
-		const anchorOf = (job: Job): number | undefined => (job.messageId > 0 ? job.messageId : undefined);
+		const anchorOf = (job: Job): number | undefined => job.item
+			? (job.item.reply.kind === 'private' ? job.item.reply.messageId : undefined)
+			: (job.messageId > 0 ? job.messageId : undefined);
+		const activityContext = (item: WorkItem | undefined): string | undefined => replyContextLine(item) ?? (item?.reply.kind === 'group' ? 'Group chat' : undefined);
 		const routeItemReply = (item: WorkItem) => (item.reply.kind === "group" ? groupRuntime?.transport.sendReply : undefined);
 
 		const serialized = <T>(work: () => Promise<T>): Promise<T> => {
@@ -293,12 +295,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			lastActivityError = undefined;
 			activity = new TelegramActivityMessage(job.jobId, {
 				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
-				existingMessageId: bridge.openActivity(job.jobId),
-				...(replyContextLine(job.item) ? { prefix: replyContextLine(job.item) } : {}),
+				existingMessageId: bridge.openActivity(job.jobId, 'private'),
+				...(activityContext(job.item) ? { prefix: activityContext(job.item) } : {}),
 				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
 				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
-				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId),
-				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId),
+				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId, 'private'),
+				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId, 'private'),
 				onFailure: (operation, error) => {
 					lastActivityError = `${operation}: ${sanitizeError(error)}`;
 					updateStatus();
@@ -320,17 +322,18 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const cleanupFinishedActivities = async (): Promise<void> => {
 			if (!bridge) return;
 			for (const finished of bridge.finishedActivities()) {
-				const transport = transportFor(bridge.itemFor(finished.jobId));
-				if (!transport || failedActivityDeletes.has(finished.messageId)) continue;
+				const transport = finished.destination === 'group' ? groupRuntime?.transport : transportFor(bridge.itemFor(finished.jobId));
+				const deletionKey = `${finished.destination}:${finished.messageId}`;
+				if (!transport || failedActivityDeletes.has(deletionKey)) continue;
 				try {
 					await transport.deleteActivity(finished.messageId, new AbortController().signal);
 				} catch (error) {
-					failedActivityDeletes.add(finished.messageId);
+					failedActivityDeletes.add(deletionKey);
 					lastActivityError = `delete: ${sanitizeError(error)}`;
 					updateStatus();
 					continue;
 				}
-				await bridge.recordActivityCleared(finished.jobId, finished.messageId);
+				await bridge.recordActivityCleared(finished.jobId, finished.messageId, finished.destination);
 			}
 		};
 
@@ -342,15 +345,15 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				if (!transport) continue;
 				let messageId: string;
 				try {
-					const context = replyContextLine(job.item);
+					const context = activityContext(job.item);
 					messageId = await transport.sendActivity(`${context ? `${context}\n` : ""}${queuedNoticeText(agentLabel, position)}`, new AbortController().signal, anchorOf(job));
 				} catch (error) {
-					// One unavailable destination, such as a paused group, must not hide private notices.
+					// A failed notice does not change the task's final reply routing.
 					lastActivityError = `queued: ${sanitizeError(error)}`;
 					updateStatus();
 					continue;
 				}
-				await bridge.recordActivityStarted(job.jobId, messageId);
+				await bridge.recordActivityStarted(job.jobId, messageId, 'private');
 			}
 		};
 
@@ -810,7 +813,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.registerTool({
 			name: GROUP_SEND_TOOL,
 			label: "Send to group chat",
-			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text and public work metadata are sent.",
+			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients, automatically prepend any missing recipient @mentions to the body, and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text, recipient mentions and public work metadata are sent.",
 			promptSnippet: "Send an explicit request, correlated reply or informational notification",
 			promptGuidelines: [
 				"Use kind request and explicit recipients to delegate work. End normally without text to wait; accepted child results resume only a recorded waiting task. Normal final text while dependencies remain is progress, not completion.",
