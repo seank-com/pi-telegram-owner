@@ -152,18 +152,24 @@ claims, so nothing else can start between the claim and the turn.
 ## Activity and queued notices
 
 When an item is accepted while the agent is busy, the agent immediately sends
-a short queued notice as a Telegram reply to the message that delivered it, so
-the sender can see it was received. This applies to owner messages in the
-private chat and the group, and to peer requests in the group, where the
-owner can see the request arrived. When the item starts, the same message is
-edited into the activity display (`Thinking (NN%)` and tool intents). Activity
-messages are Telegram replies to the message being worked on, in both the
-private chat and the group, so concurrent work is attributable. Work on another
-agent's message cannot be a Telegram reply, so its queued notice and activity
-start with a line naming it instead, such as "RE: Agent B: Can you check…". Queue endpoint
-items show activity in their reply destination, when they have one. Queued
-notices and activity are transient: they are not recorded in either archive
-and never wake another agent.
+a short queued notice in that agent's private owner chat. When the item starts,
+the same private message is edited into the activity display (`Thinking (NN%)`
+and tool intents). This private-only destination also applies to work whose
+final reply goes to the group, and to queue endpoint work with a reply target.
+Items with no reply target do not create activity. Typing remains private.
+
+Private-chat work can anchor activity to its private input. Group message IDs
+are never used as reply anchors in the private chat. Group work is labeled
+"Group chat", or names the peer request with a line such as "RE: Agent B: Can
+you check…". Actual Request/Reply/Notify messages and terminal answers retain
+their intended destinations; only ephemeral status is private. Queued notices
+and activity are transient: they are not recorded in either archive and never
+wake another agent.
+
+Activity receipts include their destination, so cleanup does not confuse equal
+message IDs in different chats. Retained unscoped activity receipts resolve to
+the original reply-target chat. Recovery cleans those historical messages in
+that chat rather than editing or deleting a same-numbered private message.
 
 A terminal reply is sent and its Telegram acceptance is recorded before the
 activity message is deleted. If that send fails or is uncertain, the activity
