@@ -513,7 +513,7 @@ test("projector rejects insecure archive roots and session path escape", async (
 	await assert.rejects(() => projector.reconcile(records(), session(join(base, "other"), outsideEntries), async () => undefined), ArchiveSafetyError);
 });
 
-test('historical work-item envelopes recover a stalled private backlog without rewriting source or existing notes', async t => {
+for (const [channel,sender] of [['endpoint','fixture'],['endpoint','fixture\nsecond'],['endpoint','fixture\r\nTask: sender label'],['group','fixture\nsecond']] as const) test(`historical ${channel} envelope ${JSON.stringify(sender)} recovers backlog without rewriting source or existing notes`, async t => {
 	const base=await mkdtemp(join(tmpdir(),'telegram-legacy-recovery-'));t.after(()=>rm(base,{recursive:true,force:true}));
 	const root=join(base,'archive'),sessions=join(base,'sessions');
 	const entries=[message('u1',null,'user','[telegram-job:job-1]\nhello','2026-09-22T01:00:01.000Z'),message('a1','u1','assistant','**world**','2026-09-22T01:00:02.000Z')];
@@ -521,9 +521,10 @@ test('historical work-item envelopes recover a stalled private backlog without r
 	await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append);
 	const before=await createProjector(root,sessions).timeline({operation:'recent',limit:10});
 	const oldNotes=await Promise.all(before.messages!.map(async m=>({path:m.path,bytes:await readFile(join(root,m.path))})));
-	const item={itemId:'11111111-2222-4333-8444-555555555555',channel:'endpoint' as const,authority:'owner' as const,sender:'fixture',text:'Read the fixture.',reply:{kind:'private' as const},timestamp:'2026-09-22T01:30:00.000Z'};
-	// Literal persisted pre-upgrade envelope, not rendered by the current code.
-	const legacy='Channel: queue endpoint\nFrom: fixture (owner authority)\nYour final reply goes to the private chat with the owner.\n\nRead the fixture.';
+	const item={itemId:'11111111-2222-4333-8444-555555555555',channel,authority:'owner' as const,sender,text:'Read the fixture.',reply:{kind:'private' as const,messageId:42},context:['Task: literal context, not a lifecycle header.'],timestamp:'2026-09-22T01:30:00.000Z'};
+	if(channel==='endpoint')assert.equal((await import('../src/endpoint.ts')).parseQueueRequest({kind:'instruction',text:item.text,reply:'private',source:sender}).ok,true);
+	// Literal persisted pre-upgrade logical fields, independent of the current renderer.
+	const legacy=`Channel: ${channel==='group'?'group chat':'queue endpoint'}\nFrom: ${sender} (owner authority)\nYour final reply goes to the private chat with the owner, as a reply to message 42.\n${channel==='group'?'The owner and every configured agent can read the group chat.\n':''}Task: literal context, not a lifecycle header.\n\nRead the fixture.`;
 	entries.push(message('u2','a1','user',`[telegram-item:${item.itemId}]\n${legacy}`,'2026-09-22T01:30:01.000Z'),message('a2','u2','assistant','Fixture reviewed.','2026-09-22T01:30:02.000Z'),message('u3','a2','user','[telegram-job:later]\nNew private message.','2026-09-22T01:40:01.000Z'),message('a3','u3','assistant','New private answer.','2026-09-22T01:40:02.000Z'));
 	journal.push({type:'work_item',schemaVersion:1,...item},{type:'dispatched',jobId:item.itemId,sessionId:'session-1'},{type:'reply_ready',jobId:item.itemId,text:'Fixture reviewed.',timestamp:'2026-09-22T01:30:03.000Z'},{type:'reply_sent',jobId:item.itemId,messageIds:['13'],timestamp:'2026-09-22T01:30:03.000Z'},{type:'update',schemaVersion:2,updateId:2,disposition:'accepted',timestamp:'2026-09-22T01:40:00.000Z',jobId:'later',messageId:14,text:'New private message.',rawText:'New private message.',chatId:70,userId:7},{type:'dispatched',jobId:'later',sessionId:'session-1'},{type:'reply_ready',jobId:'later',text:'New private answer.',timestamp:'2026-09-22T01:40:03.000Z'},{type:'reply_sent',jobId:'later',messageIds:['15'],timestamp:'2026-09-22T01:40:03.000Z'});
 	await persistSession(sessions,entries);const source=await readFile(join(sessions,'session.jsonl')),journalPrefix=JSON.stringify(journal);
