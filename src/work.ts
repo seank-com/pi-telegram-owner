@@ -259,14 +259,16 @@ export const GroupSendParameters = {
 	additionalProperties: false,
 	oneOf: [
 		{
+			type: "object",
 			properties: { kind: { const: "request" }, recipients: { minItems: 1 } },
 			required: ["recipients"],
-			not: { anyOf: [{ required: ["requestId"] }, { required: ["disposition"] }] },
+			not: { type: "object", anyOf: [{ type: "object", required: ["requestId"] }, { type: "object", required: ["disposition"] }] },
 		},
-		{ properties: { kind: { const: "reply" } }, required: ["requestId"], not: { required: ["recipients"] } },
+		{ type: "object", properties: { kind: { const: "reply" } }, required: ["requestId"], not: { type: "object", required: ["recipients"] } },
 		{
+			type: "object",
 			properties: { kind: { const: "notify" } },
-			not: { anyOf: [{ required: ["requestId"] }, { required: ["disposition"] }] },
+			not: { type: "object", anyOf: [{ type: "object", required: ["requestId"] }, { type: "object", required: ["disposition"] }] },
 		},
 	],
 };

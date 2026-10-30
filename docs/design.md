@@ -191,11 +191,13 @@ fields, preserving multiline sender/context values; task bodies and the rest of
 the envelope still match exactly. This compatibility does not rewrite canonical session entries or relax
 validation for arbitrary changed content.
 
-An interruption notice is a transport-generated local response, not the model's
-partial or empty assistant entry. A `task_output` lifecycle receipt between
-`interrupted` and `reply_ready` does not change that provenance. Lifecycle
-metadata alone, an interruption after the reply, or an interruption before a
-later dispatch does not exempt a changed Pi answer from validation.
+Interruption notices and canonical bridge-rendered turn-failure notices are
+transport-generated local responses, not the model's partial or empty assistant
+entry. A `task_output` lifecycle receipt between `interrupted`/`turn_failed` and
+`reply_ready` does not change that provenance. A failure notice must exactly match
+the bridge's renderer for the preceding failure code. Lifecycle metadata alone,
+a failure/interruption after the reply, or evidence before a later dispatch does
+not exempt a changed Pi answer from validation.
 
 Normal session-start and delivery-maintenance reconciliation can recover a
 projection backlog from the supplied persisted session and transport journal.
@@ -357,6 +359,11 @@ reports group entries since the previous group turn, so the agent can retrieve
 more with `telegram_group_timeline` or `telegram_timeline`.
 
 ### Request, Reply and Notify
+
+`telegram_group_send` has an object-root parameter schema with explicitly
+object-typed conditional branches. Kind-specific required and forbidden fields
+remain enforced; provider compatibility does not relax recipient routing or
+request/reply correlation.
 
 Group work uses three explicit kinds:
 

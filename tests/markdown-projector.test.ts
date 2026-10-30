@@ -11,7 +11,7 @@ type ReadonlySessionManager = ExtensionContext["sessionManager"];
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { ArchiveCorruptionError, ArchiveSafetyError, TelegramMarkdownProjector } from "../src/markdown-projector.ts";
-import { outboundPhotoDeliveryKey, type JournalRecord } from "../src/core.ts";
+import { outboundPhotoDeliveryKey, turnFailureNotice, type TurnFailureCode, type JournalRecord } from "../src/core.ts";
 
 function canonical(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -104,17 +104,19 @@ for (const lifecycle of [false,true]) test(`interruption notices survive project
 	await assert.rejects(() => createProjector(join(base, "invalid"), sessionRoot).reconcile(invalid, session(sessionRoot, entries), async () => undefined), /Canonical Pi assistant content changed/);
 });
 
-test('interrupted thinking-only work item recovers its notice and later private backlog across lifecycle metadata',async t=>{
+for (const failure of [false,true]) test(`generated work-item notice recovers later private backlog across lifecycle metadata (modelFailure=${failure})`,async t=>{
  const base=await mkdtemp(join(tmpdir(),'telegram-stop-work-item-'));t.after(()=>rm(base,{recursive:true,force:true}));
  const root=join(base,'archive'),sessions=join(base,'sessions');
  const item={itemId:'11111111-2222-4333-8444-555555555555',channel:'endpoint' as const,authority:'owner' as const,sender:'fixture',text:'Compute the fixture.',reply:{kind:'private' as const},timestamp:'2026-09-22T01:00:00.000Z'};
  const {renderWorkItemPrompt}=await import('../src/core.ts');
  const entries=[message('u1',null,'user',`[telegram-item:${item.itemId}]\n${renderWorkItemPrompt(item)}`,'2026-09-22T01:00:01.000Z'),message('a1','u1','assistant','','2026-09-22T01:00:02.000Z')];
- Object.assign((entries[1] as any).message,{stopReason:'aborted',content:[{type:'thinking',thinking:'Synthetic placeholder only.'}]});
- await persistSession(sessions,entries);const journal:JournalRecord[]=[{type:'work_item',schemaVersion:1,...item},{type:'dispatched',jobId:item.itemId,sessionId:'session-1'},{type:'interrupted',jobId:item.itemId,reason:'Stopped by Telegram owner command'},{type:'task_output',taskId:item.itemId,jobId:item.itemId,mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.000Z'},{type:'reply_ready',jobId:item.itemId,text:'Stopped by /stop.'},{type:'reply_sent',jobId:item.itemId,messageIds:['11']}];
+ Object.assign((entries[1] as any).message,{stopReason:failure?'error':'aborted',content:failure?[]:[{type:'thinking',thinking:'Synthetic placeholder only.'}]});
+ const notice=failure?turnFailureNotice('MODEL_ERROR'):'Stopped by /stop.';
+ const terminal:JournalRecord=failure?{type:'turn_failed',jobId:item.itemId,code:'MODEL_ERROR',timestamp:'2026-09-22T01:00:03.000Z'}:{type:'interrupted',jobId:item.itemId,reason:'Stopped by Telegram owner command'};
+ await persistSession(sessions,entries);const journal:JournalRecord[]=[{type:'work_item',schemaVersion:1,...item},{type:'dispatched',jobId:item.itemId,sessionId:'session-1'},terminal,{type:'task_output',taskId:item.itemId,jobId:item.itemId,mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.000Z'},{type:'reply_ready',jobId:item.itemId,text:notice},{type:'reply_sent',jobId:item.itemId,messageIds:['11']}];
  const append=async(r:JournalRecord)=>{journal.push(r);};
  assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:1,unchanged:0,deferred:0});
- const first=await createProjector(root,sessions).timeline({operation:'recent',limit:5});assert.equal(first.messages!.length,1);assert.equal(first.messages![0].messageId,`tgmsg:v1:telegram-job:${item.itemId}:local-response`);assert.equal(first.messages![0].content,'Stopped by /stop.');
+ const first=await createProjector(root,sessions).timeline({operation:'recent',limit:5});assert.equal(first.messages!.length,1);assert.equal(first.messages![0].messageId,`tgmsg:v1:telegram-job:${item.itemId}:local-response`);assert.equal(first.messages![0].content,notice);
  const originalNote=await readFile(join(root,first.messages![0].path));
  entries.push(message('u2','a1','user','[telegram-job:job-1]\nhello','2026-09-22T02:00:01.000Z'),message('a2','u2','assistant','**world**','2026-09-22T02:00:02.000Z'));await persistSession(sessions,entries);journal.push(...records());
  const source=await readFile(join(sessions,'session.jsonl')),prefix=JSON.stringify(journal);
@@ -129,6 +131,37 @@ for(const staleInterruption of [false,true])test(`task output never exempts a ch
  const entries=[message('u1',null,'user','[telegram-job:job-1]\nhello','2026-09-22T01:00:01.000Z'),message('a1','u1','assistant','Changed answer.','2026-09-22T01:00:02.000Z')];await persistSession(sessions,entries);
  const journal=records();journal.splice(1,0,...(staleInterruption?[{type:'interrupted' as const,jobId:'job-1',reason:'Earlier stopped attempt'}]:[]));
  journal.splice(journal.findIndex(r=>r.type==='reply_ready'),0,{type:'task_output',taskId:'job-1',jobId:'job-1',mode:'terminal',disposition:'completed',timestamp:'2026-09-22T01:00:03.000Z'});
+ await assert.rejects(createProjector(root,sessions).reconcile(journal,session(sessions,entries),async()=>undefined),/Canonical Pi assistant content changed/);
+});
+
+for (const code of ['LENGTH','ABORTED','MODEL_ERROR','NO_REPLY'] as TurnFailureCode[]) for (const lifecycle of [false,true]) test(`generated ${code} notice recovers backlog without impersonating model text (lifecycle=${lifecycle})`, async t => {
+ const base=await mkdtemp(join(tmpdir(),'telegram-failure-notice-'));t.after(()=>rm(base,{recursive:true,force:true}));const root=join(base,'archive'),sessions=join(base,'sessions');
+ const entries=[message('u1',null,'user','[telegram-job:job-1]\nhello','2026-09-22T01:00:01.000Z'),message('a1','u1','assistant',code==='LENGTH'?'Partial synthetic answer':'','2026-09-22T01:00:02.000Z')];
+ (entries[1] as any).message.stopReason=code==='LENGTH'?'length':code==='ABORTED'?'aborted':code==='MODEL_ERROR'?'error':'stop';
+ await persistSession(sessions,entries);
+ const journal:JournalRecord[]=records().filter(r=>!['reply_ready','reply_plan','reply_chunk_sent','reply_sent'].includes(r.type));
+ journal.push({type:'turn_failed',jobId:'job-1',code,timestamp:'2026-09-22T01:00:03.000Z'});
+ if(lifecycle)journal.push({type:'task_output',taskId:'job-1',jobId:'job-1',mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.001Z'});
+ journal.push({type:'reply_ready',jobId:'job-1',text:turnFailureNotice(code)},{type:'reply_sent',jobId:'job-1',messageIds:['11']});
+ const append=async(r:JournalRecord)=>{journal.push(r);};
+ assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:2,unchanged:0,deferred:0});
+ const first=await createProjector(root,sessions).timeline({operation:'recent',limit:5});const notice=first.messages!.find(m=>m.direction==='out')!;
+ assert.equal(notice.messageId,'tgmsg:v1:telegram-job:job-1:local-response');assert.equal(notice.content,turnFailureNotice(code));const note=await readFile(join(root,notice.path));
+ entries.push(message('u2','a1','user','[telegram-job:job-2]\nhello','2026-09-22T02:00:01.000Z'),message('a2','u2','assistant','**world**','2026-09-22T02:00:02.000Z'));await persistSession(sessions,entries);
+ journal.push(...records().map(r=>({...r,...('jobId'in r?{jobId:'job-2'}:{}),...(r.type==='update'?{updateId:2,messageId:12}:{})})));
+ const source=await readFile(join(sessions,'session.jsonl')),prefix=JSON.stringify(journal);
+ assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:2,unchanged:2,deferred:0});
+ assert.deepEqual(await readFile(join(root,notice.path)),note);assert.deepEqual(await readFile(join(sessions,'session.jsonl')),source);assert.equal(JSON.stringify(journal.slice(0,JSON.parse(prefix).length)),prefix);
+ assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:0,unchanged:4,deferred:0});
+});
+for (const variant of ['changed-notice','earlier-failure','later-failure'] as const) test(`failure metadata does not excuse canonical changes: ${variant}`,async t=>{
+ const base=await mkdtemp(join(tmpdir(),'telegram-failure-integrity-'));t.after(()=>rm(base,{recursive:true,force:true}));const root=join(base,'archive'),sessions=join(base,'sessions');
+ const entries=[message('u1',null,'user','[telegram-job:job-1]\nhello','2026-09-22T01:00:01.000Z'),message('a1','u1','assistant','Canonical answer differs.','2026-09-22T01:00:02.000Z')];await persistSession(sessions,entries);
+ const journal=records();const failure:JournalRecord={type:'turn_failed',jobId:'job-1',code:'MODEL_ERROR',timestamp:'2026-09-22T01:00:02.000Z'};
+ if(variant==='changed-notice')journal.splice(journal.findIndex(r=>r.type==='reply_ready'),0,failure);
+ else if(variant==='earlier-failure')journal.splice(1,0,failure);
+ else journal.push(failure);
+ if(variant!=='changed-notice')(journal.find(r=>r.type==='reply_ready') as any).text=turnFailureNotice('MODEL_ERROR');
  await assert.rejects(createProjector(root,sessions).reconcile(journal,session(sessions,entries),async()=>undefined),/Canonical Pi assistant content changed/);
 });
 
