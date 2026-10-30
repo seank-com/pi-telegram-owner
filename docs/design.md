@@ -191,6 +191,12 @@ fields, preserving multiline sender/context values; task bodies and the rest of
 the envelope still match exactly. This compatibility does not rewrite canonical session entries or relax
 validation for arbitrary changed content.
 
+An interruption notice is a transport-generated local response, not the model's
+partial or empty assistant entry. A `task_output` lifecycle receipt between
+`interrupted` and `reply_ready` does not change that provenance. Lifecycle
+metadata alone, an interruption after the reply, or an interruption before a
+later dispatch does not exempt a changed Pi answer from validation.
+
 Normal session-start and delivery-maintenance reconciliation can recover a
 projection backlog from the supplied persisted session and transport journal.
 Replaying reconciliation preserves existing notes and source history, appends
