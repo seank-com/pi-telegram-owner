@@ -71,7 +71,7 @@ function noteBody(note: string): string {
 	return match[1]!;
 }
 
-test("interruption notices survive projector restart without impersonating Pi assistant entries", async (t) => {
+for (const lifecycle of [false,true]) test(`interruption notices survive projector restart without impersonating Pi entries (lifecycle=${lifecycle})`, async (t) => {
 	const base = await mkdtemp(join(tmpdir(), "telegram-interrupted-reply-"));
 	t.after(() => rm(base, { recursive: true, force: true }));
 	const archiveRoot = join(base, "archive"); const sessionRoot = join(base, "sessions");
@@ -80,7 +80,9 @@ test("interruption notices survive projector restart without impersonating Pi as
 	await persistSession(sessionRoot, entries);
 	const original = await readFile(join(sessionRoot, "session.jsonl"), "utf8");
 	const journal = records().filter((record) => !["reply_ready", "reply_plan", "reply_chunk_sent", "reply_sent"].includes(record.type));
-	journal.push({ type: "interrupted", jobId: "job-1", reason: "Stopped by Telegram owner command" }, { type: "reply_ready", jobId: "job-1", text: "Stopped by /stop." }, { type: "reply_sent", jobId: "job-1", messageIds: ["11"] });
+	journal.push({ type: "interrupted", jobId: "job-1", reason: "Stopped by Telegram owner command" });
+	if(lifecycle)journal.push({type:'task_output',taskId:'job-1',jobId:'job-1',mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.000Z'});
+	journal.push({ type: "reply_ready", jobId: "job-1", text: "Stopped by /stop." }, { type: "reply_sent", jobId: "job-1", messageIds: ["11"] });
 	const append = async (record: JournalRecord) => { journal.push(record); };
 	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 0, deferred: 0 });
 	const restarted = createProjector(archiveRoot, sessionRoot);
@@ -100,6 +102,34 @@ test("interruption notices survive projector restart without impersonating Pi as
 	const invalid = records();
 	invalid.push({ type: "interrupted", jobId: "job-1", reason: "later interruption without a notice" });
 	await assert.rejects(() => createProjector(join(base, "invalid"), sessionRoot).reconcile(invalid, session(sessionRoot, entries), async () => undefined), /Canonical Pi assistant content changed/);
+});
+
+test('interrupted thinking-only work item recovers its notice and later private backlog across lifecycle metadata',async t=>{
+ const base=await mkdtemp(join(tmpdir(),'telegram-stop-work-item-'));t.after(()=>rm(base,{recursive:true,force:true}));
+ const root=join(base,'archive'),sessions=join(base,'sessions');
+ const item={itemId:'11111111-2222-4333-8444-555555555555',channel:'endpoint' as const,authority:'owner' as const,sender:'fixture',text:'Compute the fixture.',reply:{kind:'private' as const},timestamp:'2026-09-22T01:00:00.000Z'};
+ const {renderWorkItemPrompt}=await import('../src/core.ts');
+ const entries=[message('u1',null,'user',`[telegram-item:${item.itemId}]\n${renderWorkItemPrompt(item)}`,'2026-09-22T01:00:01.000Z'),message('a1','u1','assistant','','2026-09-22T01:00:02.000Z')];
+ Object.assign((entries[1] as any).message,{stopReason:'aborted',content:[{type:'thinking',thinking:'Synthetic placeholder only.'}]});
+ await persistSession(sessions,entries);const journal:JournalRecord[]=[{type:'work_item',schemaVersion:1,...item},{type:'dispatched',jobId:item.itemId,sessionId:'session-1'},{type:'interrupted',jobId:item.itemId,reason:'Stopped by Telegram owner command'},{type:'task_output',taskId:item.itemId,jobId:item.itemId,mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.000Z'},{type:'reply_ready',jobId:item.itemId,text:'Stopped by /stop.'},{type:'reply_sent',jobId:item.itemId,messageIds:['11']}];
+ const append=async(r:JournalRecord)=>{journal.push(r);};
+ assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:1,unchanged:0,deferred:0});
+ const first=await createProjector(root,sessions).timeline({operation:'recent',limit:5});assert.equal(first.messages!.length,1);assert.equal(first.messages![0].messageId,`tgmsg:v1:telegram-job:${item.itemId}:local-response`);assert.equal(first.messages![0].content,'Stopped by /stop.');
+ const originalNote=await readFile(join(root,first.messages![0].path));
+ entries.push(message('u2','a1','user','[telegram-job:job-1]\nhello','2026-09-22T02:00:01.000Z'),message('a2','u2','assistant','**world**','2026-09-22T02:00:02.000Z'));await persistSession(sessions,entries);journal.push(...records());
+ const source=await readFile(join(sessions,'session.jsonl')),prefix=JSON.stringify(journal);
+ assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:2,unchanged:1,deferred:0});
+ assert.deepEqual(await readFile(join(root,first.messages![0].path)),originalNote);assert.deepEqual(await readFile(join(sessions,'session.jsonl')),source);assert.equal(JSON.stringify(journal.slice(0,JSON.parse(prefix).length)),prefix);
+ assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:0,unchanged:3,deferred:0});
+ const all=await createProjector(root,sessions).timeline({operation:'recent',limit:5});assert.equal(all.messages!.length,3);assert.equal(all.messages!.some(m=>m.messageId==='tgmsg:v1:pi:session-1:a1'),false);
+});
+
+for(const staleInterruption of [false,true])test(`task output never exempts a changed canonical answer (stale interruption=${staleInterruption})`,async t=>{
+ const base=await mkdtemp(join(tmpdir(),'telegram-stop-integrity-'));t.after(()=>rm(base,{recursive:true,force:true}));const root=join(base,'archive'),sessions=join(base,'sessions');
+ const entries=[message('u1',null,'user','[telegram-job:job-1]\nhello','2026-09-22T01:00:01.000Z'),message('a1','u1','assistant','Changed answer.','2026-09-22T01:00:02.000Z')];await persistSession(sessions,entries);
+ const journal=records();journal.splice(1,0,...(staleInterruption?[{type:'interrupted' as const,jobId:'job-1',reason:'Earlier stopped attempt'}]:[]));
+ journal.splice(journal.findIndex(r=>r.type==='reply_ready'),0,{type:'task_output',taskId:'job-1',jobId:'job-1',mode:'terminal',disposition:'completed',timestamp:'2026-09-22T01:00:03.000Z'});
+ await assert.rejects(createProjector(root,sessions).reconcile(journal,session(sessions,entries),async()=>undefined),/Canonical Pi assistant content changed/);
 });
 
 test("projector writes Pi-entry notes atomically and converges metadata idempotently", async (t) => {

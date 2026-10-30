@@ -583,8 +583,10 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 		if (!reply) continue;
 		// The archive records what Telegram showed; a reply that posted nothing is not a message.
 		if (records.some((record) => record.type === "reply_sent" && record.jobId === jobId && "messageIds" in record && record.messageIds.length === 0)) continue;
-		// The bridge records interruption notices after `interrupted`; they are not Pi assistant text.
-		const beforeReply = records.slice(0, records.lastIndexOf(reply)).findLast((record) => "jobId" in record && record.jobId === jobId);
+		// Interruption notices are transport-generated, not Pi assistant text.
+		// task_output records delivery lifecycle metadata between interruption
+		// and reply_ready; it does not change that reply's source provenance.
+		const beforeReply = records.slice(0, records.lastIndexOf(reply)).findLast((record) => "jobId" in record && record.jobId === jobId && record.type !== 'task_output');
 		if (beforeReply?.type === "interrupted") {
 			addLocalResponse();
 			continue;
