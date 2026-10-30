@@ -11,7 +11,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { PollerLock, systemBootIdentity, systemPidState, type BootIdentity, type PidState } from "./runtime.ts";
 
-import { MAX_IMAGE_BYTES, renderWorkItemPrompt, validateMediaLifecycle, WORK_ITEM_MARKER_PREFIX, type ArchivedTelegramAttachment, type JournalRecord, type ResolvedImage, type WorkItem } from "./core.ts";
+import { MAX_IMAGE_BYTES, renderWorkItemPrompt, turnFailureNotice, validateMediaLifecycle, WORK_ITEM_MARKER_PREFIX, type ArchivedTelegramAttachment, type JournalRecord, type ResolvedImage, type WorkItem } from "./core.ts";
 
 export interface TelegramMarkdownProjectorConfig {
 	enabled: true;
@@ -583,11 +583,11 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 		if (!reply) continue;
 		// The archive records what Telegram showed; a reply that posted nothing is not a message.
 		if (records.some((record) => record.type === "reply_sent" && record.jobId === jobId && "messageIds" in record && record.messageIds.length === 0)) continue;
-		// Interruption notices are transport-generated, not Pi assistant text.
-		// task_output records delivery lifecycle metadata between interruption
-		// and reply_ready; it does not change that reply's source provenance.
+		// Interruption/failure notices are transport-generated, not Pi text.
+		// task_output is delivery bookkeeping, not a change of provenance.
 		const beforeReply = records.slice(0, records.lastIndexOf(reply)).findLast((record) => "jobId" in record && record.jobId === jobId && record.type !== 'task_output');
-		if (beforeReply?.type === "interrupted") {
+		const generatedFailure = beforeReply?.type === "turn_failed" && reply.text === turnFailureNotice(beforeReply.code);
+		if (beforeReply?.type === "interrupted" || generatedFailure) {
 			addLocalResponse();
 			continue;
 		}
