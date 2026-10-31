@@ -117,8 +117,13 @@ if(process.env.TEST_COMPANIONS){
    const loaded=state.loader.getExtensions();const original=loaded.runtime.appendEntry;loaded.runtime.appendEntry=(customType:string,data:any)=>branch.push({type:"custom",customType,data});
    for(const handler of owner.handlers.get("context_with_system")??[])await handler({messages:[{role:"system",content:"Inspect",toolsAdded:[{name:"read",parameters:{type:"object",properties:{},required:[]}}],timestamp:0}]},ctx);
    for(const handler of owner.handlers.get("before_provider_request")??[])await handler({payload:{model:"fixture",stream:true,store:false,instructions:"Inspect",input:[],tools:[{type:"function",name:"read",parameters:{type:"object",properties:{},required:[]}}]}},ctx);
-   for(const handler of owner.handlers.get("message_end")??[])await handler({message:{role:"assistant",content:[{type:"toolCall",id:"audited-fixture",name:"read",arguments:{intent:"Inspect the prior decision."}}]}},ctx);
-   assert.equal(activity.formatTelegramToolActivity(branch,"audited-fixture","read"),"Inspect the prior decision.");assert.equal(activity.formatTelegramToolActivity([],"missing","read"),"Using read…");loaded.runtime.appendEntry=original;
+   const secret=process.env.ACTIVITY_TEST_API_KEY!;assert.equal(secret,"synthetic-activity-credential-123456789");
+   const rawIntent=`Inspect the candidate's "quoted" token=${secret} at https://example.test/run using \`plain Markdown.`;
+   const expectedIntent=rawIntent.replace(secret,"<REDACTED ACTIVITY_TEST_API_KEY VALUE>");
+   for(const handler of owner.handlers.get("message_end")??[])await handler({message:{role:"assistant",content:[{type:"toolCall",id:"audited-fixture",name:"read",arguments:{intent:rawIntent}}]}},ctx);
+   const audit=branch.find(entry=>entry.customType===obsContract.TOOL_INTENT_ENTRY_TYPE&&entry.data.toolCallId==="audited-fixture");
+   assert.equal(audit.data.intent,expectedIntent);assert.equal(audit.data.intent.includes(secret),false);
+   assert.equal(activity.formatTelegramToolActivity(branch,"audited-fixture","read"),expectedIntent);assert.equal(activity.formatTelegramToolActivity([],"missing","read"),"Using read…");loaded.runtime.appendEntry=original;
    // Service teardown revokes captured availability before a new operation.
    const datastore=state.loader.getExtensions().extensions.find((extension:any)=>extension.path===datastoreEntry);for(const handler of datastore.handlers.get("session_shutdown")??[])await handler({},noopCtx);
    await assert.rejects(state.session.getToolDefinition("telegram_recall").execute("after-stop",{query:"Prior"}),/CAPABILITY_UNAVAILABLE/);
