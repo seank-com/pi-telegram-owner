@@ -363,8 +363,35 @@ test("activity message sends once, coalesces parallel updates, rate limits edits
 	assert.deepEqual(journal, ["start:job-1:51", "clear:job-1:51"]);
 });
 
-test("Telegram activity renders only safe versioned observability entries", () => {
-	const long = "Describe the safe operation ".repeat(20).trim();
+test("activity messages preserve full audit-length text in sends, updates and annotations", async () => {
+	const initial = `Inspect ${"a".repeat(991)}.`;
+	const updated = `Inspect ${"b".repeat(991)}.`;
+	const annotated = `Inspect ${"c".repeat(991)}.`;
+	assert.equal(initial.length, 1_000);
+	const prefix = "RE: A peer request";
+	const calls: string[] = [];
+	const activity = new TelegramActivityMessage("full-intent", {
+		async send(text) { calls.push(text); return "51"; },
+		async edit(_id, text) { calls.push(text); },
+		async delete() {},
+		async onStarted() {},
+		async onCleared() {},
+		onFailure: (operation) => assert.fail(`unexpected ${operation} failure`),
+		minimumEditIntervalMs: 0,
+		prefix,
+	}, initial);
+	activity.start();
+	await waitFor(() => calls.length === 1);
+	activity.update(updated);
+	await waitFor(() => calls.length === 2);
+	await activity.halt();
+	await activity.annotate(annotated);
+	assert.deepEqual(calls, [initial, updated, annotated].map((text) => `${prefix}\n${text}`));
+	await activity.stopAndDelete();
+});
+
+test("Telegram activity renders full structurally valid observability entries up to the audit limit", () => {
+	const long = `Inspect ${"a".repeat(991)}.`;
 	const entries = [{
 		type: "custom",
 		customType: TOOL_INTENT_ENTRY_TYPE,
@@ -377,14 +404,18 @@ test("Telegram activity renders only safe versioned observability entries", () =
 		},
 	}];
 	const status = formatTelegramToolActivity(entries, "long", "read");
-	assert.equal(status.length, 160);
-	assert.equal(status.endsWith("…"), true);
+	assert.equal(status.length, 1_000);
+	assert.equal(status, long);
+	assert.equal(formatTelegramToolActivity([{
+		...entries[0],
+		data: { ...entries[0].data, intent: `${long}x` },
+	}], "long", "read"), "Using read…");
 	assert.equal(formatTelegramToolActivity(entries, "missing", "bash"), "Using bash…");
 	assert.equal(formatTelegramToolActivity(entries, "missing", "bad name; secret"), "Using tool…");
 	assert.equal(formatTelegramToolActivity([{
 		...entries[0],
 		data: { ...entries[0].data, intent: "Expose https://example.test/private" },
-	}], "long", "read"), "Using read…");
+	}], "long", "read"), "Expose https://example.test/private");
 	assert.equal(formatTelegramToolActivity([{
 		...entries[0],
 		data: { ...entries[0].data, version: 2 },
@@ -392,11 +423,52 @@ test("Telegram activity renders only safe versioned observability entries", () =
 	assert.equal(formatTelegramToolActivity([{
 		...entries[0],
 		data: { ...entries[0].data, intent: "Inspect token=raw-secret" },
-	}], "long", "read"), "Using read…");
+	}], "long", "read"), "Inspect token=raw-secret");
 	assert.equal(formatTelegramToolActivity([{
 		...entries[0],
 		data: { ...entries[0].data, intent: "Inspect token=[redacted] safely" },
 	}], "long", "read"), "Inspect token=[redacted] safely");
+});
+
+test("audited intent content is displayed unchanged without Telegram security heuristics", () => {
+	const samples = [
+		"Check the candidate's context and the reviewer's result.",
+		'Keep "quoted text", `partial Markdown and **formatting as plain text.',
+		"Inspect https://example.test/run?x=1 and /tmp/example or ~/notes.",
+		"Keep $NAME \\ pipes | semicolons ; redirects < > and && options --flag.",
+		"Inspect token=synthetic-unregistered-value and Bearer synthetic-value.",
+		"Keep sk-syntheticvalue123 and 123456789:synthetictelegramtoken123456789 unchanged.",
+		"Keep ABCDEFGHIJKLMNOPQRSTUVWX12345678 unchanged.",
+		"Use <REDACTED FIXTURE_API_KEY VALUE> exactly as audited.",
+		"  Preserve  stored whitespace\nwithout a second normalization.\t",
+	];
+	for (const intent of samples) {
+		const entry = {type:"custom",customType:TOOL_INTENT_ENTRY_TYPE,data:{version:1,toolCallId:"content",toolName:"bash",intent,timestamp:"2026-10-31T00:00:00Z"}};
+		assert.equal(formatTelegramToolActivity([entry],"content","bash"),intent);
+	}
+});
+
+test("malformed or unrelated audit evidence never falls back to raw arguments", () => {
+	const entry:any = {type:"custom",customType:TOOL_INTENT_ENTRY_TYPE,data:{version:1,toolCallId:"shape",toolName:"read",intent:"Inspect the fixture.",timestamp:"2026-10-31T00:00:00Z"}};
+	const invalid = [
+		{...entry,type:"message"}, {...entry,customType:"other"},
+		...[{version:2},{toolCallId:"different"},{toolCallId:3},{toolName:3},{timestamp:3},{intent:""},{intent:3},{intent:"x".repeat(1001)}].map(change=>({...entry,data:{...entry.data,...change}})),
+		{...entry,data:{toolCallId:"shape",arguments:{intent:"Do not display raw input."}}},
+	];
+	for(const audit of invalid) assert.equal(formatTelegramToolActivity([audit],"shape","read"),"Using read…");
+});
+
+test("activity sends and edits audited punctuation through plain JSON without parse mode", async () => {
+	const requests:Array<{method:string;body:any}>=[];
+	const api=new TelegramApiClient("123:synthetic-transport-token",CHAT,async(url,init)=>{requests.push({method:url.split('/').at(-1)!,body:JSON.parse(init.body)});return{ok:true,status:200,async json(){return{ok:true,result:{message_id:41}};}};});
+	const intent='Inspect the candidate\'s "JSON", `partial Markdown, $x | a; b && <tag> at https://example.test/ and C:\\tmp.';
+	const render=(text:string)=>formatTelegramToolActivity([{type:"custom",customType:TOOL_INTENT_ENTRY_TYPE,data:{version:1,toolCallId:"wire",toolName:"bash",intent:text,timestamp:"2026-10-31T00:00:00Z"}}],"wire","bash");
+	const initial=render(intent),updated=render(intent+' Updated.');
+	const activity=new TelegramActivityMessage("plain-audit",{send:text=>api.sendMessage(text),edit:(id,text)=>api.editMessageText(id,text),delete:id=>api.deleteMessage(id),async onStarted(){},async onCleared(){},onFailure:operation=>assert.fail(operation),minimumEditIntervalMs:0},initial);
+	activity.start();await waitFor(()=>requests.length===1);activity.update(updated);await waitFor(()=>requests.length===2);await activity.stopAndDelete();
+	assert.deepEqual(requests.slice(0,2).map(r=>r.method),['sendMessage','editMessageText']);
+	assert.equal(requests[0].body.text,initial);assert.equal(requests[1].body.text,updated);
+	assert(requests.every(r=>!Object.hasOwn(r.body,'parse_mode')));
 });
 
 test("Telegram image download and upload enforce type, size, safe paths, and multipart fields", async (t) => {

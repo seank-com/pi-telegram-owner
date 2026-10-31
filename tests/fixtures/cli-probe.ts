@@ -44,6 +44,24 @@ const run=(extra:string[])=>JSON.parse(execFileSync(command,[...args,...extra],{
 const dry=run(["--dry-run"]);assert.equal(dry.historical,2);assert.equal(dry.piAligned,2);assert.equal(existsSync(current.archiveRoot),false);
 const committed=run(["--commit","--output-root",current.archiveRoot]);assert.equal(committed.publication.published,4);const repeat=run(["--commit","--output-root",current.archiveRoot]);assert.equal(repeat.publication.published,0);assert.equal(repeat.publication.unchanged,4);
 const archive=new TelegramMarkdownProjector({enabled:true,root:current.archiveRoot,rootId:"fixture"});const timeline=await archive.timeline({operation:"recent",limit:10});assert.equal(timeline.count,4);
+// Exercise the installed prepare workflow independently of the explicit legacy controls.
+const preparedArgs = ["--export-root", current.exportRoot, "--pi-session-root", current.sessionRoot];
+const prepare = () => JSON.parse(execFileSync(command, [...preparedArgs, "--prepare"], { encoding: "utf8", stdio: "pipe" }));
+const privatePrepared = prepare();
+assert.deepEqual(privatePrepared.placeholders, ["Owner", "Agent"]);
+assert.throws(() => execFileSync(command, preparedArgs, { encoding: "utf8", stdio: "pipe" }), /first-pi-boundary\.json/);
+const privateSpeakersPath = join(privatePrepared.controlDir, "speakers.json");
+const privateSpeakers = JSON.parse(await readFile(privateSpeakersPath, "utf8"));
+privateSpeakers.speakers.Owner = "in"; privateSpeakers.speakers.Agent = "out";
+await writeFile(privateSpeakersPath, JSON.stringify(privateSpeakers), { mode: 0o600 });
+assert.ok(prepare().candidates > 0);
+const privateBoundaryPath = join(privatePrepared.controlDir, "first-pi-boundary.json");
+const privateBoundary = JSON.parse(await readFile(privateBoundaryPath, "utf8"));
+privateBoundary.firstPi = JSON.parse(await readFile(join(privatePrepared.controlDir, "boundary-candidates.json"), "utf8")).candidates[0];
+await writeFile(privateBoundaryPath, JSON.stringify(privateBoundary), { mode: 0o600 });
+assert.equal(JSON.parse(execFileSync(command, preparedArgs, { encoding: "utf8" })).piAligned, 2);
+const preparedCommit = JSON.parse(execFileSync(command, [...preparedArgs, "--commit", "--output-root", join(current.root, "prepared-archive")], { encoding: "utf8" }));
+assert.equal(preparedCommit.publication.published, 4);
 const altered=await readFile(join(current.exportRoot,"messages.html"),"utf8");await writeFile(join(current.exportRoot,"messages.html"),altered+"changed");assert.throws(()=>run(["--commit","--output-root",current.archiveRoot]));
 const project=join(current.root,"menu-project");const config=join(project,".fixture/telegram-owner");await mkdir(config,{recursive:true,mode:0o700});await writeFile(join(config,"config.json"),JSON.stringify({ownerUserId:7,privateChatId:70,tokenEnv:"FIXTURE_MENU_TOKEN"}),{mode:0o600});
 const intercept=join(current.root,"intercept.mjs");await writeFile(intercept,'import assert from "node:assert/strict";globalThis.fetch=async(url,options)=>{const body=JSON.parse(options.body);if(url==="https://api.telegram.org/botfixture-token/deleteMyCommands"){assert.deepEqual(body,{});return{ok:true,status:200,json:async()=>({ok:true,result:true})};}assert.equal(url,"https://api.telegram.org/botfixture-token/setMyCommands");assert.equal(body.commands.length,5);assert.deepEqual(Object.keys(body),["commands","scope"]);assert.deepEqual(body.scope,{type:"all_private_chats"});assert.deepEqual(body.commands.map(command=>command.command),["help","status","stop","compact","new"]);return{ok:true,status:200,json:async()=>({ok:true,result:true})};};');

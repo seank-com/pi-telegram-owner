@@ -45,16 +45,19 @@ Three compiled CLIs are included:
 
 ```bash
 pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]
-pi-telegram-archive-import --export-root EXPORT --source-set-manifest SOURCE.json \
-  --first-pi-anchor BOUNDARY.json --speaker-map SPEAKERS.json \
-  --pi-session-root SESSIONS --checkpoint CHECKPOINT.json --dry-run
+pi-telegram-archive-import --prepare --export-root EXPORT --pi-session-root SESSIONS
+pi-telegram-archive-import --export-root EXPORT --pi-session-root SESSIONS --dry-run
 pi-telegram-group-import --export-root EXPORT
 pi-telegram-group-import --export-root EXPORT --chat-id CHAT_ID --shared-root ROOT --dry-run
 ```
 
-Menu registration contacts Telegram and is an explicit operator action. Archive
-import defaults to dry-run; commit requires the matching checkpoint and explicit
-`--commit --output-root ROOT`. Group import first prepares control files with
+Menu registration contacts Telegram and is an explicit operator action. Private
+archive import first prepares protected controls next to the export. Fill speaker
+directions, re-prepare, and confirm one generated boundary candidate; no hashes
+need hand calculation. Review dry-run counts before `--commit --output-root ROOT`,
+which requires the matching checkpoint. Existing explicit control paths and
+hashed speaker maps remain supported. See [setup](docs/setup.md#private-archive-import)
+for the confirmation steps. Group import first prepares control files with
 placeholders to fill in, then defaults to dry-run and adds only messages
 missing from the shared journal with `--commit`. The CLIs run as
 native Node programs without loading Pi. Pure helpers are exported as `/format`, `/markdown-projector` and `/importer`.
