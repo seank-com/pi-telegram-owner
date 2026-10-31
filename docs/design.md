@@ -61,13 +61,19 @@ owned by datastore; Telegram does not add workers, model downloads or semantic
 refresh loops. Injected transport fixture callbacks exercise coalescing without
 starting real services.
 
-Activity consumes only validated versioned persisted audit data. Existing safe
-activity validation remains a Telegram display responsibility; it does not copy
-observability's sanitizer/redactor. Without a valid audit entry, activity falls
-back to a bounded tool name. Validated intents are displayed in full up to the
-1,000-character audit limit, without a separate activity-display truncation.
-Raw tool arguments are never displayed. Persisted
-identifiers/types are checked against the owner's actual packed contract.
+Activity consumes only structurally valid versioned persisted audit data for
+the matching call ID. Validation checks entry kind/version, field types and the
+nonempty 1,000-character intent contract; it does not filter or normalize content.
+pi-observability owns creation-time exact credential-value redaction. Telegram
+trusts that persisted text without credential-shape guesses, punctuation/path/URL
+bans, or another redaction pass against a potentially rotated registry.
+
+Intents are displayed unchanged in full. Activity sends/edits use plain text
+without parse_mode; JSON.stringify handles transport escaping, so apostrophes,
+quotes, Markdown and redaction markers are ordinary text. Missing or malformed
+audit evidence falls back to the established bounded tool name, never raw tool
+arguments. Persisted identifiers/types are checked against the owner's actual
+packed contract.
 
 Native CLIs/archive helpers import no Pi runtime values. The extension supplies
 Pi's CONFIG_DIR_NAME; the menu CLI defaults to .pi with an explicit override.
