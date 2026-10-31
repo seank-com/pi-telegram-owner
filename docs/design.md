@@ -7,8 +7,8 @@ work through its queue endpoint; see [Group chat](#group-chat) and
 classifies every update before advancing its cursor, serializes work and records
 outcomes in its forward-only JSONL journal. Restart recovery reconciles accepted
 input, dispatched jobs, replies, commands, photos and transient activity without
-resending uncertain outcomes. Source evidence is retained; extraction changes no
-journal, cursor, archive or importer schema identifier.
+resending uncertain outcomes. Source evidence is retained. Work lifecycle
+transitions append records without rewriting messages, journal history or cursors.
 
 Canonical Markdown is authoritative. The projector joins exact Telegram text
 segments by owner, conversation and timestamp, preserves individual membership
@@ -96,7 +96,8 @@ and `firstPi.matchKind` are required. Both semantic Markdown and raw-source
 matching remain supported; omitting the match mode or session list is invalid.
 No former names or boundary versions are accepted. Reports and checkpoints also
 start at v1 in this namespace, retaining the current plan-binding and restart
-semantics. Source evidence, transport journal formats and cursors are unchanged.
+semantics. Group work lifecycle metadata is separate from archive/importer schema
+identity; adding lifecycle records never rewrites source evidence or cursors.
 Existing export files can be reused for a fresh import with regenerated controls
 and a separate output archive; see [setup](setup.md).
 
@@ -114,10 +115,12 @@ a queued item is running. The extension cannot authenticate who typed it, so it
 carries no envelope and no channel authority; the agent judges it as it would
 without this extension.
 
-Output routing is mechanical. A turn's final reply goes only to the
+Output routing is mechanical. A task's terminal reply goes only to the
 destination pinned in its envelope: a private item answers in the private
-chat, a group item answers in the group as a Telegram reply to the message
-that started it. Sharing one session never mirrors a private answer into the
+chat, a group request answers its requester in the group. A model turn is not
+itself a task completion: a task can wait for delegated work across several
+turns, and an informational turn can finish without a reply. Only a durable
+waiting task restores an earlier destination when a dependency returns. Sharing one session never mirrors a private answer into the
 group or a group answer into the private chat. Discretion about what belongs in
 a reply to a visible audience is the agent's judgment, exercised the way it
 would when writing to anyone else. Context is not hidden from the session
@@ -136,7 +139,10 @@ Authority follows the authenticated sender, never message text:
 
 The queue has two tiers. Owner-authority items run before peer items; items
 are first in, first out within a tier. An active turn is never interrupted.
-Context-only group messages are not queued.
+Context-only group messages are not queued. Waiting tasks do not occupy the
+execution slot or prevent other queued work from running. A resumed task keeps
+its original authority and destination; the peer supplying a dependency result
+does not acquire the authority of the waiting task.
 
 An agent is idle when no turn is running, nothing is queued, and no owner
 message is being collected in the quiet window. Idle is the condition for
@@ -146,23 +152,35 @@ claims, so nothing else can start between the claim and the turn.
 ## Activity and queued notices
 
 When an item is accepted while the agent is busy, the agent immediately sends
-a short queued notice as a Telegram reply to the message that delivered it, so
-the sender can see it was received. This applies to owner messages in the
-private chat and the group, and to peer requests in the group, where the
-owner can see the request arrived. When the item starts, the same message is
-edited into the activity display (`Thinking (NN%)` and tool intents). Activity
-messages are Telegram replies to the message being worked on, in both the
-private chat and the group, so concurrent work is attributable. Work on another
-agent's message cannot be a Telegram reply, so its queued notice and activity
-start with a line naming it instead, such as "RE: Agent B: Can you check…". Queue endpoint
-items show activity in their reply destination, when they have one. Queued
-notices and activity are transient: they are not recorded in either archive
-and never wake another agent.
+a short queued notice in that agent's private owner chat. When the item starts,
+the same private message is edited into the activity display (`Thinking (NN%)`
+and tool intents). This private-only destination also applies to work whose
+final reply goes to the group, and to queue endpoint work with a reply target.
+Items with no reply target do not create activity. Typing remains private.
 
-The final reply is sent and its Telegram acceptance is recorded before the
-activity message is deleted. If the final send fails or is uncertain, the
-activity message is edited into a short failure notice and kept. A failed
-activity deletion never invalidates an accepted final.
+Private-chat work can anchor activity to its private input. Group message IDs
+are never used as reply anchors in the private chat. Group work is labeled
+"Group chat", or names the peer request with a line such as "RE: Agent B: Can
+you check…". Actual Request/Reply/Notify messages and terminal answers retain
+their intended destinations; only ephemeral status is private. Queued notices
+and activity are transient: they are not recorded in either archive and never
+wake another agent.
+
+Activity receipts include their destination, so cleanup does not confuse equal
+message IDs in different chats. Retained unscoped activity receipts resolve to
+the original reply-target chat. Recovery cleans those historical messages in
+that chat rather than editing or deleting a same-numbered private message.
+
+A terminal reply is sent and its Telegram acceptance is recorded before the
+activity message is deleted. If that send fails or is uncertain, the activity
+message is edited into a short failure notice and kept. A failed activity
+deletion never invalidates an accepted terminal reply. When a task enters
+waiting, or an informational turn ends without text, activity is removed after
+the corresponding local disposition is durable. Neither needs a placeholder
+answer or an acknowledgment. Interrupted execution also removes its stopped
+activity after the interruption is durable; any pinned failure notice remains
+pending for delivery. A blocked or failed request still requires a visible
+terminal disposition.
 
 ## Archives
 
@@ -180,6 +198,29 @@ Queue endpoint instructions are recorded in the agent's transport journal.
 They are not Telegram messages, so neither archive holds them. Turns started by
 group or queue endpoint items carry their own session marker, and the private
 projector treats them as turn boundaries, never as private-chat turns.
+
+Projection validates persisted Pi text against its journal identity. Historical
+work items without lifecycle metadata may use the exact pre-lifecycle envelope
+without a Task header. The historical envelope is reconstructed from logical
+fields, preserving multiline sender/context values; task bodies and the rest of
+the envelope still match exactly. This compatibility does not rewrite canonical session entries or relax
+validation for arbitrary changed content.
+
+Interruption notices and canonical bridge-rendered turn-failure notices are
+transport-generated local responses, not the model's partial or empty assistant
+entry. A `task_output` lifecycle receipt between `interrupted`/`turn_failed` and
+`reply_ready` does not change that provenance. A failure notice must exactly match
+the bridge's renderer for the preceding failure code. Lifecycle metadata alone,
+a failure/interruption after the reply, or evidence before a later dispatch does
+not exempt a changed Pi answer from validation.
+
+Normal session-start and delivery-maintenance reconciliation can recover a
+projection backlog from the supplied persisted session and transport journal.
+Replaying reconciliation preserves existing notes and source history, appends
+projection receipts, and is idempotent. Index refresh follows newly projected
+notes; rebuilding an index cannot replace missing projection. Preserve source
+sessions, journals and archive manifests during repair: do not delete records,
+edit old prompts, reset the conversation, or clear queues to bypass an error.
 
 ## Group chat
 
@@ -224,15 +265,17 @@ journal and the queue endpoint:
    final reply of a group turn. A message Telegram must split into several
    parts is recorded as one journal entry listing every part's message ID.
 2. When Telegram accepts the message, the agent appends it to the shared
-   journal with its reply target, and records a pending wake-up for each agent
-   it addresses.
+   journal with its threading and work metadata, and records pending wake-ups
+   for its semantic recipients. Request obligations are established separately
+   from transport delivery.
 3. It posts each wake-up to that agent's queue endpoint, naming the journal
    entry, and retries with backoff until the recipient answers `202`. Pending
    wake-ups survive the sender's restart. A recipient that is down receives
    its work when it returns.
 4. The recipient reads the message from the shared journal, checks that it is
    from a configured agent in the configured group and addresses the
-   recipient, and durably queues it before answering `202`.
+   recipient, and durably records its admission or context-only disposition
+   before answering `202`. This acknowledges delivery, not task completion.
 
 Uncertain group sends follow the private rule: they are recorded in the
 sending agent's transport journal and never resent automatically. Startup
@@ -307,73 +350,198 @@ shared journal, when the group store is available.
 
 ### Routing
 
-Routing matches `@username` mentions, text mentions and reply targets against
-configured usernames and numeric bot IDs. For the owner's messages it uses
-Telegram's mention entities; for agent posts, which other bots never receive,
-it finds `@username` in the text as Telegram does. Names without `@`, such as
-an agent's display name, do not route.
+Owner routing matches Telegram mention entities and reply targets against
+configured usernames and numeric bot IDs. Names without `@`, such as an agent's
+display name, do not route. Agent posts use their explicit work kind and
+recipient metadata instead: quoted text, mentions in prose and Telegram
+threading never create or close an obligation.
 
 Consecutive owner messages within the quiet window are one item, as in the
 private chat, so a long message Telegram split into parts routes once. The
-item routes by the mentions and reply target of all its messages.
+item routes by the mentions and reply target of all its messages. An owner
+item is work for every agent it mentions or whose message it answers. Each
+handles it independently. An owner item that addresses no agent goes to election.
 
-An owner item is work for an agent when it mentions that agent or replies to
-one of its messages. It may address several agents; each handles it
-independently. An owner item that addresses no agent goes to election.
+A peer Request queues work only for its recorded recipients. A Reply goes only
+to the recorded requester; it resumes a matching waiting task or starts an
+informational turn if no such task is waiting. A Notify queues an informational
+turn only for its explicit recipients. A Notify without recipients is context
+for the room and wakes nobody. A threading target never adds a recipient.
 
-A peer request is work for an agent when it mentions that agent or replies to
-a request that agent sent with `telegram_group_send`. A peer answer is work
-only for the agent whose request it answers, even when it mentions others. All
-other agent messages are context: they are in the shared journal and timeline, but nobody is woken.
-When a turn starts, its envelope says how many group entries arrived since the
-agent's previous group turn, so the agent can read the timeline if it needs the
-context.
+Every turn's envelope identifies whether it carries a request obligation, a
+dependency result or information only. It includes the request/chain identity,
+relevant terminal dispositions and pending dependencies, and the original task
+context needed for a resumption. Private origin text and destination stay in the
+requester's local journal, not in peer-visible work metadata. The envelope also
+reports group entries since the previous group turn, so the agent can retrieve
+more with `telegram_group_timeline` or `telegram_timeline`.
 
-### Requests and answers
+### Request, Reply and Notify
 
-A message sent with `telegram_group_send` is a request. Any other message an
-agent posts in the group is an answer. The journal records each request with
-the work item that was active when it was sent: the origin.
+`telegram_group_send` has an object-root parameter schema with explicitly
+object-typed conditional branches. Kind-specific required and forbidden fields
+remain enforced; provider compatibility does not relax recipient routing or
+request/reply correlation.
 
-Telegram does not let one bot reply to another bot's message. When an agent
-answers or replies to another agent's message, it posts without a Telegram
-reply: the message starts with a quote of the first line of the message it
-answers, then the other agent's `@username`. The shared journal records the
-reply link as usual, so routing is unaffected; the quote and mention are how
-the owner sees the link in Telegram and in an export.
+Group work uses three explicit kinds:
 
-A request wakes the agents it addresses, and the final reply of the turn it
-starts answers it. A reply to a request always wakes the agent that asked. That
-answer turn runs with the origin's reply destination, not the group. If the
-owner asked an agent something privately and that agent consulted a peer, the
-peer's answer wakes the asking agent, and its final reply goes back to the
-owner in the private chat. If the origin was itself a peer's request, the
-final reply answers that peer, which wakes the peer in turn. Work is therefore
-handed back up the chain until it reaches whoever started it.
+| Kind | Effect |
+| --- | --- |
+| Request | Creates one terminal-reply obligation for each addressed recipient. |
+| Reply | Supplies a terminal disposition for the replying recipient's obligation on the identified request. It creates no acknowledgment obligation. |
+| Notify | Supplies information without creating or completing a request obligation. |
 
-The answer turn's envelope carries the request text, the origin's sender and
-destination, and the journal or private-chat message IDs of both. The agent can
-read more with `telegram_group_timeline` or `telegram_timeline`, so resuming
-does not depend on what remains in the session after compaction or `/new`.
+The sender records the kind and correlation metadata before sending. Each
+Request has an opaque `requestId`, generated once and retained across recovery,
+the authenticated requester, and a nonempty set of configured recipient bot IDs.
+An obligation is identified by `(requestId, recipientBotId)`; one recipient's
+Reply cannot close another's obligation. Group identity scopes all references.
+The tool resolves explicit recipient accounts to configured bot IDs before
+sending; unknown recipients and attempts to answer another agent's obligation
+fail before publication. New Request bodies prepend any missing recipient
+@mentions, preserving existing case-insensitive mentions and the supplied text.
+Both the send plan and published group text include those mentions. Routing
+still uses the explicit recipient metadata: additional names mentioned in prose
+are not recipients. Replies and notifications do not gain automatic mentions.
+Recovery of an already accepted historical send never republishes it just to
+add a mention.
 
-An answer never starts a new request. Two agents can keep a conversation going
-only by deliberately sending requests, and each request is visible in the
-group. A `telegram_group_send` that replies to the peer message the current turn is
-answering, such as a clarifying question, is that turn's response: its final
-reply is not posted, so the peer is not woken twice. A clarifying question sent
-with `telegram_group_send` as a reply to a request is itself a request: it wakes the asker, whose reply answers the
-question, and the original request is still answered by the turn it started. A
-request made with no active work item, such as from local interactive input,
-has no origin; its answer turn replies in the group. When an agent sends
-several requests from one item, each answer wakes it separately, and each
-answer turn replies to the origin, saying what is still outstanding when it is
-not yet complete.
+A Reply identifies its request and has one of four terminal dispositions:
+`completed`, `failed`, `blocked`, or `cancelled`. The text supplies the result or
+reason. Sender identity comes from the journal and verified roster, not a name
+in the message. Reply correlation does not depend on a Telegram reply anchor.
+A disposition becomes effective when the accepted post and its work metadata
+are durably recorded; a send attempt or queue endpoint `202` is not completion.
 
-`/new` in the private chat ends the agent's queued group and queue endpoint
-items. Each ended group item gets a reply saying the owner reset the agent's
-session; that reply answers the item, so a requesting agent is woken and can
-tell its own origin. Requests the agent was waiting on are closed. Their later
-answers are recorded as context and wake nobody.
+A distinct later Reply to a completed obligation remains source evidence and
+is delivered as an informational update, not a second completion or a request
+to acknowledge. This preserves substantive late corrections. An explicit
+addressed Notify can also carry a correction. Delivery retries of the same
+message are idempotent and never become additional informational turns. Text
+similarity, latest-message-wins rules and blanket first-reply suppression do
+not decide lifecycle or discard messages.
+
+`replyToMessageId` controls presentation and context only. Telegram does not let
+one bot reply to another bot's message. Such posts use a quote of the first
+line and the other agent's `@username`; the shared journal retains the logical
+threading link. Neither a quote nor a successful Telegram anchor changes kind,
+recipients or request correlation.
+
+### Tasks, delegation and completion
+
+A task has a stable local identity, authenticated authority, pinned destination
+and durable state separate from the current model turn: `executing`, `waiting`,
+or `completed`. A queued task has not yet entered execution. Completed tasks
+retain their outcome; receiving more context cannot make them waiting again.
+Terminal disposition is separate from success: failed, blocked and cancelled
+tasks are also completed.
+
+A Request sent during an active task records a local dependency on that task.
+The first Request in a delegation chain uses its `requestId` as `chainId`.
+Requests made while handling that chain inherit its `chainId` and identify the
+active group request as `parentRequestId`, when there is one. Private and queue
+endpoint origins are linked only in the sender's transport journal. These
+relationships survive compaction and restart and are not inferred from prose
+or the Telegram threading target. A Request sent without an active task has
+no local parent; its results are informational rather than owner-task resumptions.
+Sending a Request after the active task's terminal Reply starts independent work;
+it does not attach a new dependency to or reopen the completed task.
+
+When a turn has accepted child Requests but has not supplied a terminal result,
+its task enters `waiting` and releases the execution slot. A normal final text
+at this boundary is progress, not completion: for a peer task it is an
+unaddressed Notify, and for an owner task it goes only to the pinned owner
+destination. A normal empty final at this boundary is allowed. The bridge does
+not invent repeated waiting acknowledgments. Posting Notify alone does not
+satisfy an unanswered Request or put it into waiting.
+
+Each durably admitted child Reply updates only that child's recipient
+obligation and makes its result pending for the parent. If the parent is still
+executing, that result waits for a continuation after the turn; it cannot be
+missed in the transition to waiting or cause concurrent execution. Several
+replies arriving before that continuation runs share the pending continuation;
+none of their evidence is lost. Receipt alone does not mean the parent has
+consumed a result: it remains unfinished until presented in a continuation.
+A running turn is never interrupted. A continuation
+can wait again for remaining dependencies, or return the parent's terminal
+result. A normal final text with no pending dependencies or unconsumed results
+completes the active
+task; for a peer Request the bridge publishes a correlated `completed` Reply.
+An explicit Reply through the tool can complete that recipient's active task
+earlier, even when children remain pending. Its accepted terminal disposition
+suppresses a redundant automatic final only for the task whose obligation it
+completed, not a different task active in the same turn. Later child results are
+informational and cannot reopen it.
+
+A child Reply is not copied automatically to the parent's audience. The
+requester evaluates it and decides what belongs in the parent result. A
+private owner consultation therefore returns to the original private task,
+not to the group, only while that task is waiting. Resuming a peer task likewise
+retains its original requester and obligation. Receiving a Reply for a completed
+parent never mechanically unwinds to an older origin.
+
+An informational turn has no reply obligation and no restored parent
+destination. It may finish normally without text or an acknowledgment; this
+is not a model-produced-no-reply failure. Optional normal final text is an
+unaddressed Notify in the group, so it does not wake the sender merely because
+it answers or mentions them. Asking someone to act requires a new explicit
+Request. Supplying an update to a particular agent requires an addressed Notify.
+
+### Dependency scheduling and blocked work
+
+An outstanding obligation is not a lock on the agent. Owner/peer priority and
+FIFO ordering remain unchanged, and only one model turn executes at a time.
+A waiting task does not prevent admission or execution of another Request,
+including dependency work in its own chain. A -> B -> C -> A can therefore
+progress when C needs an independent fact or action from A. Chain membership
+alone is neither permission for concurrent turns nor a reason to reject work.
+
+A logical result dependency is different: if C's answer actually requires an
+unfinished ancestor's result, scheduling cannot resolve it. The envelope makes
+that dependency context available; the agent returns a `blocked` Reply naming
+the unresolved dependency for requester/owner coordination. It does not silently
+wait for a result that requires its own answer. No timeout, extra model worker
+or unrestricted reentrancy is used to conceal a circular dependency.
+
+### Durable state and compatibility
+
+Versioned work metadata on shared agent posts carries kind, request identity,
+recipient identities, reply disposition and parent/chain identity as applicable.
+The shared journal preserves the messages and terminal evidence. The local
+transport journal records task state transitions, dependencies, admission,
+continuation scheduling and dispositions. Task completion and replay decisions
+come from durable records, not the presence of an active Pi turn.
+
+Readers retain support for historical request/answer posting records and records
+without work metadata. A legacy request's chat/message identity provides a
+stable namespaced request identity; a legacy answer correlates only through an
+exact recorded request target and verified recipient identity. Historical
+mentions are not reinterpreted with the new explicit-recipient rules. Imported
+messages without authoritative live work metadata remain history, not newly
+admitted Requests. Normalized lifecycle records append without editing source
+messages or synthesizing a Telegram acceptance.
+
+Only a recorded waiting task can resume. An older origin pointer without a
+waiting transition is context, not evidence that a completed task should reopen.
+A late answer can still arrive as information. Ambiguous or conflicting lifecycle
+evidence is retained and diagnosed instead of guessed into new work.
+
+Agents exchange group lifecycle protocol version 1 with their roster check.
+Group sends remain disabled until compatibility is established, including while
+peer negotiation is pending. Missing or incompatible support pauses group work with a diagnostic rather than
+sending new work semantics to an incompatible agent. Private transport remains
+available. Shared history is still readable without routing it through an older
+work classifier.
+
+`/new` cancels queued and waiting tasks from the private owner chat, group and
+queue endpoint through durable explicit transitions. This includes a private
+owner assignment waiting for a peer consultation. Each incoming Request
+obligation gets a visible `cancelled` Reply; owner work keeps its pinned reset
+disposition. Outbound dependencies are marked locally abandoned, not falsely
+completed on behalf of remote recipients. This local abandonment does not claim
+to cancel remote execution. Later dependency results remain recorded context and
+do not wake or resume the reset task, including the pre-reset private assignment.
+A new explicit Request or addressed Notify is still new work, not a stale delivery.
 
 ### Election
 
@@ -398,21 +566,43 @@ whoever is free:
 The elected agent's envelope says it was chosen because the message did not
 @mention anyone, and that if the message asks for everyone or implies it, the
 agent answers for itself and then asks the others, named by their usernames,
-with `telegram_group_send` replying to the owner's message. Each recipient's
-envelope then includes the original request.
+with `telegram_group_send` using `kind: "request"`, explicit recipients, and
+threading to the owner's message. Each recipient's envelope then includes the
+original request.
 
 Election ranks depend on every agent having the same roster and
-`electionStepMs`. Agents exchange a roster check through their coordination
-endpoints whenever their membership becomes verified. A mismatch pauses group
+`electionStepMs` and a compatible group lifecycle protocol. Agents exchange a
+roster check through their coordination endpoints whenever their membership
+becomes verified. A mismatch pauses group
 behavior on the agents that detect it and is reported in the private chat;
 correct the configuration and restart the affected agents.
 
 ### Tools
 
-- `telegram_group_send`: posts a request to the group, optionally as a reply
-  to a journaled message. Mentions in the text are Telegram mentions and route
-  as described above. The request records the active work item as its origin.
-  It returns the journaled message ID.
+- `telegram_group_send`: posts one explicit Request, Reply or Notify. `kind`
+  and nonempty `text` are required; omitting kind is invalid rather than an
+  implicit Request. Its input is a discriminated union:
+  - Request: `{ kind: "request", text, recipients, replyToMessageId? }`.
+    `recipients` is a nonempty array of configured peer `@username` accounts. The bridge
+    captures the active local task and parent/chain relationship; callers do
+    not supply or override another task's origin.
+  - Reply: `{ kind: "reply", text, requestId, disposition?, replyToMessageId? }`.
+    `disposition` defaults to `completed` and also accepts `failed`, `blocked`,
+    or `cancelled`. Only the current agent's recorded recipient obligation is
+    affected; recipients are determined by the request, not supplied here.
+  - Notify: `{ kind: "notify", text, recipients?, replyToMessageId? }`.
+    Omitted recipients means room context with no wake-up. An explicit recipient
+    list delivers information without a terminal-reply obligation.
+  Fields belonging to another kind are rejected. Recipient accounts resolve
+  against the verified roster, not free-form mentions. Every result identifies
+  its kind and journaled message ID; a Request also returns `requestId` and
+  `chainId`, and a Reply returns its `requestId` and disposition. Results report
+  publication/admission, not completion of work requested from another agent.
+  Envelopes and timeline results expose correlation metadata for replying to a
+  request other than the active one. A tool Reply closes its identified
+  obligation, not every obligation on the active chain. Completing an older
+  request A while handling request B does not discharge B or suppress B's
+  empty-output or model-failure disposition.
 - `telegram_group_timeline`: bounded chronological reads of the shared journal,
   before or after a message.
 - `telegram_group_recall`: datastore search over the group store.
@@ -424,31 +614,52 @@ work continues.
 
 ### Failure and recovery
 
-Every piece of routed group work ends with a visible disposition: a final
-reply, or a reply saying the work failed with a short static reason. The same
-rule applies to private and queue endpoint work in their own destinations. A
-final counts only when the model stopped normally with text; a model error, an
-empty reply, or output cut off by a length limit or an abort is reported as a
-failure, never posted as an answer. A turn that sent a group request and ended
-without text is not a failure: the first such turn for a destination gets a
-short note naming who was asked, later ones in the same exchange post nothing,
-and the answer follows as a new turn. A reply that posted nothing is not
-archived. Failures are not retried
-automatically. The owner or requesting agent decides whether to ask again.
-Diagnostic codes and detail are recorded in the agent's transport journal and
-shown by `/status` in the private chat. Startup recovery uses the same
-distinctions as the private bridge: received, queued, claimed, started,
-send-planned, accepted or uncertain. Work that was started is not replayed.
+Every Request obligation ends with a visible terminal disposition, or remains
+explicitly waiting or delivery-uncertain. Owner and endpoint tasks keep their
+own pinned destinations. A normal empty turn is valid after an accepted tool
+Reply completes the active task's obligation, while waiting for that task's
+accepted child Requests, or when processing information with no reply obligation.
+None of these cases posts a model-failure notice. An unanswered Request with no
+pending dependency cannot disappear silently: an empty turn in that case produces
+a correlated `failed` Reply with a short static reason. Model errors, length-limit
+stops and aborts are failures, not successful answers. If a tool Reply already
+completed an obligation, a later model failure does not send another terminal
+reply for that completed obligation; it is diagnosed locally. Any different
+active task still receives its own applicable failure disposition. In particular,
+replying to older request A while handling request B does not excuse an empty
+turn or model error on B. An explicit `blocked` Reply reports a dependency
+problem, not a delivery retry.
+
+Failures are not automatically retried as work. Existing transport retries
+remain delivery retries of the same accepted message. Diagnostic codes and
+detail are recorded locally and shown by `/status`; optional informational
+output never creates a requirement to acknowledge a diagnostic.
+
+Startup recovery reconciles received, queued, claimed, executing, waiting,
+completed, send-planned, accepted and uncertain states from the forward-only
+journals. Startup and delivery maintenance reconcile recorded terminal delivery
+receipts into local task completion without sending again; a progress receipt
+does not complete its waiting parent. An executing model turn interrupted by
+restart is not replayed as though it never ran; it receives the existing interrupted-work disposition.
+A waiting task, in contrast, remains resumable when a new dependency result
+arrives. Recovery completes an accepted post's metadata and wake-ups without
+sending Telegram text again, and never closes an obligation on an uncertain
+send. An accepted tool Reply awaiting publication or local completion recovery
+suppresses duplicate automatic output without declaring that recovery complete.
+The task remains delivery-pending until its terminal metadata is reconciled. Duplicate admissions, terminal records and continuation scheduling are
+idempotent by identity. No recovery step edits source history, clears queues,
+reclassifies old acknowledgments as fresh Requests, or resends uncertain posts.
 
 ## Queue endpoint
 
 Each configured agent listens on `127.0.0.1:<queuePort>`. The endpoint has no
 token: it is reachable only from the local host, and the operating-system
 account that runs the agents is their security boundary. Requests and
-responses are JSON. `202` means the item was durably recorded in the agent's
-transport journal, or, for an answer to a request closed by `/new`, that it
-needs no work; senders retry until they receive it. Calls between agents have
-no deadline, so a slow agent is waited for, and each peer is called on its own
+responses are JSON. `202` means delivery was durably admitted or recorded as
+needing no work, such as a duplicate or a result for a locally abandoned
+dependency. It never means a Request has completed. Senders retry delivery until
+they receive it. Calls between agents have no deadline, so a slow agent is
+waited for, and each peer is called on its own
 so a stalled one holds up nothing else. An agent whose endpoint refuses
 connections, because it is not running or its port is wrong, is reported once in
 the private chat while delivery keeps retrying.
@@ -464,11 +675,15 @@ the private chat while delivery keeps retrying.
 - `POST /coordinate` carries coordination between agents:
   - `{"kind": "claimed", "messageId": N, "agent": "username"}`: the receiver
     confirms the claim in the shared journal before acting on it.
-  - `{"kind": "roster", "agent": "username", "roster": "fingerprint"}`: the
-    fingerprint covers the group, owner, every agent's bot ID and the election
-    step. The receiver answers with its own fingerprint and whether they match.
+  - `{"kind": "roster", "agent": "username", "roster": "fingerprint",
+    "groupLifecycleVersion": 1}`: the fingerprint covers the group, owner,
+    every agent's bot ID and the election step. The receiver answers with its
+    own fingerprint, lifecycle version and whether both are compatible.
 - `GET /status` returns `idle` or `busy`, queue depth by tier, and whether the
-  group is verified.
+  group is verified. It also reports local task identities, execution/waiting
+  state, pending request/recipient identities and terminal dispositions without
+  including task text or private destination details. `idle` describes the
+  execution queue, not the absence of waiting obligations.
 
 The endpoint starts with the transport and stops on shutdown. A port that
 cannot be bound disables the endpoint with a diagnostic and leaves the

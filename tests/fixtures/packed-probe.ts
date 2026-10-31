@@ -17,6 +17,25 @@ const noopCtx={ui:{setStatus(){}},sessionManager:{getBranch:()=>[],getSessionId:
 for(const handler of inactive.extensions[0].handlers.get("session_start")??[])await handler({reason:"startup"},noopCtx);
 assert.equal(existsSync(join(project,".pi/telegram-owner")),false);
 for(const handler of inactive.extensions[0].handlers.get("session_shutdown")??[])await handler({reason:"fixture"},noopCtx);
+// Exercise the public projector export with interruption/model failure,
+// lifecycle metadata and a later private turn, never live source data.
+for (const failure of [false,true]) {
+ const {TelegramMarkdownProjector}=await import('@seank/pi-telegram-owner/markdown-projector');
+ const root=join(project,`packed-stop-archive-${failure}`),sessions=join(project,`packed-stop-sessions-${failure}`);await mkdir(sessions,{mode:0o700});
+ const stamp='2026-09-22T01:00:00.000Z';
+ const msg=(id:string,parentId:string|null,role:string,content:any)=>({type:'message',id,parentId,timestamp:stamp,message:{role,content,timestamp:Date.parse(stamp),...(role==='assistant'?{stopReason:id==='a1'?(failure?'error':'aborted'):'stop'}:{})}});
+ const entries=[msg('u1',null,'user','[telegram-job:stop-packed]\nCompute.'),msg('a1','u1','assistant',failure?[]:[{type:'thinking',thinking:'Synthetic placeholder only.'}]),msg('u2','a1','user','[telegram-job:later-packed]\nLater.'),msg('a2','u2','assistant',[{type:'text',text:'Later answer.'}])];
+ const file=join(sessions,'session.jsonl');await writeFile(file,[{type:'session',version:3,id:'packed-stop',timestamp:stamp,cwd:project},...entries].map(x=>JSON.stringify(x)).join('\n')+'\n',{mode:0o600});const source=await readFile(file);
+ const update=(jobId:string,text:string,id:number)=>({type:'update',schemaVersion:2,disposition:'accepted',updateId:id,jobId,text,rawText:text,messageId:id,chatId:70,userId:7,timestamp:stamp});
+ const notice=failure?"Couldn't finish this: the model request failed.":'Stopped by /stop.';
+ const terminal=failure?{type:'turn_failed',jobId:'stop-packed',code:'MODEL_ERROR',timestamp:stamp}:{type:'interrupted',jobId:'stop-packed',reason:'Stopped by Telegram owner command'};
+ const journal:any[]=[update('stop-packed','Compute.',1),{type:'dispatched',jobId:'stop-packed',sessionId:'packed-stop'},terminal,{type:'task_output',taskId:'stop-packed',jobId:'stop-packed',mode:'terminal',disposition:'failed',timestamp:stamp},{type:'reply_ready',jobId:'stop-packed',text:notice},{type:'reply_sent',jobId:'stop-packed',messageIds:['11']},update('later-packed','Later.',2),{type:'dispatched',jobId:'later-packed',sessionId:'packed-stop'},{type:'reply_ready',jobId:'later-packed',text:'Later answer.'},{type:'reply_sent',jobId:'later-packed',messageIds:['12']}];
+ const session:any={getSessionId:()=> 'packed-stop',getSessionFile:()=>file,getBranch:()=>entries};const append=async(r:any)=>{journal.push(r);};
+ const projector=new TelegramMarkdownProjector({enabled:true,root,sessionRoot:sessions,rootId:'packed-fixture'});
+ assert.deepEqual(await projector.reconcile(journal,session,append),{projected:4,unchanged:0,deferred:0});
+ assert.deepEqual(await projector.reconcile(journal,session,append),{projected:0,unchanged:4,deferred:0});assert.deepEqual(await readFile(file),source);
+ const timeline=await projector.timeline({operation:'recent',limit:10});assert.equal(timeline.messages!.length,4);assert.equal(timeline.messages!.find(m=>m.content===notice)?.messageId,'tgmsg:v1:telegram-job:stop-packed:local-response');assert.equal(timeline.messages!.some(m=>m.messageId==='tgmsg:v1:pi:packed-stop:a1'),false);
+}
 const wrapper=join(project,"wrapper.ts");
 await writeFile(wrapper,`import {createTelegramOwnerExtension} from ${JSON.stringify(pathToFileURL(entry).href)};import {MemoryJournal} from ${JSON.stringify(pathToFileURL(join(packageRoot,"dist/core.js")).href)};import {TelegramMarkdownProjector} from ${JSON.stringify(pathToFileURL(join(packageRoot,"dist/markdown-projector.js")).href)};export default function(pi){globalThis.fixtureApi=pi;createTelegramOwnerExtension({projectRoot:process.cwd(),datastore:globalThis.fixturePolicy,projectionRefreshDebounceMs:5,dependencies:{journal:new MemoryJournal(),ownerUserId:7,privateChatId:70,agentLabel:'Fixture agent',markdownProjector:new TelegramMarkdownProjector({enabled:true,root:process.cwd(),rootId:'fixture'}),source:{async start(callback){globalThis.fixtureBatch=callback;return async()=>{globalThis.fixtureBatch=undefined;};}},async sendReply(text){globalThis.fixtureReplies.push(text);return '1';}}})(pi);}`);
 async function start(paths:string[],policy:any){

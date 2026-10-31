@@ -1,3 +1,4 @@
+import { taskResultContext, validObligation, validateTaskRecords, type Disposition, type GroupWork, type Obligation, type TaskRecord } from "./work.ts";
 import { mkdir, open, readFile, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -81,18 +82,19 @@ export type GroupUpdatePayload =
 /** Agent-local progress for group work. These records never affect the private queue. */
 export type GroupProgressRecord =
 	| { type: "group_handled"; updateId: number; stage: "published" | "routed"; timestamp: string }
-	| { type: "group_send_planned"; sendId: string; text: string; replyToMessageId?: number; originJobId?: string; timestamp: string }
+	| { type: "group_send_planned"; sendId: string; text: string; replyToMessageId?: number; originJobId?: string; work?: GroupWork; timestamp: string }
 	| { type: "group_send_accepted"; sendId: string; messageIds: number[]; date: number; timestamp: string }
 	| { type: "group_post_recorded"; postId: string; messageId: number; timestamp: string }
 	| { type: "group_wake"; messageId: number; peer: string; timestamp: string }
 	| { type: "group_wake_done"; messageId: number; peer: string; outcome: "accepted" | "rejected"; timestamp: string }
 	/** /new closes requests this agent was waiting on; later answers become context. */
-	| { type: "group_requests_closed"; timestamp: string }
+	| { type: "group_requests_closed"; requestIds?:string[]; timestamp: string }
 	/** An unaddressed owner item this agent may claim in an election. */
 	| { type: "group_candidate"; firstMessageId: number; messageIds: number[]; timestamp: string }
 	| { type: "group_candidate_done"; firstMessageId: number; outcome: "claimed" | "lost"; timestamp: string }
 	/** The latest group message an admitted group item brought into this agent's session. */
-	| { type: "group_seen"; messageId: number; timestamp: string };
+	| { type: "group_seen"; messageId: number; timestamp: string }
+	| { type: 'group_context_recorded'; messageId:number; timestamp:string };
 
 export interface FetchLike {
 	(input: string, init: { method: string; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal }): Promise<{
@@ -171,7 +173,11 @@ export type ReplyDestination =
 /** Non-private work admitted to the queue: group messages and queue endpoint items. */
 export interface WorkItem {
 	itemId: string;
-	channel: "group" | "endpoint";
+	/** Stable local parent on a continuation; never published to peers. */
+	taskId?: string;
+	obligation?: Obligation;
+	information?: boolean;
+	channel: "group" | "endpoint" | "private";
 	authority: "owner" | "peer";
 	/** Display name of the authenticated sender, or the endpoint caller's source label. */
 	sender: string;
@@ -209,6 +215,7 @@ export interface TurnOutcome {
 }
 
 export type JournalRecord =
+	| TaskRecord
 	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
 	| { type: "turn_failed"; jobId: string; code: TurnFailureCode; detail?: string; timestamp: string }
 	/** The turn responded with a telegram_group_send request replying to its own message; its final reply is not posted. */
@@ -250,8 +257,8 @@ export type JournalRecord =
 	| { type: "projection_needed"; jobId: string; direction: "in" | "out"; reason: "content" | "metadata"; canonical: { kind: "pi"; sessionId: string; entryId: string } | { kind: "local-response" }; timestamp: string }
 	| { type: "projection_committed"; jobId: string; direction: "in" | "out"; messageId: string; contentRevision: number; contentSha256: string; metadataRevision: number; metadataSha256: string; timestamp: string }
 	| { type: "projection_deferred"; jobId: string; direction: "in" | "out"; code: string; timestamp: string }
-	| { type: "activity_started"; jobId: string; messageId: string }
-	| { type: "activity_cleared"; jobId: string; messageId: string }
+	| { type: "activity_started"; jobId: string; messageId: string; destination?: "private" | "group" }
+	| { type: "activity_cleared"; jobId: string; messageId: string; destination?: "private" | "group" }
 	| { type: "interrupted"; jobId: string; reason: string };
 
 export interface Job {
@@ -280,7 +287,7 @@ export const WORK_ITEM_MARKER_PREFIX = "[telegram-item:";
 
 /** The model-visible envelope for a non-private work item. */
 export function renderWorkItemPrompt(item: WorkItem): string {
-	const channel = item.channel === "group" ? "group chat" : "queue endpoint";
+	const channel = item.channel === "group" ? "group chat" : item.channel === 'private' ? 'private owner chat' : "queue endpoint";
 	const destination = item.reply.kind === "private"
 		? item.reply.messageId ? `the private chat with the owner, as a reply to message ${item.reply.messageId}` : "the private chat with the owner"
 		: item.reply.kind === "group"
@@ -289,6 +296,8 @@ export function renderWorkItemPrompt(item: WorkItem): string {
 	const lines = [
 		`Channel: ${channel}`,
 		`From: ${item.sender} (${item.authority} authority)`,
+		`Task: ${item.taskId ?? item.itemId}. ${item.information ? 'Information only; no acknowledgment or terminal reply is required.' : 'A normal final completes this task only when no delegated results remain pending.'}`,
+		...(item.obligation ? [`Request obligation: ${item.obligation.requestId}; chain: ${item.obligation.chainId}; recipient: ${item.obligation.recipientBotId}. Use kind reply and this requestId for an explicit terminal result.`] : []),
 		`Your final reply goes to ${destination}.`,
 		...(item.channel === "group" ? ["The owner and every configured agent can read the group chat."] : []),
 		...(item.context ?? []),
@@ -343,10 +352,11 @@ function validQuote(quote: unknown): boolean {
 }
 
 function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>): void {
+	if((record.taskId!==undefined&&(typeof record.taskId!=='string'||!record.taskId))||(record.obligation!==undefined&&!validObligation(record.obligation))||(record.information!==undefined&&typeof record.information!=='boolean'))throw new StateCorruptionError('Work lifecycle metadata is invalid');
 	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
 	const validMessageId = reply?.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0);
 	const validReply = (reply?.kind === "private" && validMessageId) || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)) && validQuote((reply as { quote?: unknown }).quote));
-	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || (record.images !== undefined && (!Array.isArray(record.images) || record.images.some((image) => !/^_attachments\/[0-9a-f]{64}\.(jpg|png|webp)$/.test(image?.path) || !["image/jpeg", "image/png", "image/webp"].includes(image?.mimeType)))) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
+	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint", "private"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || (record.images !== undefined && (!Array.isArray(record.images) || record.images.some((image) => !/^_attachments\/[0-9a-f]{64}\.(jpg|png|webp)$/.test(image?.path) || !["image/jpeg", "image/png", "image/webp"].includes(image?.mimeType)))) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
 }
 
 export class StateCorruptionError extends Error {}
@@ -516,7 +526,21 @@ function validateBatch(record: Extract<JournalRecord, { type: "inbound_batch" }>
 	if (cursor !== record.text.length) throw new StateCorruptionError("Inbound batch boundaries are invalid");
 }
 
+function activityDestination(records: readonly JournalRecord[], record: { jobId: string; destination?: 'private' | 'group' }): 'private' | 'group' {
+	if (record.destination !== undefined) {
+		if (record.destination !== 'private' && record.destination !== 'group') throw new StateCorruptionError('Activity destination is invalid');
+		return record.destination;
+	}
+	// Before private-only activity, transient messages followed the reply target.
+	const item=records.find(r=>r.type==='work_item'&&r.itemId===record.jobId);
+	return item?.type==='work_item'&&item.reply.kind==='group'?'group':'private';
+}
+function activityKey(records: readonly JournalRecord[], record: { jobId: string; messageId: string; destination?: 'private' | 'group' }): string {
+	return `${record.jobId}:${activityDestination(records,record)}:${record.messageId}`;
+}
+
 export function recover(records: JournalRecord[], now = Date.now()): Recovery {
+	validateTaskRecords(records);
 	const updates: Job[] = [];
 	const capturedInboundJobs = new Set(records.filter((record): record is Extract<JournalRecord, { type: "media_captured" }> => record.type === "media_captured" && record.direction === "in").map((record) => record.jobId));
 	const requested = new Set<string>();
@@ -528,6 +552,7 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 	const activities = new Map<string, { jobId: string; messageId: string }>();
 	const batches = new Map<string, Extract<JournalRecord, { type: "inbound_batch" }>>();
 	const items: Job[] = [];
+	const finished = new Set(records.filter(r => r.type === 'turn_finished').map(r => (r as Extract<TaskRecord,{type:'turn_finished'}>).jobId));
 	let cursor: number | undefined;
 	for (const [order, record] of records.entries()) {
 		if (record.type === "work_item") {
@@ -571,8 +596,8 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 		else if (record.type === "command_started") commandsStarted.add(record.jobId);
 		else if (record.type === "reply_ready") ready.set(record.jobId, record.text);
 		else if (record.type === "reply_sent") sent.add(record.jobId);
-		else if (record.type === "activity_started") activities.set(`${record.jobId}:${record.messageId}`, record);
-		else if (record.type === "activity_cleared") activities.delete(`${record.jobId}:${record.messageId}`);
+		else if (record.type === "activity_started") activities.set(activityKey(records,record), record);
+		else if (record.type === "activity_cleared") activities.delete(activityKey(records,record));
 		else if (record.type === "interrupted") interrupted.add(record.jobId);
 	}
 	const memberJobIds = new Set([...batches.values()].flatMap((batch) => batch.memberJobIds));
@@ -586,9 +611,10 @@ export function recover(records: JournalRecord[], now = Date.now()): Recovery {
 	});
 	const batchJobs: Job[] = recoverableBatches.filter((batch) => batch.state !== "open" || new Date(batch.readyAt).valueOf() <= now).map((batch) => ({ jobId: batch.batchId, batchId: batch.batchId, updateId: updateByJobId.get(batch.memberJobIds[0]!)?.updateId ?? 0, messageId: batch.finalMessageId, text: batch.text, images: [], memberJobIds: batch.memberJobIds, messageIds: batch.messageIds, segmentSha256: batch.segmentSha256, boundaries: batch.boundaries, tier: "owner" as const, order: updateByJobId.get(batch.memberJobIds[0]!)?.order ?? 0 }));
 	const tierRank = (job: Job) => (job.tier === "peer" ? 1 : 0);
-	const unsent = [...updates.filter((job) => !memberJobIds.has(job.jobId)), ...batchJobs, ...items].filter((job) => !sent.has(job.jobId) && (job.images.length === 0 || job.captureRequired || capturedInboundJobs.has(job.jobId))).sort((a, b) => tierRank(a) - tierRank(b) || (a.order ?? 0) - (b.order ?? 0));
+	const unsent = [...updates.filter((job) => !memberJobIds.has(job.jobId)), ...batchJobs, ...items].filter((job) => !sent.has(job.jobId) && (!finished.has(job.jobId) || ready.has(job.jobId)) && (job.images.length === 0 || job.captureRequired || capturedInboundJobs.has(job.jobId))).sort((a, b) => tierRank(a) - tierRank(b) || (a.order ?? 0) - (b.order ?? 0));
 	const actionable = unsent.filter((job) => !interrupted.has(job.jobId));
-	const prompts = actionable.filter((job) => !job.command);
+	const retiredTasks=new Set(records.flatMap(r=>(r.type==='task_state'&&r.state==='completed')||r.type==='task_abandoned'?[r.taskId]:[]));
+	const prompts = actionable.filter((job) => !job.command&&!retiredTasks.has(job.item?.taskId??job.jobId));
 	const commands = actionable.filter((job) => job.command);
 	return {
 		cursor,
@@ -656,6 +682,101 @@ export class TelegramOwnerBridge {
 		return this.records.filter((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.disposition === "group" && Boolean(record.group)).map((record) => ({ updateId: record.updateId, payload: record.group! }));
 	}
 
+	taskId(job: Job): string { return job.item?.taskId ?? job.jobId; }
+	taskState(taskId: string): Extract<TaskRecord,{type:'task_state'}> | undefined {
+		return this.records.findLast((r): r is Extract<TaskRecord,{type:'task_state'}> => r.type === 'task_state' && r.taskId === taskId);
+	}
+	private async setTaskState(taskId: string, state: 'executing'|'waiting'|'completed', disposition?: Disposition): Promise<void> {
+		if (this.taskState(taskId)?.state === 'completed') return;
+		await this.append({type:'task_state',taskId,state,...(disposition?{disposition}:{}),timestamp:new Date(this.now()).toISOString()},()=>this.taskState(taskId)?.state!=='completed');
+	}
+	isTaskAbandoned(taskId:string):boolean{return this.records.some(r=>r.type==='task_abandoned'&&r.taskId===taskId);}
+	private rootItem(taskId: string): WorkItem | undefined { return this.itemFor(taskId); }
+	obligationFor(taskId: string): Obligation | undefined { return this.rootItem(taskId)?.obligation; }
+	async completeObligation(requestId: string, recipientBotId: number, disposition: Disposition): Promise<void> {
+		const ids=new Set(this.records.filter((r):r is Extract<JournalRecord,{type:'work_item'}>=>r.type==='work_item'&&r.obligation?.requestId===requestId&&r.obligation.recipientBotId===recipientBotId).map(r=>r.taskId??r.itemId));
+		for(const taskId of ids){
+			await this.setTaskState(taskId,'completed',disposition);
+			for(const job of recover(this.records,this.now()).queued.filter(j=>j.item?.taskId===taskId))await this.append({type:'turn_finished',jobId:job.jobId,mode:'silent',timestamp:new Date(this.now()).toISOString()});
+			await this.reconcileCompletedResults(taskId);
+		}
+	}
+	private async reconcileCompletedResults(taskId:string):Promise<void>{
+		if(this.taskState(taskId)?.state!=='completed'||this.isTaskAbandoned(taskId))return;
+		for(const result of this.pendingResults(taskId)){
+			const origin=this.rootItem(taskId),chatId=origin?.reply.kind==='group'?origin.reply.chatId:this.groupChatId;
+			await this.admitItem({channel:'group',authority:'peer',sender:`configured peer ${result.recipientBotId}`,information:true,text:result.text,reply:chatId?{kind:'group',chatId}:{kind:'none'},itemId:workItemIdForKey('group',`result-info:${taskId}:${result.messageId}`),context:[`Informational result for completed request ${result.requestId}. Do not resume its old destination.`]});
+		}
+	}
+	async addDependency(taskId: string, requestId: string, recipients: number[]): Promise<void> {
+		if (this.taskState(taskId)?.state === 'completed' || this.records.some(r=>r.type==='task_dependency'&&r.taskId===taskId&&r.requestId===requestId)) return;
+		await this.append({type:'task_dependency',taskId,requestId,recipients,timestamp:new Date(this.now()).toISOString()},()=>this.taskState(taskId)?.state!=='completed'&&!this.records.some(r=>r.type==='task_dependency'&&r.taskId===taskId&&r.requestId===requestId));
+	}
+	dependency(requestId: string): Extract<TaskRecord,{type:'task_dependency'}> | undefined {
+		return this.records.find((r):r is Extract<TaskRecord,{type:'task_dependency'}>=>r.type==='task_dependency'&&r.requestId===requestId);
+	}
+	private results(taskId: string): Array<Extract<TaskRecord,{type:'task_result'}>> {
+		return [...new Map(this.records.filter((r):r is Extract<TaskRecord,{type:'task_result'}>=>r.type==='task_result'&&r.taskId===taskId).map(r=>[r.messageId,r])).values()];
+	}
+	pendingResults(taskId: string): Array<Extract<TaskRecord,{type:'task_result'}>> {
+		const consumed = new Set(this.records.filter((r):r is Extract<TaskRecord,{type:'task_presented'}>=>r.type==='task_presented'&&r.taskId===taskId&&this.records.some(d=>d.type==='dispatched'&&d.jobId===r.jobId)).flatMap(r=>r.messageIds));
+		return this.results(taskId).filter(r=>!consumed.has(r.messageId));
+	}
+	private pendingDependencies(taskId: string): Array<{requestId:string;recipientBotId:number}> {
+		return this.records.filter((r):r is Extract<TaskRecord,{type:'task_dependency'}>=>r.type==='task_dependency'&&r.taskId===taskId).flatMap(r=>r.recipients.filter(id=>!this.results(taskId).some(x=>x.requestId===r.requestId&&x.recipientBotId===id)).map(recipientBotId=>({requestId:r.requestId,recipientBotId})));
+	}
+	async receiveResult(input: Omit<Extract<TaskRecord,{type:'task_result'}>,'type'|'timestamp'>): Promise<boolean> {
+		if (this.taskState(input.taskId)?.state==='completed'||this.results(input.taskId).some(r=>r.requestId===input.requestId&&r.recipientBotId===input.recipientBotId)) return false;
+		await this.append({type:'task_result',...input,timestamp:new Date(this.now()).toISOString()});
+		return this.taskState(input.taskId)?.state !== 'completed';
+	}
+	get taskStatus(): Array<{taskId:string;state:string;disposition?:Disposition;pending:Array<{requestId:string;recipientBotId:number}>}> {
+		const ids=new Set(this.records.filter((r):r is Extract<TaskRecord,{type:'task_state'}>=>r.type==='task_state').map(r=>r.taskId));
+		return [...ids].map(taskId=>({taskId,state:this.taskState(taskId)!.state,disposition:this.taskState(taskId)!.disposition,pending:this.pendingDependencies(taskId)}));
+	}
+	continuations(): Array<Omit<WorkItem,'timestamp'>> {
+		return this.taskStatus.filter(t=>t.state==='waiting'&&!this.isTaskAbandoned(t.taskId)&&this.pendingResults(t.taskId).length&&!this.records.some(r=>r.type==='task_output'&&r.taskId===t.taskId&&r.mode==='terminal')).flatMap(t=>{
+			const original=this.rootItem(t.taskId), privateJob=this.privateJobFor(t.taskId);
+			if (!original&&!privateJob) return [];
+			const result=this.pendingResults(t.taskId)[0]!;
+			return [{...(original??{channel:'private' as const,authority:'owner' as const,sender:'the owner',text:privateJob!.text,reply:{kind:'private' as const,messageId:privateJob!.messageId}}),taskId:t.taskId,itemId:workItemIdForKey('group',`continue:${t.taskId}:${result.messageId}`),context:[...(original?.context??[]),'Continue the recorded waiting task. Evaluate child results before replying to its pinned audience.']}];
+		});
+	}
+	acceptedTerminalReply(job:Job):Extract<GroupWork,{kind:'reply'}>|undefined{
+		const obligation=job.item?.obligation;
+		if(!obligation)return undefined;
+		const plan=this.records.findLast(r=>r.type==='group_send_planned'&&r.work?.kind==='reply'&&r.work.requestId===obligation.requestId&&r.work.recipientBotId===obligation.recipientBotId&&this.records.some(a=>a.type==='group_send_accepted'&&a.sendId===r.sendId));
+		return plan?.type==='group_send_planned'&&plan.work?.kind==='reply'?plan.work:undefined;
+	}
+	private async retireSuppliedReply(job:Job):Promise<boolean>{
+		const reply=this.acceptedTerminalReply(job);
+		if(!reply)return false;
+		// Telegram acceptance suppresses duplicate output, not metadata recovery or completion.
+		await this.prepareOutput(job,'terminal',reply.disposition);
+		await this.setTaskState(this.taskId(job),'waiting');
+		await this.append({type:'turn_finished',jobId:job.jobId,mode:'waiting',timestamp:new Date(this.now()).toISOString()});
+		return true;
+	}
+	private async prepareOutput(job: Job, mode:'terminal'|'progress', disposition:Disposition='completed'): Promise<void> {
+		const taskId=this.taskId(job), obligation=job.item?.obligation;
+		const work:GroupWork=obligation&&mode==='terminal'?{version:1,kind:'reply',...obligation,disposition}:{version:1,kind:'notify',recipients:[]};
+		if(!this.records.some(r=>r.type==='task_output'&&r.jobId===job.jobId)) await this.append({type:'task_output',taskId,jobId:job.jobId,mode,disposition,...(job.item?.reply.kind==='group'?{work}:{}),timestamp:new Date(this.now()).toISOString()});
+	}
+	private async outputAccepted(job:Job):Promise<void>{
+		const output=this.records.findLast((r):r is Extract<TaskRecord,{type:'task_output'}>=>r.type==='task_output'&&r.jobId===job.jobId);
+		if(output?.mode==='terminal') {await this.setTaskState(output.taskId,'completed',output.disposition);await this.reconcileCompletedResults(output.taskId);}
+	}
+
+	/** Delivery can commit before completion; reconcile that boundary without transport calls. */
+	private async reconcileDeliveredTasks(): Promise<void> {
+		const sent = new Set(this.records.filter(record => record.type === "reply_sent").map(record => record.jobId));
+		for (const record of this.records) {
+			if (record.type !== "task_output" || record.mode !== "terminal" || !sent.has(record.jobId)) continue;
+			await this.setTaskState(record.taskId, "completed", record.disposition);
+			await this.reconcileCompletedResults(record.taskId);
+		}
+	}
+
 	appendGroupRecord(record: GroupProgressRecord): Promise<void> {
 		return this.append(record);
 	}
@@ -663,7 +784,10 @@ export class TelegramOwnerBridge {
 	async initialize(): Promise<Recovery> {
 		this.records = await this.journal.load();
 		validateMediaLifecycle(this.records);
-		return recover(this.records, this.now());
+		recover(this.records,this.now());
+		await this.reconcileDeliveredTasks();
+		for(const task of this.taskStatus)await this.reconcileCompletedResults(task.taskId);
+		return recover(this.records,this.now());
 	}
 
 	get activeJob(): Job | undefined {
@@ -741,8 +865,9 @@ export class TelegramOwnerBridge {
 		return this.append(record);
 	}
 
-	private append(record: JournalRecord): Promise<void> {
+	private append(record: JournalRecord,guard?:()=>boolean): Promise<void> {
 		const result = this.appendTail.then(async () => {
+			if(guard&&!guard())return;
 			await this.journal.append(record);
 			this.records.push(record);
 		});
@@ -944,7 +1069,8 @@ export class TelegramOwnerBridge {
 		if (!this.active) return undefined;
 		const job = this.active;
 		await this.append({ type: "interrupted", jobId: job.jobId, reason });
-		await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });
+		if(this.taskState(this.taskId(job))?.state==='completed')await this.append({type:'turn_finished',jobId:job.jobId,mode:'silent',timestamp:new Date(this.now()).toISOString()});
+		else {await this.prepareOutput(job,'terminal','failed');await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });}
 		this.active = undefined;
 		this.dispatchConfirmed = false;
 		this.sawOwnInput = false;
@@ -952,19 +1078,19 @@ export class TelegramOwnerBridge {
 		return job;
 	}
 
-	async recordActivityStarted(jobId: string, messageId: string): Promise<void> {
-		await this.append({ type: "activity_started", jobId, messageId });
+	async recordActivityStarted(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
+		await this.append({ type: "activity_started", jobId, messageId, ...(destination?{destination}:{}) });
 	}
 
-	async recordActivityCleared(jobId: string, messageId: string): Promise<void> {
-		await this.append({ type: "activity_cleared", jobId, messageId });
+	async recordActivityCleared(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
+		await this.append({ type: "activity_cleared", jobId, messageId, ...(destination?{destination}:{}) });
 	}
 
-	private openActivities(): Array<{ jobId: string; messageId: string }> {
-		const open = new Map<string, { jobId: string; messageId: string }>();
+	private openActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
+		const open = new Map<string, { jobId: string; messageId: string; destination: 'private' | 'group' }>();
 		for (const record of this.records) {
-			if (record.type === "activity_started") open.set(`${record.jobId}:${record.messageId}`, { jobId: record.jobId, messageId: record.messageId });
-			else if (record.type === "activity_cleared") open.delete(`${record.jobId}:${record.messageId}`);
+			if (record.type === "activity_started") open.set(activityKey(this.records,record), { jobId: record.jobId, messageId: record.messageId, destination: activityDestination(this.records,record) });
+			else if (record.type === "activity_cleared") open.delete(activityKey(this.records,record));
 		}
 		return [...open.values()];
 	}
@@ -981,10 +1107,25 @@ export class TelegramOwnerBridge {
 	async interruptQueuedItems(reason: string, notice: string): Promise<WorkItem[]> {
 		const ended: WorkItem[] = [];
 		for (const job of recover(this.records, this.now()).queued) {
-			if (!job.item || job.jobId === this.active?.jobId) continue;
+			if (job.jobId === this.active?.jobId) continue;
+			if(job.item?.taskId){await this.append({type:'turn_finished',jobId:job.jobId,mode:'silent',timestamp:new Date(this.now()).toISOString()});continue;}
+			await this.append({type:'task_abandoned',taskId:this.taskId(job),timestamp:new Date(this.now()).toISOString()});
+			await this.prepareOutput(job,'terminal','cancelled');
 			await this.append({ type: "interrupted", jobId: job.jobId, reason });
 			await this.append({ type: "reply_ready", jobId: job.jobId, text: notice, timestamp: new Date(this.now()).toISOString() });
-			ended.push(job.item);
+			if(job.item) ended.push(job.item);
+		}
+		for(const task of this.taskStatus.filter(t=>t.state==='waiting')){
+			const original=this.rootItem(task.taskId),privateJob=this.privateJobFor(task.taskId);
+			if(!original&&!privateJob)continue;
+			if(!this.isTaskAbandoned(task.taskId))await this.append({type:'task_abandoned',taskId:task.taskId,timestamp:new Date(this.now()).toISOString()});
+			const {item}=await this.admitItem({...original,channel:original?.channel??'private',authority:original?.authority??'owner',sender:original?.sender??'the owner',text:notice,reply:original?.reply??{kind:'private',messageId:privateJob!.messageId},taskId:task.taskId,itemId:workItemIdForKey('endpoint',`reset:${task.taskId}`)});
+			const job:Job={jobId:item.itemId,item,messageId:item.reply.kind==='none'||(item.reply.kind==='group'&&item.reply.quote)?0:item.reply.messageId??0,updateId:0,text:notice,images:[]};
+			if(!this.records.some(r=>r.type==='reply_ready'&&r.jobId===job.jobId)){
+				await this.prepareOutput(job,'terminal','cancelled');
+				await this.append({type:'interrupted',jobId:job.jobId,reason});
+				await this.append({type:'reply_ready',jobId:job.jobId,text:notice,timestamp:new Date(this.now()).toISOString()});
+			}
 		}
 		return ended;
 	}
@@ -998,21 +1139,20 @@ export class TelegramOwnerBridge {
 	}
 
 	/** The open activity or queued-notice message for a job, if any. */
-	openActivity(jobId: string): string | undefined {
-		return this.openActivities().find((activity) => activity.jobId === jobId)?.messageId;
+	openActivity(jobId: string, destination?: 'private' | 'group'): string | undefined {
+		return this.openActivities().find((activity) => activity.jobId === jobId && (destination === undefined || activity.destination === destination))?.messageId;
 	}
 
 	/** Open activities whose job no longer needs them: its reply was sent, or it ended without one. */
-	finishedActivities(): Array<{ jobId: string; messageId: string }> {
+	finishedActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
 		const sent = new Set<string>();
-		const ready = new Set<string>();
 		const interrupted = new Set<string>();
 		for (const record of this.records) {
 			if (record.type === "reply_sent") sent.add(record.jobId);
-			else if (record.type === "reply_ready") ready.add(record.jobId);
-			else if (record.type === "interrupted") interrupted.add(record.jobId);
+			else if (record.type === "interrupted" || record.type === 'turn_finished') interrupted.add(record.jobId);
 		}
-		return this.openActivities().filter((activity) => sent.has(activity.jobId) || (interrupted.has(activity.jobId) && !ready.has(activity.jobId)));
+		// Interrupted execution has stopped even when its pinned failure notice awaits delivery.
+		return this.openActivities().filter((activity) => sent.has(activity.jobId) || interrupted.has(activity.jobId)||this.taskState(this.itemFor(activity.jobId)?.taskId??activity.jobId)?.state==='completed');
 	}
 
 	/** Queued jobs waiting behind other work that have no queued notice yet, with their queue position. */
@@ -1027,7 +1167,8 @@ export class TelegramOwnerBridge {
 		const uncertain = recover(this.records, this.now()).uncertain;
 		for (const job of uncertain) {
 			await this.append({ type: "interrupted", jobId: job.jobId, reason });
-			if (notice) await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });
+			if(await this.retireSuppliedReply(job))continue;
+			if (notice) {await this.prepareOutput(job,'terminal','failed');await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });}
 		}
 		return uncertain;
 	}
@@ -1135,6 +1276,7 @@ export class TelegramOwnerBridge {
 	}
 
 	async retryReadyReplies(send: SendReply, route?: ItemReplyRoute): Promise<number> {
+		await this.reconcileDeliveredTasks();
 		const retries = recover(this.records, this.now()).repliesToRetry;
 		let delivered = 0;
 		let firstError: unknown;
@@ -1145,6 +1287,7 @@ export class TelegramOwnerBridge {
 			if (isPrivate && privateBlocked) continue;
 			try {
 				await this.deliver(job, job.reply, send, route);
+				await this.outputAccepted(job);
 				delivered += 1;
 			} catch (error) {
 				if (isPrivate) privateBlocked = true;
@@ -1181,6 +1324,13 @@ export class TelegramOwnerBridge {
 			if (!batch) throw new StateCorruptionError("Dispatch batch is missing");
 			if (batch.state !== "dispatching") await this.append({ ...batch, revision: batch.revision + 1, state: "dispatching" });
 		}
+		const taskId=this.taskId(job);
+		await this.setTaskState(taskId,'executing');
+		const results=this.pendingResults(taskId);
+		if(results.length){
+			await this.append({type:'task_presented',taskId,jobId:job.jobId,messageIds:results.map(r=>r.messageId),timestamp:new Date(this.now()).toISOString()});
+			job.text+=taskResultContext(this.records,job.jobId);
+		}
 		await this.append({ type: "dispatch_requested", jobId: job.jobId, sessionId });
 		sendUserMessage(`${this.marker}\n${job.text}`, images);
 		return job;
@@ -1207,39 +1357,6 @@ export class TelegramOwnerBridge {
 		this.assistantText = this.turnOutcome.text;
 	}
 
-	/** Where a job's reply goes, as a comparable key. */
-	private destinationKey(job: Pick<Job, "jobId" | "messageId" | "item">): string | undefined {
-		const reply = job.item?.reply;
-		if (!reply) return `private:${job.messageId}`;
-		if (reply.kind === "none") return undefined;
-		return reply.kind === "private" ? `private:${reply.messageId ?? ""}` : `group:${reply.chatId}:${reply.messageId ?? ""}`;
-	}
-
-	/** Whether an earlier asking turn already told this job's destination that a sister was asked. */
-	private alreadyAcknowledged(job: Job): boolean {
-		const key = this.destinationKey(job);
-		if (!key) return false;
-		return this.records.some((record) => {
-			if (record.type !== "interrupted" || record.reason !== "GROUP_REQUEST_ACKNOWLEDGED" || record.jobId === job.jobId) return false;
-			const item = this.itemFor(record.jobId);
-			const earlier = item ? { jobId: record.jobId, messageId: 0, item } : { jobId: record.jobId, messageId: this.privateJobFor(record.jobId)?.messageId ?? 0 };
-			return this.destinationKey(earlier) === key;
-		});
-	}
-
-	/** Agents mentioned in group requests a job sent and Telegram accepted; undefined when it sent none. */
-	private requestsSentBy(jobId: string): string[] | undefined {
-		const accepted = new Set(this.records.filter((record) => record.type === "group_send_accepted").map((record) => (record as Extract<GroupProgressRecord, { type: "group_send_accepted" }>).sendId));
-		const accounts = new Set<string>();
-		let sent = false;
-		for (const record of this.records) {
-			if (record.type !== "group_send_planned" || record.originJobId !== jobId || !accepted.has(record.sendId)) continue;
-			sent = true;
-			for (const match of record.text.matchAll(/(?:^|[^\w@])@([A-Za-z][A-Za-z0-9_]{3,31})\b/g)) accounts.add(match[1]!);
-		}
-		return sent ? [...accounts] : undefined;
-	}
-
 	/** The most recent turn that ended without a usable reply. */
 	get lastTurnFailure(): Extract<JournalRecord, { type: "turn_failed" }> | undefined {
 		return this.records.findLast((record): record is Extract<JournalRecord, { type: "turn_failed" }> => record.type === "turn_failed");
@@ -1250,22 +1367,25 @@ export class TelegramOwnerBridge {
 		const job = this.active;
 		const outcome = this.turnOutcome;
 		this.turnOutcome = undefined;
-		let text: string;
-		const asked = outcome.failure === "NO_REPLY" ? this.requestsSentBy(job.jobId) : undefined;
-		if (asked && this.alreadyAcknowledged(job)) {
-			// A later asking turn in the same chain: the owner already knows a sister was asked.
-			await this.append({ type: "responded_by_request", jobId: job.jobId, messageId: 0, timestamp: new Date(this.now()).toISOString() });
-			text = "Asked again in the group.";
-		} else if (asked) {
-			// The turn's work was asking a peer; the answer arrives as a new turn, so this is not a failure.
-			text = asked.length ? `Asked ${asked.map((account) => `@${account}`).join(" and ")} in the group; the answer will follow here.` : "Posted a request in the group; any answer will follow here.";
-			await this.append({ type: "interrupted", jobId: job.jobId, reason: "GROUP_REQUEST_ACKNOWLEDGED" });
-		} else if (outcome.failure) {
-			// A failed turn still gets a visible disposition; it is a notice, not the model's answer.
-			text = turnFailureNotice(outcome.failure);
-			await this.append({ type: "turn_failed", jobId: job.jobId, code: outcome.failure, ...(outcome.detail ? { detail: outcome.detail } : {}), timestamp: new Date(this.now()).toISOString() });
-			await this.append({ type: "interrupted", jobId: job.jobId, reason: outcome.failure });
-		} else text = outcome.text!;
+		const taskId=this.taskId(job), completed=this.taskState(taskId)?.state==='completed';
+		const pending=this.pendingDependencies(taskId).length>0||this.pendingResults(taskId).length>0;
+		const waiting=!completed&&pending&&(!outcome.failure||outcome.failure==='NO_REPLY');
+		const silent=completed||(job.item?.information&&!!outcome.failure)||(waiting&&!outcome.text);
+		if(outcome.failure&&outcome.failure!=='NO_REPLY') await this.append({type:'turn_failed',jobId:job.jobId,code:outcome.failure,...(outcome.detail?{detail:outcome.detail}:{}),timestamp:new Date(this.now()).toISOString()});
+		if(!completed&&await this.retireSuppliedReply(job)){
+			this.active=undefined;this.dispatchConfirmed=false;this.assistantText=undefined;
+			return true;
+		}
+		if(waiting) await this.setTaskState(taskId,'waiting');
+		if(silent){
+			await this.append({type:'turn_finished',jobId:job.jobId,mode:waiting?'waiting':'silent',timestamp:new Date(this.now()).toISOString()});
+			if(!waiting&&!completed) await this.setTaskState(taskId,'completed');
+			this.active=undefined;this.dispatchConfirmed=false;this.assistantText=undefined;
+			return true;
+		}
+		const text=outcome.failure?turnFailureNotice(outcome.failure):outcome.text!;
+		if(outcome.failure==='NO_REPLY') await this.append({type:'turn_failed',jobId:job.jobId,code:'NO_REPLY',timestamp:new Date(this.now()).toISOString()});
+		await this.prepareOutput(job,waiting?'progress':'terminal',outcome.failure?'failed':'completed');
 		await this.append({ type: "reply_ready", jobId: job.jobId, text, timestamp: new Date().toISOString() });
 		// The durable ready reply is retried by retryReadyReplies if delivery
 		// fails, so the job no longer holds the queue.
@@ -1273,6 +1393,7 @@ export class TelegramOwnerBridge {
 		this.dispatchConfirmed = false;
 		this.assistantText = undefined;
 		await this.deliver(job, text, send, route);
+		await this.outputAccepted(job);
 		return true;
 	}
 
@@ -1283,7 +1404,13 @@ export class TelegramOwnerBridge {
 			const hasReadyReply = this.records.some(
 				(record) => record.type === "reply_ready" && record.jobId === this.active?.jobId,
 			);
-			if (!hasReadyReply) await this.append({ type: "interrupted", jobId: this.active.jobId, reason });
+			if (!hasReadyReply) {
+				if(this.taskState(this.taskId(this.active))?.state!=='completed'&&!await this.retireSuppliedReply(this.active)){
+					await this.prepareOutput(this.active,'terminal','failed');
+					await this.append({type:'reply_ready',jobId:this.active.jobId,text:'Interrupted before completion; the model turn was not replayed.',timestamp:new Date(this.now()).toISOString()});
+				}
+				await this.append({ type: "interrupted", jobId: this.active.jobId, reason });
+			}
 		}
 		this.active = undefined;
 	}

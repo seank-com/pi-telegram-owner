@@ -934,6 +934,19 @@ test("commands and photos never join inbound text batches", async () => {
 	assert.equal(recover(journal.records, now).queued.some((job) => job.images.length > 0), true);
 });
 
+test('activity recovery scopes same-numbered old group and new private notices to their actual chats',async()=>{
+ const jobId='11111111-2222-4333-8444-555555555555';
+ const journal=new MemoryJournal([{type:'work_item',schemaVersion:1,itemId:jobId,channel:'group',authority:'owner',sender:'fixture',text:'Group work.',reply:{kind:'group',chatId:-100,messageId:1},timestamp:'2026-10-29T00:00:00.000Z'},{type:'activity_started',jobId,messageId:'42'},{type:'activity_started',jobId,messageId:'42',destination:'private'},{type:'reply_sent',jobId,messageIds:['43'],timestamp:'2026-10-29T00:00:01.000Z'}]);
+ let bridge=new TelegramOwnerBridge(journal,OWNER,CHAT);await bridge.initialize();
+ assert.equal(bridge.openActivity(jobId,'private'),'42');assert.equal(bridge.openActivity(jobId,'group'),'42');
+ assert.equal(bridge.finishedActivities().length,2);assert.equal(recover(journal.records).orphanedActivities.length,2);
+ await bridge.recordActivityCleared(jobId,'42','private');
+ bridge=new TelegramOwnerBridge(journal,OWNER,CHAT);await bridge.initialize();
+ assert.equal(bridge.openActivity(jobId,'private'),undefined);assert.equal(bridge.openActivity(jobId,'group'),'42');assert.equal(bridge.finishedActivities().length,1);
+ // A legacy unscoped clear still means the old reply-target chat.
+ await bridge.recordActivityCleared(jobId,'42');assert.equal(bridge.finishedActivities().length,0);assert.equal(recover(journal.records).orphanedActivities.length,0);
+});
+
 test("plain-text splitter never exceeds its configured boundary", () => {
 	assert.deepEqual(splitPlainText("short", 10), ["short"]);
 	assert.ok(splitPlainText("a".repeat(31), 10).every((chunk) => chunk.length <= 10));

@@ -1,3 +1,4 @@
+import { GROUP_LIFECYCLE_VERSION, parseGroupSend, validWork, type GroupSendInput, type GroupWork, type RequestWork } from './work.ts';
 import {
 	quotedReplyText,
 	ReplyDestinationUnavailableError,
@@ -164,6 +165,7 @@ export class GroupRuntime {
 		await this.recordAgentPosts();
 		await this.deliverWakes();
 		await this.electionTick();
+		await this.scheduleContinuations();
 	}
 
 	async stop(): Promise<void> {
@@ -187,7 +189,12 @@ export class GroupRuntime {
 		void this.run(async () => {
 			await this.recordAgentPosts();
 			await this.deliverWakes();
+			await this.scheduleContinuations();
 		});
+	}
+
+	private async scheduleContinuations():Promise<void>{
+		for(const item of this.options.bridge()?.continuations()??[]) await this.options.admit(item);
 	}
 
 	private run(work: () => Promise<void>): Promise<void> {
@@ -295,10 +302,12 @@ export class GroupRuntime {
 			const expected = 2 + config.otherAgents.length;
 			if (count !== expected) return this.setMembership({ state: "unverified", reason: `the group has ${count} members; expected ${expected}` });
 			if (this.rosterMismatched) return;
-			const wasVerified = this.verified;
+			// Membership alone cannot authorize sends while peer protocol checks are pending.
+			if (!this.verified) {
+				await this.exchangeRoster();
+				if (this.rosterMismatched || config.otherAgents.some(peer => !this.compatiblePeers.has(peer.telegramAccount.toLowerCase()))) return;
+			}
 			this.setMembership({ state: "verified" });
-			// Ranks only agree if every agent has the same configuration.
-			if (!wasVerified) await this.exchangeRoster();
 		} catch (error) {
 			this.setMembership({ state: "unverified", reason: `membership check failed (${error instanceof Error ? error.message : String(error)})` });
 			this.scheduleRetry();
@@ -616,9 +625,10 @@ export class GroupRuntime {
 		}
 		if (value.kind === "roster") {
 			const mine = this.rosterFingerprint();
-			const match = value.roster === mine;
+			const match = value.roster === mine && value.groupLifecycleVersion === GROUP_LIFECYCLE_VERSION;
 			if (!match) await this.rosterMismatch(String(value.agent ?? "a peer"));
-			return { status: 200, body: { roster: mine, match } };
+			else if(this.agentByAccount(String(value.agent))){this.compatiblePeers.add(String(value.agent).toLowerCase());void this.run(()=>this.catchUp());}
+			return { status: 200, body: { roster: mine, groupLifecycleVersion: GROUP_LIFECYCLE_VERSION, match } };
 		}
 		return { status: 400, body: { error: "kind must be \"claimed\" or \"roster\"" } };
 	}
@@ -630,30 +640,66 @@ export class GroupRuntime {
 	}
 
 	private rosterMismatched = false;
+	private readonly compatiblePeers = new Set<string>();
 
 	private async rosterMismatch(peer: string): Promise<void> {
 		await this.options.journal.appendEvent({ kind: "roster_check", agent: this.self!.username, peer, result: "mismatch" }).catch((error) => this.options.onError(error));
 		this.rosterMismatched = true;
-		this.setMembership({ state: "unverified", reason: `the group configuration differs from ${peer}'s (roster, owner or election step)` });
+		this.setMembership({ state: "unverified", reason: `the group configuration or lifecycle protocol differs from ${peer}'s (roster, owner, election step or protocol version)` });
 	}
 
 	/** Compares configuration with every reachable peer. */
 	private async exchangeRoster(): Promise<void> {
 		const roster = this.rosterFingerprint();
 		for (const peer of this.config.otherAgents) {
-			const response = await this.options.coordinate?.(peer, { kind: "roster", agent: this.self!.username, roster });
-			const reply = response?.body as { roster?: unknown; match?: unknown } | undefined;
-			if (response?.status === 200 && reply?.roster !== roster) return this.rosterMismatch(`@${peer.telegramAccount}`);
+			const response = await this.options.coordinate?.(peer, { kind: "roster", agent: this.self!.username, roster, groupLifecycleVersion: GROUP_LIFECYCLE_VERSION });
+			const reply = response?.body as { roster?: unknown; match?: unknown; groupLifecycleVersion?:unknown } | undefined;
+			if (response?.status === 200 && (reply?.roster !== roster || reply.groupLifecycleVersion !== GROUP_LIFECYCLE_VERSION || reply.match === false)) return this.rosterMismatch(`@${peer.telegramAccount}`);
+			if(response?.status===200)this.compatiblePeers.add(peer.telegramAccount.toLowerCase());
+			else if(!this.compatiblePeers.has(peer.telegramAccount.toLowerCase())){this.setMembership({state:'unverified',reason:`lifecycle support is not yet verified for @${peer.telegramAccount}`});this.scheduleRetry();}
 		}
 	}
 
+	private wakeTail:Promise<unknown>=Promise.resolve();
+	/** Serialize recipient-side admission checks with their durable receipts. */
+	acceptWakeUp(messageId:number):Promise<EndpointResponse>{
+		const result=this.wakeTail.then(()=>this.receiveWakeUp(messageId));
+		this.wakeTail=result.catch(()=>undefined);
+		return result;
+	}
 	/** Verifies and queues a peer's wake-up for a journaled group message. */
-	async acceptWakeUp(messageId: number): Promise<EndpointResponse> {
+	private async receiveWakeUp(messageId: number): Promise<EndpointResponse> {
 		if (!this.self) return { status: 503, body: { error: "The group runtime has not started" } };
 		const message = await this.options.journal.message(this.config.chatId, messageId);
 		if (!message) return { status: 404, body: { error: `Group message ${messageId} is not in the shared journal` } };
 		const peer = this.agentById(message.senderId);
 		if (message.senderKind !== "agent" || !peer) return { status: 400, body: { error: "Only messages from configured agents can be delivered" } };
+		if(message.work){
+			if(!validWork(message.work)) return {status:400,body:{error:'Invalid lifecycle metadata'}};
+			const work=message.work;
+			if(work.kind==='request'){
+				await this.requestById(work.requestId); // Conflicting request identities never create another obligation.
+				if(!work.recipients.includes(this.self.id)) return {status:400,body:{error:'Request does not address this agent'}};
+				return this.admitPeerItem(message,peer,this.replyToPeer(message,peer),[...(await this.contextFor(message)),...(await this.missedLines(message.messageId))],{requestId:work.requestId,chainId:work.chainId,...(work.parentRequestId?{parentRequestId:work.parentRequestId}:{}),requesterBotId:message.senderId,recipientBotId:this.self.id});
+			}
+			if(work.kind==='notify'){
+				if(!work.recipients.includes(this.self.id)) return {status:202,body:{context:true}};
+				return this.admitPeerItem(message,peer,{kind:'group',chatId:this.config.chatId},['Information only. No acknowledgment is required.'],undefined,true);
+			}
+			const request=await this.requestById(work.requestId);
+			if(!request||request.senderId!==this.self.id||work.requesterBotId!==this.self.id||work.recipientBotId!==message.senderId||!request.work.recipients.includes(message.senderId)||work.chainId!==request.work.chainId) return {status:400,body:{error:'Reply does not identify this sender recipient obligation'}};
+			if(this.records().some(r=>r.type==='group_requests_closed'&&r.requestIds?.includes(work.requestId))){await this.recordContext(message.messageId);return {status:202,body:{context:true}};}
+			const bridge=this.options.bridge(), dep=bridge?.dependency(work.requestId);
+			if(dep){
+				const state=bridge!.taskState(dep.taskId);
+				if(state?.disposition==='cancelled'||bridge!.isTaskAbandoned(dep.taskId)) {await this.recordContext(message.messageId);return {status:202,body:{context:true}};}
+				if(bridge!.journalRecords.some(r=>r.type==='task_result'&&r.messageId===message.messageId))return {status:202,body:{duplicate:true}};
+				const pending=await bridge!.receiveResult({taskId:dep.taskId,requestId:work.requestId,recipientBotId:message.senderId,messageId:message.messageId,text:message.text,disposition:work.disposition});
+				if(pending){ await this.scheduleContinuations();return {status:202,body:{pending:true}}; }
+			}
+			return this.admitPeerItem(message,peer,{kind:'group',chatId:this.config.chatId},[`Informational result for request ${work.requestId}; no waiting parent is resumed.`],undefined,true);
+		}
+		if(!message.posting) {await this.recordContext(message.messageId);return {status:202,body:{context:true}};}
 		const target = message.replyToMessageId ? await this.options.journal.message(this.config.chatId, message.replyToMessageId) : undefined;
 		const repliesToOwnRequest = Boolean(target && target.senderId === this.self.id && target.posting?.kind === "request");
 		const mentioned = this.mentionedIds(message).has(this.self.id) || mentionedAccounts(message.text).includes(this.self.username.toLowerCase());
@@ -661,7 +707,9 @@ export class GroupRuntime {
 		if (!mentioned && !repliesToOwnRequest) return { status: 400, body: { error: "The message does not address this agent" } };
 		// An answer to this agent's request returns to the work that asked; a new request is answered in the group.
 		if (repliesToOwnRequest && message.posting?.kind === "answer") return this.admitAnswer(message, peer, target!);
-		return this.admitPeerItem(message, peer, this.replyToPeer(message, peer), [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))]);
+		const legacy=await this.normalizedRequest(message);
+		if(!legacy?.work.recipients.includes(this.self.id))return {status:400,body:{error:'Legacy request has no exact recipient correlation'}};
+		return this.admitPeerItem(message, peer, this.replyToPeer(message, peer), [...(await this.contextFor(message)), ...(await this.missedLines(message.messageId))],{requestId:legacy.work.requestId,chainId:legacy.work.chainId,requesterBotId:message.senderId,recipientBotId:this.self.id});
 	}
 
 	/** A group reply to another agent's message, which Telegram can only show as a quote. */
@@ -669,7 +717,7 @@ export class GroupRuntime {
 		return { kind: "group", chatId: this.config.chatId, messageId: message.messageId, quote: { sender: peer.telegramName, account: peer.telegramAccount, text: message.text } };
 	}
 
-	private async admitPeerItem(message: GroupMessage, peer: GroupAgentConfig, reply: WorkItem["reply"], context: string[]): Promise<EndpointResponse> {
+	private async admitPeerItem(message: GroupMessage, peer: GroupAgentConfig, reply: WorkItem["reply"], context: string[], obligation?:WorkItem['obligation'], information=false): Promise<EndpointResponse> {
 		const result = await this.options.admit({
 			itemId: groupItemId(this.config.chatId, message.messageId),
 			channel: "group",
@@ -678,6 +726,8 @@ export class GroupRuntime {
 			text: message.text || "[empty message]",
 			reply,
 			context,
+			...(obligation?{obligation}:{}),
+			...(information?{information:true}:{}),
 		}) as { item: WorkItem; duplicate: boolean } | undefined;
 		await this.markSeen(message.messageId);
 		return { status: 202, body: { itemId: result?.item.itemId, duplicate: result?.duplicate ?? false } };
@@ -690,25 +740,8 @@ export class GroupRuntime {
 			// The owner reset this agent's session after the request; the answer stays in the journal as context.
 			return { status: 202, body: { context: true } };
 		}
-		const bridge = this.options.bridge();
-		const originId = request.posting?.originItemId;
-		const originItem = originId ? bridge?.itemFor(originId) : undefined;
-		const originPrivate = originId && !originItem ? bridge?.privateJobFor(originId) : undefined;
-		const context = [`This answers your request ${request.messageId} in the group chat: ${request.text}`];
-		let reply: WorkItem["reply"];
-		if (originItem) {
-			reply = originItem.reply;
-			const where = originItem.reply.kind === "group" && originItem.reply.messageId ? `group message ${originItem.reply.messageId}` : originItem.channel === "endpoint" ? "a queue endpoint instruction" : "the group chat";
-			context.push(`You sent that request while working on ${where} from ${originItem.sender}: ${originItem.text}`);
-		} else if (originPrivate) {
-			reply = { kind: "private", messageId: originPrivate.messageId };
-			context.push(`You sent that request while working on the owner's private message ${originPrivate.messageId}: ${originPrivate.text}`);
-		} else {
-			reply = this.replyToPeer(message, peer);
-		}
-		context.push(...(await this.missedLines(message.messageId)));
-		context.push("Use telegram_group_timeline or telegram_timeline if you need more of that conversation.");
-		return this.admitPeerItem(message, peer, reply, context);
+		// An old origin pointer is not proof of a durable waiting transition.
+		return this.admitPeerItem(message,peer,{kind:'group',chatId:this.config.chatId},[`Historical result for legacy:${this.config.chatId}:${request.messageId}. No recorded waiting task is resumed.`],undefined,true);
 	}
 
 	/** Journals group replies Telegram accepted for this agent, then queues wake-ups for the agents they address. */
@@ -725,6 +758,7 @@ export class GroupRuntime {
 				const anchorRejected = records.some((candidate) => candidate.type === "reply_anchor_rejected" && candidate.jobId === record.itemId);
 				await this.recordPost(record.itemId, {
 					partIds, text: ready.text, posting: { kind: "answer" },
+					work: records.findLast((r)=>r.type==='task_output'&&r.jobId===record.itemId)?.type === 'task_output' ? (records.findLast((r)=>r.type==='task_output'&&r.jobId===record.itemId) as Extract<JournalRecord,{type:'task_output'}>).work : undefined,
 					date: Math.floor(new Date(sent.timestamp ?? this.timestamp()).valueOf() / 1000),
 					replyToMessageId: anchorRejected ? undefined : record.reply.messageId,
 				});
@@ -733,13 +767,14 @@ export class GroupRuntime {
 				if (!plan) continue;
 				await this.recordPost(record.sendId, {
 					partIds: record.messageIds, text: plan.text, date: record.date, replyToMessageId: plan.replyToMessageId,
-					posting: { kind: "request", ...(plan.originJobId ? { originItemId: plan.originJobId } : {}) },
+					posting: { kind: plan.work?.kind==='notify'?'notify':plan.work?.kind==='reply'?'answer':'request', ...(!plan.work&&plan.originJobId ? { originItemId: plan.originJobId } : {}) },
+					work: plan.work,
 				});
 			}
 		}
 	}
 
-	private async recordPost(postId: string, post: { partIds: number[]; text: string; date: number; replyToMessageId?: number; posting: NonNullable<GroupMessage["posting"]> }): Promise<void> {
+	private async recordPost(postId: string, post: { partIds: number[]; text: string; date: number; replyToMessageId?: number; posting: NonNullable<GroupMessage["posting"]>;work?:GroupWork }): Promise<void> {
 		const message: GroupMessage = {
 			chatId: this.config.chatId,
 			messageId: post.partIds[0]!,
@@ -752,18 +787,31 @@ export class GroupRuntime {
 			entities: [],
 			...(post.replyToMessageId ? { replyToMessageId: post.replyToMessageId } : {}),
 			posting: post.posting,
+			...(post.work?{work:post.work}:{}),
 		};
-		await this.options.journal.recordMessage(message, this.self!.username);
+		const bridge=this.options.bridge();
+		// The parent link is durable before any peer can observe the published Request.
+		if(post.work?.kind==='request'){
+			const plan=bridge?.journalRecords.find((r)=>r.type==='group_send_planned'&&r.sendId===postId);
+			if(plan?.type==='group_send_planned'&&plan.originJobId) await bridge!.addDependency(plan.originJobId,post.work.requestId,post.work.recipients);
+		}
+		const recorded=await this.options.journal.recordMessage(message, this.self!.username);
+		if(recorded.outcome==='conflict')throw new Error('Conflicting accepted group publication');
 		this.options.onJournalChanged?.();
+		if(post.work?.kind==='reply') await bridge?.completeObligation(post.work.requestId,post.work.recipientBotId,post.work.disposition);
 		const peers = new Set<GroupAgentConfig>();
+		if(post.work){
+			const ids=post.work.kind==='reply'?[post.work.requesterBotId]:post.work.recipients;
+			for(const id of ids){const agent=this.agentById(id);if(agent)peers.add(agent);}
+		}
 		// A request wakes the agents it mentions; an answer never starts new work.
-		if (post.posting.kind === "request") {
+		if (!post.work && post.posting.kind === "request") {
 			for (const account of mentionedAccounts(post.text)) {
 				const agent = this.agentByAccount(account);
 				if (agent) peers.add(agent);
 			}
 		}
-		if (post.replyToMessageId) {
+		if (!post.work && post.replyToMessageId) {
 			const target = await this.options.journal.message(this.config.chatId, post.replyToMessageId);
 			const author = target ? this.agentById(target.senderId) : undefined;
 			if (author && target?.posting?.kind === "request") peers.add(author);
@@ -821,15 +869,62 @@ export class GroupRuntime {
 		}
 	}
 
-	/** Posts a request to the group for telegram_group_send. Never resends an uncertain attempt. */
-	async sendRequest(sendId: string, text: string, replyToMessageId: number | undefined, originJobId: string | undefined): Promise<number> {
+	private async recordContext(messageId:number):Promise<void>{
+		if(!this.records().some(r=>r.type==='group_context_recorded'&&r.messageId===messageId))await this.append({type:'group_context_recorded',messageId,timestamp:this.timestamp()});
+	}
+	private async normalizedRequest(message:GroupMessage):Promise<(GroupMessage&{work:RequestWork})|undefined>{
+		if(message.work)return message.work.kind==='request'&&validWork(message.work)?message as GroupMessage&{work:RequestWork}:undefined;
+		if(message.posting?.kind!=='request')return undefined;
+		const ids=this.mentionedIds(message);
+		for(const account of mentionedAccounts(message.text)) {const id=account===this.self?.username.toLowerCase()?this.self.id:this.agentByAccount(account)?.botUserId;if(id)ids.add(id);}
+		if(message.replyToMessageId){const target=await this.options.journal.message(this.config.chatId,message.replyToMessageId);if(target?.posting?.kind==='request')ids.add(target.senderId);}
+		const requestId=`legacy:${this.config.chatId}:${message.messageId}`;
+		return {...message,work:{version:1,kind:'request',requestId,chainId:requestId,recipients:[...ids]}};
+	}
+	private async requestById(requestId:string):Promise<(GroupMessage&{work:RequestWork})|undefined>{
+		const requests=await Promise.all((await this.options.journal.timeline({chatId:this.config.chatId,limit:Number.MAX_SAFE_INTEGER})).map(m=>this.normalizedRequest(m)));
+		const matches=requests.filter((m):m is GroupMessage&{work:RequestWork}=>!!m&&m.work.requestId===requestId);
+		if(matches.length>1) throw new Error('Conflicting request identity');
+		return matches[0] as (GroupMessage&{work:RequestWork})|undefined;
+	}
+	/** Posts explicit work. Accepted receipt recovery never repeats a send. */
+	async sendWork(sendId:string,value:unknown):Promise<{kind:GroupSendInput['kind'];messageId:number;requestId?:string;chainId?:string;disposition?:string}>{
+		const input=parseGroupSend(value);
+		const present=new Set(mentionedAccounts(input.text));
+		const missing=input.kind==='request'?(input.recipients??[]).filter(account=>!present.has(account.slice(1).toLowerCase())):[];
+		const text=missing.length?`${missing.join(' ')}\n\n${input.text}`:input.text,replyToMessageId=input.replyToMessageId;
+		const active=this.options.bridge()?.activeJob;
+		const taskId=active?this.options.bridge()!.taskId(active):undefined;
+		const originJobId=taskId&&active&&!this.options.bridge()?.acceptedTerminalReply(active)&&this.options.bridge()?.taskState(taskId)?.state!=='completed'?taskId:undefined;
+		const parent=originJobId?this.options.bridge()?.obligationFor(originJobId):undefined;
+		const recipients=input.kind==='reply'?[]:(input.recipients??[]).map(account=>{const peer=this.agentByAccount(account.slice(1));if(!peer)throw new Error(`Unknown recipient ${account}`);return peer.botUserId;});
+		let work:GroupWork;
+		if(input.kind==='request') {
+			const requestId=workItemIdForKey('group',`${this.self?.id}:${sendId}`);
+			const localChain=originJobId?this.records().flatMap(r=>r.type==='group_send_planned'&&r.originJobId===originJobId&&r.work?.kind==='request'&&this.records().some(a=>a.type==='group_send_accepted'&&a.sendId===r.sendId)?[r.work.chainId]:[])[0]:undefined;
+			work={version:1,kind:'request',requestId,chainId:parent?.chainId??localChain??requestId,...(parent?{parentRequestId:parent.requestId}:{}),recipients};
+		}
+		else if(input.kind==='notify')work={version:1,kind:'notify',recipients};
+		else {const request=await this.requestById(input.requestId);if(!request||!this.self||!request.work.recipients.includes(this.self.id))throw new Error('This agent has no recipient obligation for that request');work={version:1,kind:'reply',requestId:input.requestId,chainId:request.work.chainId,recipientBotId:this.self.id,requesterBotId:request.senderId,disposition:input.disposition??'completed'};}
+		const result=(messageId:number)=>({kind:input.kind,messageId,...(work.kind==='request'?{requestId:work.requestId,chainId:work.chainId}:work.kind==='reply'?{requestId:work.requestId,disposition:work.disposition}:{})});
 		if (!this.verified) throw new ReplyDestinationUnavailableError(`The group chat is not available: ${this.statusText()}`);
 		const bridge = this.options.bridge();
 		if (!bridge) throw new Error("Telegram bridge is not running");
 		const accepted = bridge.journalRecords.find((record): record is Extract<GroupProgressRecord, { type: "group_send_accepted" }> => record.type === "group_send_accepted" && record.sendId === sendId);
-		if (accepted) return accepted.messageIds[0]!;
+		if (accepted) {
+			const plan=bridge.journalRecords.find((r)=>r.type==='group_send_planned'&&r.sendId===sendId);
+			// Accepted historical sends may predate automatic mention insertion. Never
+			// republish or rewrite them merely to add the new display prefix.
+			if(plan?.type!=='group_send_planned'||(plan.text!==text&&plan.text!==input.text)||plan.replyToMessageId!==replyToMessageId||(plan.work&&plan.work.kind!==work.kind))throw new Error('Send identity conflicts with its accepted plan');
+			if(plan.work){
+				if(plan.work.kind==='reply'&&work.kind==='reply'&&(plan.work.requestId!==work.requestId||plan.work.disposition!==work.disposition))throw new Error('Send identity conflicts with its accepted Reply');
+				if(plan.work.kind!=='reply'&&work.kind!=='reply'&&JSON.stringify([...plan.work.recipients].sort())!==JSON.stringify([...work.recipients].sort()))throw new Error('Send identity conflicts with its accepted recipients');
+				work=plan.work;
+			}else if(work.kind==='request'){const id=`legacy:${this.config.chatId}:${accepted.messageIds[0]}`;work={...work,requestId:id,chainId:id};}
+			await this.run(()=>this.recordAgentPosts());return result(accepted.messageIds[0]!);
+		}
 		if (bridge.journalRecords.some((record) => record.type === "group_send_planned" && record.sendId === sendId)) throw new Error("This group message's delivery is uncertain after an interruption; it was not resent");
-		await this.append({ type: "group_send_planned", sendId, text, ...(replyToMessageId ? { replyToMessageId } : {}), ...(originJobId ? { originJobId } : {}), timestamp: this.timestamp() });
+		await this.append({ type: "group_send_planned", sendId, text, work, ...(replyToMessageId ? { replyToMessageId } : {}), ...(originJobId ? { originJobId } : {}), timestamp: this.timestamp() });
 		// Telegram rejects a reply to another bot's message, so that reply is shown as a quote; the journal keeps the link.
 		const target = replyToMessageId ? await this.options.journal.message(this.config.chatId, replyToMessageId) : undefined;
 		const peer = target && target.senderId !== this.self?.id ? this.agentById(target.senderId) : undefined;
@@ -851,7 +946,7 @@ export class GroupRuntime {
 			await this.recordAgentPosts();
 			await this.deliverWakes();
 		});
-		return messageIds[0]!;
+		return result(messageIds[0]!);
 	}
 
 	private async sendWithAnchor(text: string, replyTo: number | undefined, format?: "HTML" | "plain", signal?: AbortSignal): Promise<string> {

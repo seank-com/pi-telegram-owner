@@ -1,3 +1,4 @@
+import { taskResultContext } from './work.ts';
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
@@ -10,7 +11,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { PollerLock, systemBootIdentity, systemPidState, type BootIdentity, type PidState } from "./runtime.ts";
 
-import { MAX_IMAGE_BYTES, renderWorkItemPrompt, validateMediaLifecycle, WORK_ITEM_MARKER_PREFIX, type ArchivedTelegramAttachment, type JournalRecord, type ResolvedImage, type WorkItem } from "./core.ts";
+import { MAX_IMAGE_BYTES, renderWorkItemPrompt, turnFailureNotice, validateMediaLifecycle, WORK_ITEM_MARKER_PREFIX, type ArchivedTelegramAttachment, type JournalRecord, type ResolvedImage, type WorkItem } from "./core.ts";
 
 export interface TelegramMarkdownProjectorConfig {
 	enabled: true;
@@ -481,6 +482,25 @@ async function persistedEntries(session: ReadonlySessionManager, sessionRoot: st
 	return { path: rel.split(sep).join("/"), entries };
 }
 
+// Pre-lifecycle work items used the same envelope without the Task header.
+// Accept only that exact historical shape, never arbitrary prompt/body changes.
+function legacyWorkItemPrompt(item: WorkItem): string | undefined {
+	if (item.channel === 'private' || item.reply.kind !== 'private' || item.taskId !== undefined || item.obligation !== undefined || item.information !== undefined) return undefined;
+	// Reconstruct the historical logical fields. Sender/context values can
+	// contain newlines, so a physical line number cannot identify a field.
+	const destination = item.reply.messageId
+		? `the private chat with the owner, as a reply to message ${item.reply.messageId}`
+		: 'the private chat with the owner';
+	const lines = [
+		`Channel: ${item.channel === 'group' ? 'group chat' : 'queue endpoint'}`,
+		`From: ${item.sender} (${item.authority} authority)`,
+		`Your final reply goes to ${destination}.`,
+		...(item.channel === 'group' ? ['The owner and every configured agent can read the group chat.'] : []),
+		...(item.context ?? []),
+	];
+	return `${lines.join('\n')}\n\n${item.text}`;
+}
+
 async function buildCandidates(records: readonly JournalRecord[], mediaEvents: readonly TelegramMediaEvent[], session: ReadonlySessionManager, sessionRoot: string): Promise<{ candidates: Candidate[]; deferred: Array<{ jobId: string; direction: "in" | "out"; code: string }> }> {
 	validateMediaLifecycle(records);
 	const sessionId = session.getSessionId();
@@ -498,7 +518,7 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 	for (const plan of photoPlans) validateArchivedAttachment(plan.attachment);
 	// Journal position orders private jobs (as Telegram update order does) and work items together.
 	const position = new Map<JournalRecord, number>(records.map((record, index) => [record, index]));
-	const logical: Array<{ jobId: string; text: string; command?: string; timestamp: string; telegramDate?: number; updateId: number | null; messageId?: number; batch?: Extract<JournalRecord, { type: "inbound_batch" }>; item?: WorkItem; order: number }> = updates.filter((update) => update.command || !batchMembers.has(update.jobId!)).map((update) => ({ jobId: update.jobId!, text: update.text!, command: update.command, timestamp: update.timestamp, telegramDate: update.telegramDate, updateId: update.updateId, messageId: update.messageId, order: position.get(update)! }));
+	const logical: Array<{ jobId: string; text: string; legacyText?: string; command?: string; timestamp: string; telegramDate?: number; updateId: number | null; messageId?: number; batch?: Extract<JournalRecord, { type: "inbound_batch" }>; item?: WorkItem; order: number }> = updates.filter((update) => update.command || !batchMembers.has(update.jobId!)).map((update) => ({ jobId: update.jobId!, text: update.text!, command: update.command, timestamp: update.timestamp, telegramDate: update.telegramDate, updateId: update.updateId, messageId: update.messageId, order: position.get(update)! }));
 	for (const batch of latestBatches.values()) {
 		const members = batch.memberJobIds.map((jobId) => updates.find((update) => update.jobId === jobId));
 		if (members.some((member) => !member)) throw new ArchiveCorruptionError("Inbound batch member update is missing");
@@ -509,7 +529,8 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 	for (const record of records) {
 		if (record.type !== "work_item" || record.reply.kind !== "private") continue;
 		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
-		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
+		const resultContext = taskResultContext(records, item.itemId);
+		logical.push({ jobId: item.itemId, text: renderWorkItemPrompt(item)+resultContext, legacyText: resultContext ? undefined : legacyWorkItemPrompt(item), timestamp: item.timestamp, updateId: null, item, order: position.get(record)! });
 	}
 	logical.sort((a, b) => a.order - b.order || a.jobId.localeCompare(b.jobId));
 	for (const update of logical) {
@@ -533,7 +554,10 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 		}
 		const marker = update.item ? `${WORK_ITEM_MARKER_PREFIX}${jobId}]\n` : update.batch ? `[telegram-batch:${jobId}]\n` : `[telegram-job:${jobId}]\n`;
 		const markerUsers = branch.map((entry, index) => ({ entry, index })).filter(({ entry }) => messageText(entry)?.startsWith(marker));
-		const userMatches = markerUsers.filter(({ entry }) => messageText(entry)!.slice(marker.length) === update.text);
+		const userMatches = markerUsers.filter(({ entry }) => {
+			const persistedText = messageText(entry)!.slice(marker.length);
+			return persistedText === update.text || (update.legacyText !== undefined && persistedText === update.legacyText);
+		});
 		if (userMatches.length !== 1) {
 			if (markerUsers.length === 1 && userMatches.length === 0) throw new ArchiveCorruptionError("Canonical Pi user content changed under a stable job marker");
 			const code = userMatches.length ? "PI_USER_ENTRY_AMBIGUOUS" : "PI_USER_ENTRY_MISSING";
@@ -559,9 +583,11 @@ async function buildCandidates(records: readonly JournalRecord[], mediaEvents: r
 		if (!reply) continue;
 		// The archive records what Telegram showed; a reply that posted nothing is not a message.
 		if (records.some((record) => record.type === "reply_sent" && record.jobId === jobId && "messageIds" in record && record.messageIds.length === 0)) continue;
-		// The bridge records interruption notices after `interrupted`; they are not Pi assistant text.
-		const beforeReply = records.slice(0, records.lastIndexOf(reply)).findLast((record) => "jobId" in record && record.jobId === jobId);
-		if (beforeReply?.type === "interrupted") {
+		// Interruption/failure notices are transport-generated, not Pi text.
+		// task_output is delivery bookkeeping, not a change of provenance.
+		const beforeReply = records.slice(0, records.lastIndexOf(reply)).findLast((record) => "jobId" in record && record.jobId === jobId && record.type !== 'task_output');
+		const generatedFailure = beforeReply?.type === "turn_failed" && reply.text === turnFailureNotice(beforeReply.code);
+		if (beforeReply?.type === "interrupted" || generatedFailure) {
 			addLocalResponse();
 			continue;
 		}

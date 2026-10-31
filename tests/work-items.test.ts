@@ -42,13 +42,14 @@ test("the envelope names channel, sender, authority, audience and reply destinat
 	assert.equal(prompt, [
 		"Channel: group chat",
 		"From: Agent B (@example_agent_b_bot) (peer authority)",
+		"Task: x. A normal final completes this task only when no delegated results remain pending.",
 		"Your final reply goes to the group chat, as a reply to message 41.",
 		"The owner and every configured agent can read the group chat.",
 		"In reply to the owner: please coordinate.",
 		"",
 		"Can you check the build?",
 	].join("\n"));
-	assert.match(renderWorkItemPrompt({ ...automation("Remind the owner.", { kind: "none" }), itemId: "y", timestamp: "" }), /^Channel: queue endpoint\nFrom: nightly-calendar \(owner authority\)\nYour final reply goes to nowhere; this turn sends no reply\.\n\nRemind the owner\.$/);
+	assert.match(renderWorkItemPrompt({ ...automation("Remind the owner.", { kind: "none" }), itemId: "y", timestamp: "" }), /^Channel: queue endpoint\nFrom: nightly-calendar \(owner authority\)\nTask:[^\n]+\nYour final reply goes to nowhere; this turn sends no reply\.\n\nRemind the owner\.$/);
 });
 
 test("owner-authority work runs before peer work, first in first out within each tier", async () => {

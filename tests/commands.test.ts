@@ -333,7 +333,7 @@ test("identity lookup failure is sanitized, uses a generic label, and does not s
 	assert.equal(harness.statuses.some((status) => status.includes("identityError=getMe failed token=[redacted]")), true);
 });
 
-test("new uses the command context replacement API and recovers one durable reply in the replacement session", async () => {
+test("new replaces the session and visibly cancels queued private work without replaying it", async () => {
 	const journal = new MemoryJournal();
 	const first = createHarness(journal);
 	await first.emit("session_start", { reason: "startup" });
@@ -360,12 +360,13 @@ test("new uses the command context replacement API and recovers one durable repl
 	await second.emit("session_start", { reason: "new" });
 	assert.equal(second.activePollers, 1);
 	assert.equal(second.maxActivePollers, 1);
-	assert.equal(second.replies.length, 1);
+	assert.equal(second.replies.length, 2);
 	assert.match(second.replies[0].text, /^Started a new session\.\nSession: session-test/);
-	assert.equal(second.sentMessages.length, 1, "queued ordinary work must survive replacement");
+	assert.match(second.replies[1].text, /owner reset/);
+	assert.equal(second.sentMessages.length, 0, "queued private work is cancelled, not replayed after reset");
 	await second.poll([update(40, "/new"), update(41, "preserve this update")]);
-	assert.equal(second.replies.length, 1, "duplicate Telegram update must not duplicate the reply or replacement");
-	assert.equal(second.sentMessages.length, 1, "duplicate Telegram update must not duplicate queued work");
+	assert.equal(second.replies.length, 2, "duplicate updates do not duplicate reset or cancellation replies");
+	assert.equal(second.sentMessages.length, 0, "duplicate updates do not revive cancelled work");
 });
 
 test("an uncertain state-changing command is not replayed after an ordinary restart", async () => {

@@ -28,6 +28,7 @@ import {
 	type TelegramUpdate,
 } from "./core.ts";
 import { parseQueueRequest, postToPeer, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
+import { GroupSendParameters } from './work.ts';
 import { GroupJournal, type GroupJournalOptions } from "./group-journal.ts";
 import { GroupRuntime, type GroupRuntimeOptions, type GroupTelegramApi } from "./group-runtime.ts";
 import { GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, registerGroupRecallTool, registerGroupTimelineTool } from "./group-tools.ts";
@@ -215,12 +216,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			currentContext?.ui.setStatus("telegram-owner", `telegram: ${statusText()}`);
 		};
 
-		/** The chat that shows a job's activity and receives its reply, or undefined when it has none. */
+		/** Transient status always belongs to this agent's private owner chat, not its final reply target. */
 		const transportFor = (item: WorkItem | undefined): ChatTransport | undefined => {
 			const deps = runtimeDependencies;
 			if (!deps) return undefined;
 			if (item?.reply.kind === "none") return undefined;
-			if (item?.reply.kind === "group") return groupRuntime?.transport;
 			if (!deps.sendActivity && !deps.editActivity && !deps.deleteActivity) return undefined;
 			const missing = (operation: string) => async (): Promise<never> => { throw new Error(`Telegram activity ${operation} is not configured`); };
 			return {
@@ -231,7 +231,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				deleteActivity: deps.deleteActivity ?? missing("delete"),
 			};
 		};
-		const anchorOf = (job: Job): number | undefined => (job.messageId > 0 ? job.messageId : undefined);
+		const anchorOf = (job: Job): number | undefined => job.item
+			? (job.item.reply.kind === 'private' ? job.item.reply.messageId : undefined)
+			: (job.messageId > 0 ? job.messageId : undefined);
+		const activityContext = (item: WorkItem | undefined): string | undefined => replyContextLine(item) ?? (item?.reply.kind === 'group' ? 'Group chat' : undefined);
 		const routeItemReply = (item: WorkItem) => (item.reply.kind === "group" ? groupRuntime?.transport.sendReply : undefined);
 
 		const serialized = <T>(work: () => Promise<T>): Promise<T> => {
@@ -292,12 +295,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			lastActivityError = undefined;
 			activity = new TelegramActivityMessage(job.jobId, {
 				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
-				existingMessageId: bridge.openActivity(job.jobId),
-				...(replyContextLine(job.item) ? { prefix: replyContextLine(job.item) } : {}),
+				existingMessageId: bridge.openActivity(job.jobId, 'private'),
+				...(activityContext(job.item) ? { prefix: activityContext(job.item) } : {}),
 				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
 				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
-				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId),
-				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId),
+				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId, 'private'),
+				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId, 'private'),
 				onFailure: (operation, error) => {
 					lastActivityError = `${operation}: ${sanitizeError(error)}`;
 					updateStatus();
@@ -319,17 +322,18 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const cleanupFinishedActivities = async (): Promise<void> => {
 			if (!bridge) return;
 			for (const finished of bridge.finishedActivities()) {
-				const transport = transportFor(bridge.itemFor(finished.jobId));
-				if (!transport || failedActivityDeletes.has(finished.messageId)) continue;
+				const transport = finished.destination === 'group' ? groupRuntime?.transport : transportFor(bridge.itemFor(finished.jobId));
+				const deletionKey = `${finished.destination}:${finished.messageId}`;
+				if (!transport || failedActivityDeletes.has(deletionKey)) continue;
 				try {
 					await transport.deleteActivity(finished.messageId, new AbortController().signal);
 				} catch (error) {
-					failedActivityDeletes.add(finished.messageId);
+					failedActivityDeletes.add(deletionKey);
 					lastActivityError = `delete: ${sanitizeError(error)}`;
 					updateStatus();
 					continue;
 				}
-				await bridge.recordActivityCleared(finished.jobId, finished.messageId);
+				await bridge.recordActivityCleared(finished.jobId, finished.messageId, finished.destination);
 			}
 		};
 
@@ -341,15 +345,15 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				if (!transport) continue;
 				let messageId: string;
 				try {
-					const context = replyContextLine(job.item);
+					const context = activityContext(job.item);
 					messageId = await transport.sendActivity(`${context ? `${context}\n` : ""}${queuedNoticeText(agentLabel, position)}`, new AbortController().signal, anchorOf(job));
 				} catch (error) {
-					// One unavailable destination, such as a paused group, must not hide private notices.
+					// A failed notice does not change the task's final reply routing.
 					lastActivityError = `queued: ${sanitizeError(error)}`;
 					updateStatus();
 					continue;
 				}
-				await bridge.recordActivityStarted(job.jobId, messageId);
+				await bridge.recordActivityStarted(job.jobId, messageId, 'private');
 			}
 		};
 
@@ -479,6 +483,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				`Telegram: ${connection.phase}, queue ${queued ? `${queued.owner} owner, ${queued.peer} peer` : "0"}${active}`,
 				...(group ? [`Group: ${group.state === "unverified" ? `paused, ${group.reason}` : group.state}${lastGroupError ? ` (last error: ${lastGroupError})` : ""}`] : []),
 				...(runtimeDependencies?.queuePort !== undefined ? [`Queue endpoint: ${endpoint ? `${QUEUE_ENDPOINT_HOST}:${endpoint.port}` : `unavailable${lastEndpointError ? `, ${lastEndpointError}` : ""}`}`] : []),
+				...(bridge?.taskStatus.filter(t=>t.state!=='completed').map(t=>`Task ${t.taskId}: ${t.state}, pending ${t.pending.map(p=>`${p.requestId}/${p.recipientBotId}`).join(', ')||'none'}`)??[]),
 				...(failure ? [`Last failed turn: ${failure.code} at ${failure.timestamp}${failure.detail ? ` (${failure.detail})` : ""}`] : []),
 			].join("\n");
 		};
@@ -581,7 +586,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					await bridge.completeCommand(job, `Started a new session.\nSession: ${ctx.sessionManager.getSessionId()}\n${contextText(ctx)}`);
 					// Queued group and endpoint work ends visibly; a requesting agent is woken by the notice.
 					await bridge.interruptQueuedItems("Owner started a new session", `Not handled: the owner reset ${agentLabel}'s session.`);
-					await bridge.appendGroupRecord({ type: "group_requests_closed", timestamp: new Date().toISOString() });
+					await bridge.appendGroupRecord({ type: "group_requests_closed", requestIds:bridge.journalRecords.flatMap(r=>r.type==='group_send_planned'&&r.work?.kind==='request'?[r.work.requestId]:[]), timestamp: new Date().toISOString() });
 				} else {
 					await bridge.interruptCommand(
 						job,
@@ -638,6 +643,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					state: isBusy() ? "busy" : "idle",
 					queue: bridge?.queueDepthByTier ?? { owner: 0, peer: 0 },
 					group: groupRuntime ? groupRuntime.state.state : "unconfigured",
+					tasks: bridge?.taskStatus ?? [],
 				},
 			}),
 		});
@@ -807,30 +813,20 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.registerTool({
 			name: GROUP_SEND_TOOL,
 			label: "Send to group chat",
-			description: "Ask another agent a question in the group chat shared with the owner and the other agents. Mention the agent as @username. Its answer comes back to you as a new turn carrying the work that led you to ask. To answer the message you are working on, do not use this tool: just write your reply, which is posted automatically. Only the supplied text is sent.",
-			promptSnippet: "Ask another agent a question in the shared group chat",
+			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients, automatically prepend any missing recipient @mentions to the body, and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text, recipient mentions and public work metadata are sent.",
+			promptSnippet: "Send an explicit request, correlated reply or informational notification",
 			promptGuidelines: [
-				"Use telegram_group_send only to ask another agent something, mentioning it as @username, then end your turn; the answer wakes you. To answer the message you are working on, write your reply normally; it is posted automatically.",
-				"A telegram_group_send that replies to the message you are working on, such as a clarifying question, is your response to that message: your final reply to it is not posted.",
+				"Use kind request and explicit recipients to delegate work. End normally without text to wait; accepted child results resume only a recorded waiting task. Normal final text while dependencies remain is progress, not completion.",
+				"Use kind reply with requestId for an explicit terminal result, including failed, blocked or cancelled. Only that recipient obligation is completed. A normal final also completes a request when no dependencies or unconsumed results remain.",
+				"Use kind notify for information; omit recipients for room context without wake-ups. Processing information or an accepted Reply requires no acknowledgment. Completed tasks never reopen merely because a late result arrives.",
+				"Outstanding requests are not execution locks. Handle independent dependency work serially; if an answer logically requires its own unfinished ancestor result, return a blocked Reply explaining that dependency.",
 			],
-			parameters: {
-				type: "object",
-				properties: {
-					text: { type: "string", minLength: 1, description: "The request, including @username mentions of the agents it is for." },
-					replyToMessageId: { type: "integer", minimum: 1, description: "A group message ID to reply to, such as the owner's request being passed on." },
-				},
-				required: ["text"],
-				additionalProperties: false,
-			} as any,
+			parameters: GroupSendParameters as any,
 			executionMode: "sequential",
 			execute: async (toolCallId, params) => {
-				const input = params as { text: string; replyToMessageId?: number };
 				if (!groupRuntime) throw new Error("CAPABILITY_UNAVAILABLE: the group chat is not configured.");
-				const messageId = await groupRuntime.sendRequest(`tool:${toolCallId}`, input.text, input.replyToMessageId, bridge?.activeJob?.jobId);
-				if (bridge && await bridge.recordRespondedByRequest(input.replyToMessageId, messageId)) {
-					return { content: [{ type: "text" as const, text: `Posted group message ${messageId} as a question replying to message ${input.replyToMessageId}, the message you are working on. That question is your response to it: your final reply will not be posted, and the answer will come back to you as a new turn. End your turn now.` }], details: { messageId, respondedToCurrentMessage: true } };
-				}
-				return { content: [{ type: "text" as const, text: `Posted group message ${messageId}. The answer will come back to you as a new turn.` }], details: { messageId, respondedToCurrentMessage: false } };
+				const result=await groupRuntime.sendWork(`tool:${toolCallId}`,params);
+				return {content:[{type:'text' as const,text:`Published ${result.kind} as group message ${result.messageId}. Publication is not completion of requested work.`}],details:result};
 			},
 		});
 		pi.on("resources_discover", () => { updateRecall(); updateStatus(); });
