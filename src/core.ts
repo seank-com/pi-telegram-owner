@@ -311,32 +311,39 @@ export function workItemIdForKey(channel: WorkItem["channel"], key: string): str
 	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
-/** Approved private-owner activity window. Not a transport timeout. */
-export const PRIVATE_OWNER_ACTIVITY_WINDOW_MS = 20 * 60 * 1000;
+export interface OwnerActivity {
+	lastOwnerMessageAt: string | null;
+	lastAgentMessageAt: string | null;
+}
 
-/** A private owner turn in either direction within the approved window. Group traffic does not count. */
-export function privateOwnerActivity(records: readonly JournalRecord[], privateChatId: number, now: number): { active: boolean; lastTurnAt: string | null } {
+/** Private-owner recency facts. The caller chooses any window. Group traffic does not count. */
+export function privateOwnerActivity(records: readonly JournalRecord[], privateChatId: number): OwnerActivity {
 	const privateJobs = new Set<string>();
-	let latest = Number.NEGATIVE_INFINITY;
-	const consider = (at: number) => { if (Number.isFinite(at)) latest = Math.max(latest, at); };
+	let lastOwner = Number.NEGATIVE_INFINITY;
+	let lastAgent = Number.NEGATIVE_INFINITY;
+	const consider = (side: "owner" | "agent", at: number) => {
+		if (!Number.isFinite(at)) return;
+		if (side === "owner") lastOwner = Math.max(lastOwner, at);
+		else lastAgent = Math.max(lastAgent, at);
+	};
 	for (const record of records) {
 		if (record.type === "update" && record.disposition === "accepted" && record.chatId === privateChatId) {
 			if (record.jobId) privateJobs.add(record.jobId);
-			consider(record.telegramDate !== undefined ? record.telegramDate * 1000 : Date.parse(record.timestamp));
+			consider("owner", record.telegramDate !== undefined ? record.telegramDate * 1000 : Date.parse(record.timestamp));
 		} else if (record.type === "work_item" && record.reply.kind === "private") privateJobs.add(record.itemId);
 	}
 	for (const record of records) {
 		if (record.type === "inbound_batch" && record.memberJobIds.some((id) => privateJobs.has(id))) privateJobs.add(record.batchId);
 	}
 	for (const record of records) {
-		if (record.type === "reply_chunk_sent" && privateJobs.has(record.jobId)) consider(Date.parse(record.timestamp));
+		if (record.type === "reply_chunk_sent" && privateJobs.has(record.jobId)) consider("agent", Date.parse(record.timestamp));
 		else if (record.type === "reply_sent" && privateJobs.has(record.jobId)) {
 			if ("messageIds" in record && record.messageIds.length === 0) continue;
-			if (record.timestamp) consider(Date.parse(record.timestamp));
+			if (record.timestamp) consider("agent", Date.parse(record.timestamp));
 		}
 	}
-	if (!Number.isFinite(latest)) return { active: false, lastTurnAt: null };
-	return { active: now - latest <= PRIVATE_OWNER_ACTIVITY_WINDOW_MS, lastTurnAt: new Date(latest).toISOString() };
+	const iso = (at: number) => Number.isFinite(at) ? new Date(at).toISOString() : null;
+	return { lastOwnerMessageAt: iso(lastOwner), lastAgentMessageAt: iso(lastAgent) };
 }
 
 export interface TelegramBridgeOptions {
@@ -847,9 +854,9 @@ export class TelegramOwnerBridge {
 		return { owner: queued.filter((job) => job.tier !== "peer").length, peer: queued.filter((job) => job.tier === "peer").length };
 	}
 
-	/** Private-owner recency. Idle and empty queues do not make this inactive. */
-	get ownerActivity(): { active: boolean; lastTurnAt: string | null } {
-		return privateOwnerActivity(this.records, this.privateChatId, this.now());
+	/** Private-owner recency facts. Idle does not clear them, and no window is applied. */
+	get ownerActivity(): OwnerActivity {
+		return privateOwnerActivity(this.records, this.privateChatId);
 	}
 
 	/** Durably admits a non-private work item. Repeating an item ID returns the original item. */
