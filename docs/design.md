@@ -683,7 +683,12 @@ the private chat while delivery keeps retrying.
   group is verified. It also reports local task identities, execution/waiting
   state, pending request/recipient identities and terminal dispositions without
   including task text or private destination details. `idle` describes the
-  execution queue, not the absence of waiting obligations.
+  execution queue, not the absence of waiting obligations. `activity` is a
+  separate fact: `active` is true when a private owner turn, in either
+  direction, was observed within the last 20 minutes, including a turn exactly
+  20 minutes old. Group messages, peer requests, queue depth, and a reply that
+  was not sent do not count. `lastTurnAt` is the newest counted turn, or null.
+  No message text is included. This is not a busy flag and not a mail schedule.
 
 The endpoint starts with the transport and stops on shutdown. A port that
 cannot be bound disables the endpoint with a diagnostic and leaves the
