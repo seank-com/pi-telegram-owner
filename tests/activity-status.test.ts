@@ -40,6 +40,25 @@ test("a private turn older than 20 minutes is inactive, and group traffic does n
 	assert.deepEqual(privateOwnerActivity(records, CHAT, NOW), { active: false, lastTurnAt: new Date(old).toISOString() });
 });
 
+test("a sent batched or plain private reply refreshes activity after the inbound ages out", async () => {
+	for (const options of [{ inboundQuietWindowMs: undefined, formattedDelivery: true }, { inboundQuietWindowMs: 0, formattedDelivery: false }] as const) {
+		const now = Date.now();
+		let clock = now - PRIVATE_OWNER_ACTIVITY_WINDOW_MS - 60_000;
+		const bridge = new TelegramOwnerBridge(new MemoryJournal(), OWNER, CHAT, { now: () => clock, inboundQuietWindowMs: options.inboundQuietWindowMs, formattedDelivery: options.formattedDelivery });
+		await bridge.initialize();
+		await bridge.ingestBatch([ownerText(1, "Synthetic question", Math.floor(clock / 1000))]);
+		clock = now;
+		let prompt = "";
+		const job = await bridge.dispatchNext("synthetic-session", (text) => { prompt = text; });
+		assert.ok(job);
+		bridge.observeInput("extension", prompt);
+		assert.equal(await bridge.beforeAgentStart(prompt, "synthetic-session"), true);
+		bridge.captureAgentEnd("Synthetic answer");
+		assert.equal(await bridge.settle(async () => "900"), true);
+		assert.equal(bridge.ownerActivity.active, true, JSON.stringify(options));
+	}
+});
+
 test("a private reply within 20 minutes is active after the owner's message has aged out", () => {
 	const old = NOW - PRIVATE_OWNER_ACTIVITY_WINDOW_MS - 1;
 	const replied = NOW - 60_000;

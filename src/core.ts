@@ -326,6 +326,9 @@ export function privateOwnerActivity(records: readonly JournalRecord[], privateC
 		} else if (record.type === "work_item" && record.reply.kind === "private") privateJobs.add(record.itemId);
 	}
 	for (const record of records) {
+		if (record.type === "inbound_batch" && record.memberJobIds.some((id) => privateJobs.has(id))) privateJobs.add(record.batchId);
+	}
+	for (const record of records) {
 		if (record.type === "reply_chunk_sent" && privateJobs.has(record.jobId)) consider(Date.parse(record.timestamp));
 		else if (record.type === "reply_sent" && privateJobs.has(record.jobId)) {
 			if ("messageIds" in record && record.messageIds.length === 0) continue;
@@ -1226,7 +1229,7 @@ export class TelegramOwnerBridge {
 			const id = index === 0 ? await this.sendWithAnchorRecovery(job, chunk, undefined, send) : await send(chunk);
 			if (!firstId) firstId = id;
 		}
-		await this.append({ type: "reply_sent", jobId: job.jobId, messageId: firstId });
+		await this.append({ type: "reply_sent", jobId: job.jobId, messageId: firstId, timestamp: new Date(this.now()).toISOString() });
 	}
 
 	/**
