@@ -683,7 +683,14 @@ the private chat while delivery keeps retrying.
   group is verified. It also reports local task identities, execution/waiting
   state, pending request/recipient identities and terminal dispositions without
   including task text or private destination details. `idle` describes the
-  execution queue, not the absence of waiting obligations.
+  execution queue, not the absence of waiting obligations. `ownerActivity` is
+  separate and contains only facts: `lastOwnerMessageAt` and
+  `lastAgentMessageAt`, each an ISO timestamp or null when that direction has
+  never occurred. The two are independent. A private reply with no owner
+  message sets only `lastAgentMessageAt`. Group messages, peer requests, queue
+  depth, and a reply that was not sent do not move either field. No window is
+  applied and no message text is included. A consumer compares the timestamps
+  with its own clock. This is not a busy flag and not a mail schedule.
 
 The endpoint starts with the transport and stops on shutdown. A port that
 cannot be bound disables the endpoint with a diagnostic and leaves the

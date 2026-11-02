@@ -644,6 +644,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					queue: bridge?.queueDepthByTier ?? { owner: 0, peer: 0 },
 					group: groupRuntime ? groupRuntime.state.state : "unconfigured",
 					tasks: bridge?.taskStatus ?? [],
+					ownerActivity: bridge?.ownerActivity ?? { lastOwnerMessageAt: null, lastAgentMessageAt: null },
 				},
 			}),
 		});
