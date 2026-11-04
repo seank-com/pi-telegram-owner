@@ -122,7 +122,11 @@ curl -s -X POST http://127.0.0.1:7351/queue -H 'Content-Type: application/json' 
 `reply` selects the private chat, the group or no reply. Use a stable `id` per
 logical request so retries do not queue duplicates. `GET /status` returns
 `state` (`idle` or `busy`), `queue` (`owner` and `peer` counts) and `group`
-(`unconfigured`, `verifying`, `verified` or `unverified`). The endpoint never listens on other interfaces. A
+(`unconfigured`, `verifying`, `verified` or `unverified`). It also includes
+`ownerActivity.lastOwnerMessageAt` and `ownerActivity.lastAgentMessageAt`.
+Which messages those fields count, what null means, and the absence of an
+active flag or recency window are defined under [Queue endpoint](design.md#queue-endpoint).
+The endpoint never listens on other interfaces. A
 group chat requires a queue port.
 
 ## Group chat
