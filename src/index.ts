@@ -1126,7 +1126,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.on("session_before_tree", beforeTransition);
 		pi.on("session_tree", () => { hostTransition = false; selectors?.invalidate(); });
 		pi.on("session_before_compact", () => {
-			// Do not cancel automatic compaction or this extension's own /compact command.
+			// This hook is too late to prevent Pi manual compaction's earlier turn abort.
+			// Cancelling only an in-flight selector mutation is safe and helps that case.
+			// Other queued work may remain blocked by this extension's busy admission gate.
 			if (selectors?.mutating) return { cancel: true };
 			hostCompacting = true;
 		});
