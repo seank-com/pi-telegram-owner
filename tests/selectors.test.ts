@@ -373,3 +373,14 @@ test("fresh idempotent selections remain allowed after a restart without replayi
 	await restarted.selectors.handle(command(3)); await restarted.selectors.handle(callback(4, restarted.button(0)));
 	assert.equal(restarted.calls, 1); assert.equal(restarted.outcome(), "applied");
 });
+
+
+test("a background full log's stale busy-compaction assertions are not implemented", async () => {
+	// Deliberately pin the current guard's acceptance, not a removed over-broad cancel.
+	for (const text of ["/compact", "queued inbound"]) {
+		const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
+		await h.poll([command(1, text)]);
+		assert.equal(await h.emit("session_before_compact"), undefined);
+		await h.emit("session_shutdown", { reason: "exit" });
+	}
+});
