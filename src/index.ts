@@ -1,1128 +1,1458 @@
-import { resolve } from "node:path";
+import { taskResultContext, validObligation, validateTaskRecords, type Disposition, type GroupWork, type Obligation, type TaskRecord } from "./work.ts";
+import { mkdir, open, readFile, truncate } from "node:fs/promises";
+import { dirname } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { SelectorRecord } from "./selectors.ts";
+import { parseTelegramOwnerCommand, type TelegramOwnerCommandName } from "./commands.ts";
+import { createTelegramTransportPlan, MAX_TELEGRAM_CHUNKS, TELEGRAM_HTML_LIMIT, type TelegramTransportPlan } from "./format.ts";
 
-import { createDatastoreIntegration, parseDatastorePolicy, type DatastorePolicy } from "./datastore.ts";
-import { formatTelegramToolActivity } from "./activity.ts";
-import { TelegramMarkdownProjector } from "./markdown-projector.ts";
-import {
-	initialThinkingText,
-	queuedNoticeText,
-	telegramOwnerHelpText,
-	unsupportedTelegramCommandText,
-} from "./commands.ts";
-import {
-	DEFAULT_INBOUND_QUIET_WINDOW_MS,
-	extractAssistantText,
-	JsonlJournal,
-	type Journal,
-	type Job,
-	type WorkItem,
-	type TurnOutcome,
-	replyContextLine,
-	type ArchivedTelegramAttachment,
-	type ResolvedArchivedImage,
-	TelegramOwnerBridge,
-	type TelegramImageRef,
-	type TelegramUpdate,
-} from "./core.ts";
-import { parseQueueRequest, postToPeer, QUEUE_ENDPOINT_HOST, startQueueEndpoint, type QueueEndpoint, type QueueEndpointHandlers } from "./endpoint.ts";
-import { GroupSendParameters } from './work.ts';
-import { GroupJournal, type GroupJournalOptions } from "./group-journal.ts";
-import { GroupRuntime, type GroupRuntimeOptions, type GroupTelegramApi } from "./group-runtime.ts";
-import { GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, registerGroupRecallTool, registerGroupTimelineTool } from "./group-tools.ts";
-import { registerTelegramRecallTool } from "./recall.ts";
-import { registerTelegramTimelineTool } from "./timeline.ts";
-import {
-	type ConnectionStatus,
-	loadTelegramOwnerConfig,
-	LongPollSource,
-	PollerLock,
-	projectTelegramOwnerConfigPath,
-	readSafeOutboundImage,
-	sanitizeError,
-	TelegramActivityMessage,
-	TelegramReplyAnchorError,
-	TelegramTypingActivity,
-	type GroupChatConfig,
-} from "./runtime.ts";
+export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported" | "group" | "local";
 
-export interface PrototypeSource {
-	start(
-		onBatch: (updates: TelegramUpdate[]) => Promise<number | undefined>,
-		cursor?: number,
-	): Promise<() => Promise<void>>;
+export interface TelegramImageRef {
+	fileId: string;
+	mimeType: "image/jpeg" | "image/png" | "image/webp";
+	fileSize?: number;
 }
 
-export interface PrototypeDependencies {
-	journal: Journal;
-	ownerUserId: number;
-	privateChatId: number;
-	/** Validated configured override; skips Telegram identity lookup when present. */
-	agentLabel?: string;
-	/** Resolves the validated Telegram bot first name once during startup. */
-	resolveAgentLabel?(signal?: AbortSignal): Promise<string>;
+export interface ResolvedImage {
+	data: string;
+	mimeType: string;
+}
+
+export interface ArchivedTelegramAttachment {
+	sha256: string;
+	size: number;
+	mimeType: "image/jpeg" | "image/png" | "image/webp";
+	path: string;
+	source: "live" | "telegram-desktop-import";
+	direction: "in" | "out";
+}
+
+export interface ResolvedArchivedImage {
+	image: ResolvedImage;
+	attachment: ArchivedTelegramAttachment;
+}
+
+export interface TelegramUser {
+	id: number;
+	is_bot?: boolean;
+	username?: string;
+	first_name?: string;
+}
+
+export interface TelegramMessage {
+	message_id: number;
+	date?: number;
+	edit_date?: number;
+	text?: string;
+	caption?: string;
+	entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string; user?: TelegramUser }>;
+	caption_entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string; user?: TelegramUser }>;
+	photo?: Array<{ file_id: string; file_size?: number; width?: number; height?: number }>;
+	document?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
+	chat: { id: number; type: string };
+	from?: TelegramUser;
+	/** Set when the owner posts anonymously as the group. */
+	sender_chat?: { id: number; type: string };
+	/** Telegram's copy of the replied-to message, without its own reply. */
+	reply_to_message?: Omit<TelegramMessage, "reply_to_message">;
+}
+
+export interface TelegramChatMemberUpdate {
+	chat: { id: number; type: string };
+	from?: TelegramUser;
+	date?: number;
+	old_chat_member?: { status: string; user: TelegramUser };
+	new_chat_member: { status: string; user: TelegramUser };
+}
+
+export interface TelegramCallbackQuery {
+	id: string;
+	from: { id: number };
+	message?: { message_id: number; chat: { id: number; type: string } };
+	data?: string;
+}
+
+export interface TelegramUpdate {
+	update_id: number;
+	message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
+	chat_member?: TelegramChatMemberUpdate;
+	my_chat_member?: TelegramChatMemberUpdate;
+}
+
+/** A group update kept in the agent's own transport journal until it is published to the shared journal. */
+export type GroupUpdatePayload =
+	| { kind: "message"; message: TelegramMessage }
+	| { kind: "member"; member: TelegramChatMemberUpdate; self: boolean }
+	| { kind: "foreign-chat"; chatId: number; chatType: string };
+
+/** Agent-local progress for group work. These records never affect the private queue. */
+export type GroupProgressRecord =
+	| { type: "group_handled"; updateId: number; stage: "published" | "routed"; timestamp: string }
+	| { type: "group_send_planned"; sendId: string; text: string; replyToMessageId?: number; originJobId?: string; work?: GroupWork; timestamp: string }
+	| { type: "group_send_accepted"; sendId: string; messageIds: number[]; date: number; timestamp: string }
+	| { type: "group_post_recorded"; postId: string; messageId: number; timestamp: string }
+	| { type: "group_wake"; messageId: number; peer: string; timestamp: string }
+	| { type: "group_wake_done"; messageId: number; peer: string; outcome: "accepted" | "rejected"; timestamp: string }
+	/** /new closes requests this agent was waiting on; later answers become context. */
+	| { type: "group_requests_closed"; requestIds?:string[]; timestamp: string }
+	/** An unaddressed owner item this agent may claim in an election. */
+	| { type: "group_candidate"; firstMessageId: number; messageIds: number[]; timestamp: string }
+	| { type: "group_candidate_done"; firstMessageId: number; outcome: "claimed" | "lost"; timestamp: string }
+	/** The latest group message an admitted group item brought into this agent's session. */
+	| { type: "group_seen"; messageId: number; timestamp: string }
+	| { type: 'group_context_recorded'; messageId:number; timestamp:string };
+
+export interface FetchLike {
+	(input: string, init: { method: string; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal }): Promise<{
+		ok: boolean;
+		status?: number;
+		json(): Promise<unknown>;
+		arrayBuffer?(): Promise<ArrayBuffer>;
+	}>;
+}
+
+export async function fetchUpdateBatch(
+	fetchImpl: FetchLike,
+	token: string,
+	cursor?: number,
+	signal?: AbortSignal,
+	pollTimeoutSeconds = 0,
+	allowedUpdates: readonly string[] = ["message"],
+): Promise<TelegramUpdate[]> {
+	const response = await fetchImpl(`https://api.telegram.org/bot${token}/getUpdates`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			offset: cursor === undefined ? undefined : cursor + 1,
+			timeout: pollTimeoutSeconds,
+			allowed_updates: allowedUpdates,
+		}),
+		signal,
+	});
+	const payload = (await response.json()) as { ok?: boolean; result?: unknown };
+	if (!response.ok || payload.ok !== true || !Array.isArray(payload.result)) {
+		throw new Error("Telegram getUpdates failed");
+	}
+	return payload.result as TelegramUpdate[];
+}
+
+/**
+ * Telegram does not let one bot reply to another bot's message. A reply to
+ * another agent is sent with this quote and an @mention instead; the shared
+ * journal still records the reply link.
+ */
+export interface ReplyQuote {
+	/** The other agent's display name. */
+	sender: string;
+	/** The other agent's bot username, without @. */
+	account: string;
+	text: string;
+}
+
+/** The first line of a message, shortened at a word boundary. */
+export function quoteExcerpt(text: string, max = 80): string {
+	const firstLine = text.split("\n").find((line) => line.trim())?.trim() ?? "";
+	if (firstLine.length <= max) return firstLine;
+	const cut = firstLine.slice(0, max - 1);
+	return `${(cut.lastIndexOf(" ") > max / 2 ? cut.slice(0, cut.lastIndexOf(" ")) : cut).trimEnd()}…`;
+}
+
+/** Names what a transient message is about when Telegram cannot show it as a reply. */
+export function replyContextLine(item: WorkItem | undefined): string | undefined {
+	const quote = item?.reply.kind === "group" ? item.reply.quote : undefined;
+	return quote ? `RE: ${quote.sender}: ${quoteExcerpt(quote.text, 60)}` : undefined;
+}
+
+/** The quote and @mention that stand in for a reply Telegram cannot show. */
+export function quotedReplyText(quote: ReplyQuote, text: string): string {
+	const excerpt = quoteExcerpt(quote.text);
+	const escaped = excerpt.replace(/([\\`*_[\]])/g, "\\$1");
+	return `> ${quote.sender}: ${escaped}\n\n@${quote.account}\n${text}`;
+}
+
+/** Where a work item's final reply goes. */
+export type ReplyDestination =
+	| { kind: "private"; messageId?: number }
+	| { kind: "group"; chatId: number; messageId?: number; quote?: ReplyQuote }
+	| { kind: "none" };
+
+/** Non-private work admitted to the queue: group messages and queue endpoint items. */
+export interface WorkItem {
+	itemId: string;
+	/** Stable local parent on a continuation; never published to peers. */
+	taskId?: string;
+	obligation?: Obligation;
+	information?: boolean;
+	channel: "group" | "endpoint" | "private";
+	authority: "owner" | "peer";
+	/** Display name of the authenticated sender, or the endpoint caller's source label. */
+	sender: string;
+	text: string;
+	reply: ReplyDestination;
+	/** Additional verified context lines for the envelope, such as a referenced owner message. */
+	context?: string[];
+	/** Caller-supplied key; repeating it returns the original item. */
+	idempotencyKey?: string;
+	/** Images for the model, as paths relative to the group's shared root. */
+	images?: Array<{ path: string; mimeType: "image/jpeg" | "image/png" | "image/webp" }>;
+	timestamp: string;
+}
+
+/** Why a turn ended without a usable final reply. */
+export type TurnFailureCode = "LENGTH" | "ABORTED" | "MODEL_ERROR" | "NO_REPLY";
+
+const TURN_FAILURE_TEXT: Record<TurnFailureCode, string> = {
+	LENGTH: "the reply was cut off by the model's length limit",
+	ABORTED: "the turn was stopped before it finished",
+	MODEL_ERROR: "the model request failed",
+	NO_REPLY: "the model produced no reply",
+};
+
+export function turnFailureNotice(code: TurnFailureCode): string {
+	return `Couldn't finish this: ${TURN_FAILURE_TEXT[code]}.`;
+}
+
+/** How a turn ended, from the session's final assistant message. */
+export interface TurnOutcome {
+	text?: string;
+	failure?: TurnFailureCode;
+	/** Bounded provider detail for diagnostics; never shown to the chat. */
+	detail?: string;
+}
+
+export type JournalRecord =
+	| TaskRecord
+	| SelectorRecord
+	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
+	| { type: "turn_failed"; jobId: string; code: TurnFailureCode; detail?: string; timestamp: string }
+	/** The turn responded with a telegram_group_send request replying to its own message; its final reply is not posted. */
+	| { type: "responded_by_request"; jobId: string; messageId: number; timestamp: string }
+	| GroupProgressRecord
+	| {
+			type: "update";
+			schemaVersion?: 2 | 3;
+			updateId: number;
+			disposition: UpdateDisposition;
+			timestamp: string;
+			jobId?: string;
+			messageId?: number;
+			chatId?: number;
+			userId?: number;
+			text?: string;
+			rawText?: string;
+			telegramDate?: number;
+			telegramEditDate?: number;
+			entities?: Array<{ type: string; offset: number; length: number; url?: string; language?: string }>;
+			images?: TelegramImageRef[];
+			command?: TelegramOwnerCommandName | "unknown";
+			group?: GroupUpdatePayload;
+	  }
+	| { type: "inbound_batch"; schemaVersion: 1; batchId: string; revision: number; state: "open" | "sealed" | "dispatching"; openedAt: string; readyAt: string; memberJobIds: string[]; messageIds: number[]; segmentSha256: string[]; boundaries: Array<{ start: number; end: number }>; text: string; finalMessageId: number }
+	| { type: "media_captured"; schemaVersion: 1; mediaId: string; jobId: string; direction: "in" | "out"; attachment: ArchivedTelegramAttachment; telegram: { updateId?: number; messageId?: number; fileId?: string }; timestamp: string }
+	| { type: "photo_send_planned"; schemaVersion: 1; photoId: string; deliveryKey: string; jobId: string; caption: string; replyToMessageId: number; attachment: ArchivedTelegramAttachment; timestamp: string }
+	| { type: "photo_sent"; schemaVersion: 1; photoId: string; jobId: string; messageId: string; timestamp: string }
+	| { type: "dispatch_requested"; jobId: string; sessionId: string; timestamp?: string }
+	| { type: "command_started"; jobId: string; command: TelegramOwnerCommandName | "unknown"; timestamp?: string }
+	| { type: "dispatched"; jobId: string; sessionId: string; timestamp?: string }
+	| { type: "reply_ready"; jobId: string; text: string; sessionEntryId?: string; timestamp?: string }
+	| { type: "reply_plan"; jobId: string; renderer: "telegram-html-v1"; rawSha256: string; chunks: Array<{ index: number; format: "HTML" | "plain"; payload: string; plainFallback: string; payloadSha256: string }> }
+	| { type: "reply_chunk_rejected"; jobId: string; index: number; code: "HTML_REJECTED"; timestamp: string }
+	| { type: "reply_anchor_rejected"; jobId: string; index: 0; code: "REPLY_TARGET_MISSING"; timestamp: string }
+	| { type: "reply_chunk_sent"; jobId: string; index: number; messageId: string; format: "HTML" | "plain"; timestamp: string }
+	| { type: "reply_sent"; jobId: string; messageId: string; timestamp?: string }
+	| { type: "reply_sent"; jobId: string; messageIds: string[]; timestamp: string }
+	| { type: "projection_needed"; jobId: string; direction: "in" | "out"; reason: "content" | "metadata"; canonical: { kind: "pi"; sessionId: string; entryId: string } | { kind: "local-response" }; timestamp: string }
+	| { type: "projection_committed"; jobId: string; direction: "in" | "out"; messageId: string; contentRevision: number; contentSha256: string; metadataRevision: number; metadataSha256: string; timestamp: string }
+	| { type: "projection_deferred"; jobId: string; direction: "in" | "out"; code: string; timestamp: string }
+	| { type: "activity_started"; jobId: string; messageId: string; destination?: "private" | "group" }
+	| { type: "activity_cleared"; jobId: string; messageId: string; destination?: "private" | "group" }
+	| { type: "interrupted"; jobId: string; reason: string };
+
+export interface Job {
+	jobId: string;
+	updateId: number;
+	messageId: number;
+	text: string;
+	telegramDate?: number;
+	images: TelegramImageRef[];
+	captureRequired?: boolean;
+	command?: TelegramOwnerCommandName | "unknown";
+	batchId?: string;
+	memberJobIds?: string[];
+	messageIds?: number[];
+	segmentSha256?: string[];
+	boundaries?: Array<{ start: number; end: number }>;
+	/** Present for non-private work; private jobs answer in the private chat. */
+	item?: WorkItem;
+	/** Owner-authority work runs before peer work. */
+	tier?: "owner" | "peer";
+	/** Admission order within the journal. */
+	order?: number;
+}
+
+export const WORK_ITEM_MARKER_PREFIX = "[telegram-item:";
+
+/** The model-visible envelope for a non-private work item. */
+export function renderWorkItemPrompt(item: WorkItem): string {
+	const channel = item.channel === "group" ? "group chat" : item.channel === 'private' ? 'private owner chat' : "queue endpoint";
+	const destination = item.reply.kind === "private"
+		? item.reply.messageId ? `the private chat with the owner, as a reply to message ${item.reply.messageId}` : "the private chat with the owner"
+		: item.reply.kind === "group"
+			? item.reply.messageId ? `the group chat, as a reply to message ${item.reply.messageId}` : "the group chat"
+			: "nowhere; this turn sends no reply";
+	const lines = [
+		`Channel: ${channel}`,
+		`From: ${item.sender} (${item.authority} authority)`,
+		`Task: ${item.taskId ?? item.itemId}. ${item.information ? 'Information only; no acknowledgment or terminal reply is required.' : 'A normal final completes this task only when no delegated results remain pending.'}`,
+		...(item.obligation ? [`Request obligation: ${item.obligation.requestId}; chain: ${item.obligation.chainId}; recipient: ${item.obligation.recipientBotId}. Use kind reply and this requestId for an explicit terminal result.`] : []),
+		`Your final reply goes to ${destination}.`,
+		...(item.channel === "group" ? ["The owner and every configured agent can read the group chat."] : []),
+		...(item.context ?? []),
+	];
+	return `${lines.join("\n")}\n\n${item.text}`;
+}
+
+/** Item IDs are UUIDs, or endpoint-chosen keys hashed into the same shape. */
+export function workItemIdForKey(channel: WorkItem["channel"], key: string): string {
+	const hex = createHash("sha256").update(`${channel}\n${key}`, "utf8").digest("hex");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+export interface TelegramBridgeOptions {
+	/** Runtime-selected; false retains exact plain-v1 delivery. */
 	formattedDelivery?: boolean;
+	/** Same-date text segments are durably coalesced before dispatch. Default 4000ms. */
 	inboundQuietWindowMs?: number;
-	markdownProjector?: TelegramMarkdownProjector;
-	/** Mandatory media-event stream writer, including when note projection is disabled. */
-	mediaProjector?: TelegramMarkdownProjector;
-	/** Enqueues coalesced lexical maintenance after durable Markdown publication. */
-	requestLexicalRefresh?(signal?: AbortSignal): Promise<void>;
-	source: PrototypeSource;
-	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
-	reconcileCommandMenu?(signal?: AbortSignal): Promise<void>;
-	/** Sends a transient activity or queued notice, as a reply when a message is given. */
-	sendActivity?(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
-	editActivity?(messageId: string, text: string, signal: AbortSignal): Promise<void>;
-	deleteActivity?(messageId: string, signal: AbortSignal): Promise<void>;
-	resolveImages?(images: TelegramImageRef[], archived: readonly ArchivedTelegramAttachment[]): Promise<ResolvedArchivedImage[]>;
-	stageOutboundPhoto?(path: string, projectRoot: string): Promise<{ image: { bytes: Buffer; filename: string; mimeType: string }; attachment: ArchivedTelegramAttachment }>;
-	sendPhoto?(image: { bytes: Buffer; filename: string; mimeType: string }, caption: string | undefined, replyToMessageId?: number, signal?: AbortSignal): Promise<string>;
-	sendTyping?(signal: AbortSignal): Promise<void>;
-	/** Group chat configuration and Telegram access, when this agent joins a group. */
-	groupChat?: {
-		config: GroupChatConfig;
-		api: GroupTelegramApi;
-		journalOptions?: GroupJournalOptions;
-		wake?: GroupRuntimeOptions["wake"];
-		coordinate?: GroupRuntimeOptions["coordinate"];
-		retryDelayMs?: GroupRuntimeOptions["retryDelayMs"];
+	/** The configured group chat, whose updates are kept for the group runtime. */
+	groupChatId?: number;
+	now?: () => number;
+}
+
+export interface Recovery {
+	cursor?: number;
+	queued: Job[];
+	uncertain: Job[];
+	pendingCommands: Job[];
+	uncertainCommands: Job[];
+	repliesToRetry: Array<Job & { reply: string }>;
+	orphanedActivities: Array<{ jobId: string; messageId: string }>;
+}
+
+export interface Journal {
+	load(): Promise<JournalRecord[]>;
+	append(record: JournalRecord): Promise<void>;
+}
+
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+export type SendReply = (text: string, replyTo?: number, format?: "HTML" | "plain") => Promise<string>;
+
+/** Chooses the sender for a work item whose reply goes to the group; undefined when the group is unavailable. */
+export type ItemReplyRoute = (item: WorkItem) => SendReply | undefined;
+
+export class ReplyDestinationUnavailableError extends Error {}
+
+function validQuote(quote: unknown): boolean {
+	if (quote === undefined) return true;
+	const value = quote as Partial<ReplyQuote>;
+	return Boolean(value && typeof value.sender === "string" && value.sender && typeof value.account === "string" && /^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(value.account) && typeof value.text === "string");
+}
+
+function validateWorkItem(record: Extract<JournalRecord, { type: "work_item" }>): void {
+	if((record.taskId!==undefined&&(typeof record.taskId!=='string'||!record.taskId))||(record.obligation!==undefined&&!validObligation(record.obligation))||(record.information!==undefined&&typeof record.information!=='boolean'))throw new StateCorruptionError('Work lifecycle metadata is invalid');
+	const reply = record.reply as Partial<{ kind: string; chatId: number; messageId: number }> | undefined;
+	const validMessageId = reply?.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0);
+	const validReply = (reply?.kind === "private" && validMessageId) || reply?.kind === "none" || (reply?.kind === "group" && Number.isSafeInteger(reply.chatId) && (reply.messageId === undefined || (Number.isSafeInteger(reply.messageId) && reply.messageId > 0)) && validQuote((reply as { quote?: unknown }).quote));
+	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.itemId) || !["group", "endpoint", "private"].includes(record.channel) || !["owner", "peer"].includes(record.authority) || typeof record.sender !== "string" || !record.sender || typeof record.text !== "string" || !record.text || !validReply || (record.context !== undefined && (!Array.isArray(record.context) || record.context.some((line) => typeof line !== "string"))) || (record.idempotencyKey !== undefined && (typeof record.idempotencyKey !== "string" || !record.idempotencyKey)) || (record.images !== undefined && (!Array.isArray(record.images) || record.images.some((image) => !/^_attachments\/[0-9a-f]{64}\.(jpg|png|webp)$/.test(image?.path) || !["image/jpeg", "image/png", "image/webp"].includes(image?.mimeType)))) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Work item record is invalid");
+}
+
+export class StateCorruptionError extends Error {}
+
+export const DEFAULT_INBOUND_QUIET_WINDOW_MS = 4_000;
+export const MIN_INBOUND_QUIET_WINDOW_MS = 100;
+export const MAX_INBOUND_QUIET_WINDOW_MS = 5_000;
+
+function sha256(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+export function outboundPhotoDeliveryKey(attachment: ArchivedTelegramAttachment, caption: string | undefined, replyToMessageId: number): string {
+	return sha256(`${attachment.sha256}\n${(caption ?? "").replace(/\r\n?/g, "\n")}\n${replyToMessageId}`);
+}
+
+export function validateMediaLifecycle(records: readonly JournalRecord[]): void {
+	const validAttachment = (attachment: ArchivedTelegramAttachment): boolean => Boolean(attachment && /^[0-9a-f]{64}$/.test(attachment.sha256) && Number.isSafeInteger(attachment.size) && attachment.size > 0 && attachment.size <= MAX_IMAGE_BYTES && ["image/jpeg", "image/png", "image/webp"].includes(attachment.mimeType) && attachment.path === `messages/_attachments/${attachment.sha256}.${attachment.mimeType === "image/jpeg" ? "jpg" : attachment.mimeType === "image/png" ? "png" : "webp"}` && ["live", "telegram-desktop-import"].includes(attachment.source) && ["in", "out"].includes(attachment.direction));
+	const updates = new Map(records.filter((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.disposition === "accepted" && Boolean(record.jobId)).map((record) => [record.jobId!, record]));
+	const media = new Map<string, Extract<JournalRecord, { type: "media_captured" }>>();
+	const inboundBindings = new Set<string>();
+	const plans = new Map<string, Extract<JournalRecord, { type: "photo_send_planned" }>>();
+	const deliveryKeys = new Map<string, string>();
+	const receipts = new Map<string, Extract<JournalRecord, { type: "photo_sent" }>>();
+	for (const record of records) {
+		if (record.type === "media_captured") {
+			if (record.schemaVersion !== 1 || media.has(record.mediaId) || !validAttachment(record.attachment) || record.attachment.source !== "live" || record.attachment.direction !== record.direction || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Media capture lifecycle is invalid");
+			if (record.direction === "in") {
+				const update = updates.get(record.jobId);
+				const imageIndex = update?.images?.findIndex((image) => image.fileId === record.telegram.fileId) ?? -1;
+				const binding = `${record.jobId}:${imageIndex}`;
+				if (!update || imageIndex < 0 || record.telegram.updateId !== update.updateId || record.telegram.messageId !== update.messageId || record.mediaId !== `in:${record.jobId}:${imageIndex}:${record.attachment.sha256}` || inboundBindings.has(binding)) throw new StateCorruptionError("Inbound media capture linkage is invalid");
+				inboundBindings.add(binding);
+			}
+			media.set(record.mediaId, record);
+		} else if (record.type === "photo_send_planned") {
+			if (record.schemaVersion !== 1 || plans.has(record.photoId) || deliveryKeys.has(record.deliveryKey) || !validAttachment(record.attachment) || record.attachment.direction !== "out" || record.attachment.source !== "live" || !/^[0-9a-f]{64}$/.test(record.deliveryKey) || record.deliveryKey !== outboundPhotoDeliveryKey(record.attachment, record.caption, record.replyToMessageId) || !Number.isSafeInteger(record.replyToMessageId) || record.replyToMessageId <= 0 || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Outbound photo plan lifecycle is invalid");
+			plans.set(record.photoId, record);
+			deliveryKeys.set(record.deliveryKey, record.photoId);
+		} else if (record.type === "photo_sent") {
+			if (record.schemaVersion !== 1 || receipts.has(record.photoId) || !/^[1-9][0-9]*$/.test(record.messageId) || !Number.isFinite(new Date(record.timestamp).valueOf())) throw new StateCorruptionError("Outbound photo receipt lifecycle is invalid");
+			receipts.set(record.photoId, record);
+		}
+	}
+	for (const plan of plans.values()) {
+		const capture = media.get(`out:${plan.photoId}:${plan.attachment.sha256}`);
+		if (!capture || capture.jobId !== plan.jobId || JSON.stringify(capture.attachment) !== JSON.stringify(plan.attachment)) throw new StateCorruptionError("Outbound photo plan lacks its matching media capture");
+	}
+	for (const receipt of receipts.values()) {
+		const plan = plans.get(receipt.photoId);
+		if (!plan || plan.jobId !== receipt.jobId) throw new StateCorruptionError("Outbound photo receipt is orphaned or mismatched");
+	}
+}
+
+function isHtmlRejection(error: unknown): boolean {
+	return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === "TELEGRAM_PARSE_REJECTED");
+}
+
+function isReplyAnchorRejection(error: unknown): boolean {
+	return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === "TELEGRAM_REPLY_ANCHOR_REJECTED");
+}
+
+function journalPlan(jobId: string, text: string, plan: TelegramTransportPlan): Extract<JournalRecord, { type: "reply_plan" }> {
+	return {
+		type: "reply_plan",
+		jobId,
+		renderer: plan.renderer,
+		rawSha256: sha256(text),
+		chunks: plan.chunks.map((chunk) => ({ ...chunk, payloadSha256: sha256(chunk.payload) })),
 	};
-	/** Local queue endpoint port on 127.0.0.1; 0 selects a free port. */
-	queuePort?: number;
-	close?(): Promise<void>;
 }
 
-/** Sends, edits and deletes messages in one chat. */
-export interface ChatTransport {
-	chatId: number;
-	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
-	sendActivity(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
-	editActivity(messageId: string, text: string, signal: AbortSignal): Promise<void>;
-	deleteActivity(messageId: string, signal: AbortSignal): Promise<void>;
+function validateJournalPlan(plan: Extract<JournalRecord, { type: "reply_plan" }>, text: string): void {
+	if (plan.renderer !== "telegram-html-v1" || !/^[0-9a-f]{64}$/.test(plan.rawSha256) || plan.rawSha256 !== sha256(text)) throw new StateCorruptionError("Reply plan identity is invalid");
+	if (!Array.isArray(plan.chunks) || plan.chunks.length < 1 || plan.chunks.length > MAX_TELEGRAM_CHUNKS) throw new StateCorruptionError("Reply plan chunk count is invalid");
+	for (let index = 0; index < plan.chunks.length; index++) {
+		const chunk = plan.chunks[index];
+		if (!chunk || chunk.index !== index || (chunk.format !== "HTML" && chunk.format !== "plain")) throw new StateCorruptionError("Reply plan indices or formats are invalid");
+		if (typeof chunk.payload !== "string" || !chunk.payload || chunk.payload.length > TELEGRAM_HTML_LIMIT || Buffer.byteLength(chunk.payload, "utf8") > TELEGRAM_HTML_LIMIT * 4) throw new StateCorruptionError("Reply plan payload bounds are invalid");
+		if (typeof chunk.plainFallback !== "string" || !chunk.plainFallback || chunk.plainFallback.length > TELEGRAM_HTML_LIMIT) throw new StateCorruptionError("Reply plan fallback bounds are invalid");
+		if (!/^[0-9a-f]{64}$/.test(chunk.payloadSha256) || chunk.payloadSha256 !== sha256(chunk.payload)) throw new StateCorruptionError("Reply plan payload hash mismatch");
+	}
 }
 
-export interface ExtensionOptions {
-	/** Immutable private assembly override, independent of live settings. */
-	datastore?: Partial<DatastorePolicy>;
-	datastoreTimeoutMs?: number;
-	dependencies?: PrototypeDependencies;
-	/** Injected project root; defaults once to the process launch directory. */
-	projectRoot?: string;
-	/** Test/migration injection. Normal use always derives this from projectRoot. */
-	configPath?: string;
-	/** Test injection. Normal use reads process.env directly. */
-	environment?: NodeJS.ProcessEnv;
-	/** Test injection for the bounded projection refresh coalescing window. */
-	projectionRefreshDebounceMs?: number;
+function imageFromMessage(message: NonNullable<TelegramUpdate["message"]>): TelegramImageRef | undefined {
+	const photo = message.photo?.at(-1);
+	if (photo && (!photo.file_size || photo.file_size <= MAX_IMAGE_BYTES)) {
+		return { fileId: photo.file_id, mimeType: "image/jpeg", fileSize: photo.file_size };
+	}
+	const document = message.document;
+	if (
+		document &&
+		(document.mime_type === "image/jpeg" || document.mime_type === "image/png" || document.mime_type === "image/webp") &&
+		(!document.file_size || document.file_size <= MAX_IMAGE_BYTES)
+	) {
+		return { fileId: document.file_id, mimeType: document.mime_type, fileSize: document.file_size };
+	}
+	return undefined;
 }
 
-const GENERIC_AGENT_LABEL = "The agent";
+export class JsonlJournal implements Journal {
+	readonly path: string;
+	constructor(path: string) {
+		this.path = path;
+	}
 
-/** Reads how a turn ended from its final assistant message. */
-export function turnOutcome(messages: unknown[]): TurnOutcome {
-	const last = [...messages].reverse().find((message) => (message as { role?: string }).role === "assistant") as { stopReason?: string; errorMessage?: unknown } | undefined;
-	const detail = typeof last?.errorMessage === "string" ? sanitizeError(last.errorMessage).slice(0, 300) : undefined;
-	if (last?.stopReason === "length") return { failure: "LENGTH" };
-	if (last?.stopReason === "aborted") return { failure: "ABORTED" };
-	if (last?.stopReason === "error") return { failure: "MODEL_ERROR", ...(detail ? { detail } : {}) };
-	const text = extractAssistantText(messages);
-	return text ? { text } : { failure: "NO_REPLY" };
+	async load(): Promise<JournalRecord[]> {
+		let bytes: Buffer;
+		try {
+			bytes = await readFile(this.path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+			throw error;
+		}
+		const lastNewline = bytes.lastIndexOf(0x0a);
+		if (lastNewline !== bytes.length - 1) {
+			await truncate(this.path, Math.max(0, lastNewline + 1));
+			bytes = bytes.subarray(0, Math.max(0, lastNewline + 1));
+		}
+		const lines = bytes.toString("utf8").split("\n");
+		lines.pop();
+		return lines.map((line, index) => {
+			try {
+				return JSON.parse(line) as JournalRecord;
+			} catch (error) {
+				throw new StateCorruptionError(`Malformed state record at line ${index + 1}: ${String(error)}`);
+			}
+		});
+	}
+
+	async append(record: JournalRecord): Promise<void> {
+		await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+		const file = await open(this.path, "a", 0o600);
+		try {
+			await file.write(`${JSON.stringify(record)}\n`);
+			await file.sync();
+		} finally {
+			await file.close();
+		}
+	}
 }
-const GROUP_SEND_TOOL = "telegram_group_send";
-export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
-	// Capture this once, before any session can change its active cwd.
-	const projectRoot = resolve(options.projectRoot ?? process.cwd());
-	const configPath = options.configPath ? resolve(options.configPath) : projectTelegramOwnerConfigPath(projectRoot, CONFIG_DIR_NAME);
-	const environment = options.environment ?? process.env;
-	const overridePolicy = options.datastore === undefined ? undefined : parseDatastorePolicy(options.datastore);
-	return function telegramOwnerExtension(pi: ExtensionAPI): void {
-		let datastorePolicy = overridePolicy ?? parseDatastorePolicy(undefined);
-		const integration = createDatastoreIntegration(pi.events, () => datastorePolicy, options.datastoreTimeoutMs);
-		const datastoreClient = integration.service;
-		let groupPolicy: DatastorePolicy = { mode: "off", store: "telegram-group" };
-		const groupIntegration = createDatastoreIntegration(pi.events, () => groupPolicy, options.datastoreTimeoutMs);
-		let groupConfigured = false;
-		const updateRecall = () => {
-			const enabled = datastorePolicy.mode === "required" || integration.available();
-			const groupRecall = groupConfigured && (groupPolicy.mode === "required" || groupIntegration.available());
-			const toggles: Array<[string, boolean]> = [["telegram_recall", enabled], [GROUP_RECALL_TOOL, groupRecall], [GROUP_TIMELINE_TOOL, groupConfigured], [GROUP_SEND_TOOL, groupConfigured]];
-			let active = pi.getActiveTools?.() ?? [];
-			for (const [name, on] of toggles) active = on ? [...new Set([...active, name])] : active.filter((candidate) => candidate !== name);
-			pi.setActiveTools?.(active);
-		};
-		const projectionRefreshDebounceMs = options.projectionRefreshDebounceMs ?? 250;
-		let bridge: TelegramOwnerBridge | undefined;
-		let runtimeDependencies: PrototypeDependencies | undefined;
-		let stopSource: (() => Promise<void>) | undefined;
-		let currentContext: ExtensionContext | undefined;
-		let typing: TelegramTypingActivity | undefined;
-		let receiptTypingController: AbortController | undefined;
-		let receiptTypingInFlight: Promise<void> | undefined;
-		let receiptTypingPending = 0;
-		let activity: TelegramActivityMessage | undefined;
-		let quietTimer: ReturnType<typeof setTimeout> | undefined;
-		let projectionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
-		let projectionRefreshPending = false;
-		let projectionRefreshInFlight: Promise<void> | undefined;
-		let projectionRefreshController: AbortController | undefined;
-		let generation = 0;
-		let operationTail: Promise<void> = Promise.resolve();
-		let connection: ConnectionStatus = { phase: "disabled" };
-		let lastOperationError: string | undefined;
-		let lastIdentityError: string | undefined;
-		let lastMenuError: string | undefined;
-		let lastTypingError: string | undefined;
-		let lastActivityError: string | undefined;
-		let lastIndexError: string | undefined;
-		let lastEndpointError: string | undefined;
-		let endpoint: QueueEndpoint | undefined;
-		let groupRuntime: GroupRuntime | undefined;
-		let groupJournal: GroupJournal | undefined;
-		let lastGroupError: string | undefined;
-		let compacting = false;
-		let switching = false;
-		let agentLabel = GENERIC_AGENT_LABEL;
-		let disabledReason = "configuration absent";
 
-		const statusText = (): string => {
-			const details: string[] = [connection.phase];
-			if (datastorePolicy.mode === "required" && !integration.available()) details.push("datastore=CAPABILITY_UNAVAILABLE");
-			if (connection.phase === "disabled") details.push(disabledReason);
-			if (bridge) {
-				details.push(`queue=${bridge.queueDepth}`);
-				if (bridge.activeJob) details.push(`active=${bridge.activeJob.jobId.slice(0, 8)}`);
-				if (bridge.pendingReplyCount) details.push(`pendingReplies=${bridge.pendingReplyCount}`);
+export class MemoryJournal implements Journal {
+	records: JournalRecord[];
+	constructor(records: JournalRecord[] = []) {
+		this.records = records;
+	}
+	async load(): Promise<JournalRecord[]> {
+		return [...this.records];
+	}
+	async append(record: JournalRecord): Promise<void> {
+		this.records.push(record);
+	}
+}
+
+function validateBatch(record: Extract<JournalRecord, { type: "inbound_batch" }>): void {
+	const count = record.memberJobIds.length;
+	const openedAt = new Date(record.openedAt).valueOf(); const readyAt = new Date(record.readyAt).valueOf();
+	if (record.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(record.batchId) || !Number.isSafeInteger(record.revision) || record.revision < 1 || !["open", "sealed", "dispatching"].includes(record.state) || count < 1 || count > 100 || new Set(record.memberJobIds).size !== count || record.memberJobIds.some((id) => typeof id !== "string" || !id) || record.messageIds.length !== count || new Set(record.messageIds).size !== count || record.messageIds.some((id) => !Number.isSafeInteger(id) || id <= 0) || record.segmentSha256.length !== count || record.boundaries.length !== count || !record.text || !Number.isFinite(openedAt) || !Number.isFinite(readyAt) || readyAt < openedAt || record.finalMessageId !== record.messageIds.at(-1)) throw new StateCorruptionError("Inbound batch record is invalid");
+	let cursor = 0;
+	for (let index = 0; index < count; index++) {
+		const boundary = record.boundaries[index];
+		if (!boundary || boundary.start !== cursor || boundary.end < boundary.start || boundary.end > record.text.length || !/^[0-9a-f]{64}$/.test(record.segmentSha256[index]!) || sha256(record.text.slice(boundary.start, boundary.end)) !== record.segmentSha256[index]) throw new StateCorruptionError("Inbound batch segment provenance is invalid");
+		if (index + 1 < count && record.text.slice(boundary.end, boundary.end + 2) !== "\n\n") throw new StateCorruptionError("Inbound batch separator is invalid");
+		cursor = boundary.end + (index + 1 < count ? 2 : 0);
+	}
+	if (cursor !== record.text.length) throw new StateCorruptionError("Inbound batch boundaries are invalid");
+}
+
+function activityDestination(records: readonly JournalRecord[], record: { jobId: string; destination?: 'private' | 'group' }): 'private' | 'group' {
+	if (record.destination !== undefined) {
+		if (record.destination !== 'private' && record.destination !== 'group') throw new StateCorruptionError('Activity destination is invalid');
+		return record.destination;
+	}
+	// Before private-only activity, transient messages followed the reply target.
+	const item=records.find(r=>r.type==='work_item'&&r.itemId===record.jobId);
+	return item?.type==='work_item'&&item.reply.kind==='group'?'group':'private';
+}
+function activityKey(records: readonly JournalRecord[], record: { jobId: string; messageId: string; destination?: 'private' | 'group' }): string {
+	return `${record.jobId}:${activityDestination(records,record)}:${record.messageId}`;
+}
+
+export function recover(records: JournalRecord[], now = Date.now()): Recovery {
+	validateTaskRecords(records);
+	const updates: Job[] = [];
+	const capturedInboundJobs = new Set(records.filter((record): record is Extract<JournalRecord, { type: "media_captured" }> => record.type === "media_captured" && record.direction === "in").map((record) => record.jobId));
+	const requested = new Set<string>();
+	const dispatched = new Set<string>();
+	const commandsStarted = new Set<string>();
+	const interrupted = new Set<string>();
+	const sent = new Set<string>();
+	const ready = new Map<string, string>();
+	const activities = new Map<string, { jobId: string; messageId: string }>();
+	const batches = new Map<string, Extract<JournalRecord, { type: "inbound_batch" }>>();
+	const items: Job[] = [];
+	const finished = new Set(records.filter(r => r.type === 'turn_finished').map(r => (r as Extract<TaskRecord,{type:'turn_finished'}>).jobId));
+	let cursor: number | undefined;
+	for (const [order, record] of records.entries()) {
+		if (record.type === "work_item") {
+			validateWorkItem(record);
+			const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+			// A quoted reply is sent unanchored because Telegram rejects replies to other bots.
+			const anchor = item.reply.kind === "none" || (item.reply.kind === "group" && item.reply.quote) ? 0 : item.reply.messageId ?? 0;
+			items.push({ jobId: item.itemId, updateId: 0, messageId: anchor, text: renderWorkItemPrompt(item), images: [], item, tier: item.authority, order });
+		} else if (record.type === "update") {
+			cursor = record.updateId;
+			if (
+				record.disposition === "accepted" &&
+				record.jobId &&
+				record.messageId !== undefined &&
+				record.text !== undefined
+			) {
+				updates.push({
+					order,
+					tier: "owner",
+					jobId: record.jobId,
+					updateId: record.updateId,
+					messageId: record.messageId,
+					text: record.text,
+					telegramDate: record.telegramDate,
+					images: record.images ?? [],
+					captureRequired: record.schemaVersion === 3 && Boolean(record.images?.length),
+					command: record.command,
+				});
 			}
-			if (connection.lastSuccessfulPoll) details.push(`lastPoll=${connection.lastSuccessfulPoll}`);
-			if (connection.retryDelayMs) details.push(`retry=${connection.retryDelayMs}ms`);
-			const lastError = lastOperationError ?? connection.lastError;
-			if (lastError) details.push(`error=${lastError}`);
-			if (lastIdentityError) details.push(`identityError=${lastIdentityError}`);
-			if (lastMenuError) details.push(`menuError=${lastMenuError}`);
-			if (lastTypingError) details.push(`typingError=${lastTypingError}`);
-			if (lastActivityError) details.push(`activityError=${lastActivityError}`);
-			if (lastIndexError) details.push(`indexError=${lastIndexError}`);
-			if (endpoint) details.push(`endpoint=${QUEUE_ENDPOINT_HOST}:${endpoint.port}`);
-			if (groupRuntime) details.push(groupRuntime.statusText());
-			if (lastGroupError) details.push(`groupError=${lastGroupError}`);
-			if (lastEndpointError) details.push(`endpointError=${lastEndpointError}`);
-			return details.join(" ");
-		};
-
-		const updateStatus = (): void => {
-			currentContext?.ui.setStatus("telegram-owner", `telegram: ${statusText()}`);
-		};
-
-		/** Transient status always belongs to this agent's private owner chat, not its final reply target. */
-		const transportFor = (item: WorkItem | undefined): ChatTransport | undefined => {
-			const deps = runtimeDependencies;
-			if (!deps) return undefined;
-			if (item?.reply.kind === "none") return undefined;
-			if (!deps.sendActivity && !deps.editActivity && !deps.deleteActivity) return undefined;
-			const missing = (operation: string) => async (): Promise<never> => { throw new Error(`Telegram activity ${operation} is not configured`); };
-			return {
-				chatId: deps.privateChatId,
-				sendReply: deps.sendReply,
-				sendActivity: deps.sendActivity ?? missing("send"),
-				editActivity: deps.editActivity ?? missing("edit"),
-				deleteActivity: deps.deleteActivity ?? missing("delete"),
-			};
-		};
-		const anchorOf = (job: Job): number | undefined => job.item
-			? (job.item.reply.kind === 'private' ? job.item.reply.messageId : undefined)
-			: (job.messageId > 0 ? job.messageId : undefined);
-		const activityContext = (item: WorkItem | undefined): string | undefined => replyContextLine(item) ?? (item?.reply.kind === 'group' ? 'Group chat' : undefined);
-		const routeItemReply = (item: WorkItem) => (item.reply.kind === "group" ? groupRuntime?.transport.sendReply : undefined);
-
-		const serialized = <T>(work: () => Promise<T>): Promise<T> => {
-			const result = operationTail.then(work);
-			operationTail = result.then(() => undefined, () => undefined);
-			return result;
-		};
-
-		const noteError = (error: unknown, token?: string): void => {
-			lastOperationError = sanitizeError(error, token);
-			updateStatus();
-		};
-
-		const startReceiptTyping = (): void => {
-			if (connection.phase === "stopping" || !runtimeDependencies?.sendTyping) return;
-			if (receiptTypingInFlight) { receiptTypingPending += 1; return; }
-			lastTypingError = undefined;
-			const controller = new AbortController();
-			receiptTypingController = controller;
-			const request = (async () => {
-				try {
-					await runtimeDependencies!.sendTyping!(controller.signal);
-				} catch (error) {
-					if (!controller.signal.aborted) {
-						lastTypingError = sanitizeError(error);
-						updateStatus();
-					}
-				} finally {
-					if (receiptTypingController === controller) {
-						receiptTypingController = undefined;
-						receiptTypingInFlight = undefined;
-						if (receiptTypingPending > 0) { receiptTypingPending -= 1; startReceiptTyping(); }
-					}
-				}
-			})();
-			receiptTypingInFlight = request;
-		};
-
-		const stopReceiptTyping = async (): Promise<void> => {
-			receiptTypingController?.abort(new Error("Telegram receipt typing stopped"));
-			await receiptTypingInFlight;
-			receiptTypingController = undefined;
-			receiptTypingInFlight = undefined;
-			receiptTypingPending = 0;
-		};
-
-		const startTyping = (): void => {
-			if (connection.phase === "stopping") return;
-			lastTypingError = undefined;
-			typing?.start();
-		};
-
-		const stopTyping = (): Promise<void> => typing?.stop() ?? Promise.resolve();
-
-		const startActivity = (job: Job, ctx: ExtensionContext): void => {
-			const transport = transportFor(job.item);
-			if (!bridge || !transport) return;
-			lastActivityError = undefined;
-			activity = new TelegramActivityMessage(job.jobId, {
-				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
-				existingMessageId: bridge.openActivity(job.jobId, 'private'),
-				...(activityContext(job.item) ? { prefix: activityContext(job.item) } : {}),
-				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
-				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
-				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId, 'private'),
-				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId, 'private'),
-				onFailure: (operation, error) => {
-					lastActivityError = `${operation}: ${sanitizeError(error)}`;
-					updateStatus();
-				},
-			}, initialThinkingText(ctx.getContextUsage?.()?.percent));
-			activity.start();
-		};
-
-		/** Stops activity updates; the message stays until its job's reply is sent. */
-		const haltActivity = async (): Promise<TelegramActivityMessage | undefined> => {
-			const current = activity;
-			activity = undefined;
-			await current?.halt();
-			return current;
-		};
-
-		const failedActivityDeletes = new Set<string>();
-		/** Deletes activity and queued-notice messages whose job has finished. */
-		const cleanupFinishedActivities = async (): Promise<void> => {
-			if (!bridge) return;
-			for (const finished of bridge.finishedActivities()) {
-				const transport = finished.destination === 'group' ? groupRuntime?.transport : transportFor(bridge.itemFor(finished.jobId));
-				const deletionKey = `${finished.destination}:${finished.messageId}`;
-				if (!transport || failedActivityDeletes.has(deletionKey)) continue;
-				try {
-					await transport.deleteActivity(finished.messageId, new AbortController().signal);
-				} catch (error) {
-					failedActivityDeletes.add(deletionKey);
-					lastActivityError = `delete: ${sanitizeError(error)}`;
-					updateStatus();
-					continue;
-				}
-				await bridge.recordActivityCleared(finished.jobId, finished.messageId, finished.destination);
+		} else if (record.type === "inbound_batch") {
+			validateBatch(record);
+			const previous = batches.get(record.batchId);
+			if (previous) {
+				const priorMembers = record.memberJobIds.slice(0, previous.memberJobIds.length);
+				const transition = `${previous.state}->${record.state}`;
+				if (record.revision !== previous.revision + 1 || record.openedAt !== previous.openedAt || !["open->open", "open->sealed", "open->dispatching", "sealed->dispatching"].includes(transition) || JSON.stringify(priorMembers) !== JSON.stringify(previous.memberJobIds) || JSON.stringify(record.messageIds.slice(0, previous.messageIds.length)) !== JSON.stringify(previous.messageIds) || JSON.stringify(record.segmentSha256.slice(0, previous.segmentSha256.length)) !== JSON.stringify(previous.segmentSha256) || JSON.stringify(record.boundaries.slice(0, previous.boundaries.length)) !== JSON.stringify(previous.boundaries) || !record.text.startsWith(previous.text) || (record.state !== "open" && record.memberJobIds.length !== previous.memberJobIds.length)) throw new StateCorruptionError("Inbound batch revision transition is invalid");
 			}
-		};
+			batches.set(record.batchId, record);
+		} else if (record.type === "dispatch_requested") requested.add(record.jobId);
+		else if (record.type === "dispatched") dispatched.add(record.jobId);
+		else if (record.type === "command_started") commandsStarted.add(record.jobId);
+		else if (record.type === "reply_ready") ready.set(record.jobId, record.text);
+		else if (record.type === "reply_sent") sent.add(record.jobId);
+		else if (record.type === "activity_started") activities.set(activityKey(records,record), record);
+		else if (record.type === "activity_cleared") activities.delete(activityKey(records,record));
+		else if (record.type === "interrupted") interrupted.add(record.jobId);
+	}
+	const memberJobIds = new Set([...batches.values()].flatMap((batch) => batch.memberJobIds));
+	const updateByJobId = new Map(updates.map((job) => [job.jobId, job]));
+	const recoverableBatches = [...batches.values()].filter((batch) => {
+		if (sent.has(batch.batchId)) return true;
+		const sentMembers = batch.memberJobIds.filter((jobId) => sent.has(jobId)).length;
+		if (sentMembers === 0) return true;
+		if (sentMembers === batch.memberJobIds.length) return false;
+		throw new StateCorruptionError("Inbound batch has partially terminal legacy members");
+	});
+	const batchJobs: Job[] = recoverableBatches.filter((batch) => batch.state !== "open" || new Date(batch.readyAt).valueOf() <= now).map((batch) => ({ jobId: batch.batchId, batchId: batch.batchId, updateId: updateByJobId.get(batch.memberJobIds[0]!)?.updateId ?? 0, messageId: batch.finalMessageId, text: batch.text, images: [], memberJobIds: batch.memberJobIds, messageIds: batch.messageIds, segmentSha256: batch.segmentSha256, boundaries: batch.boundaries, tier: "owner" as const, order: updateByJobId.get(batch.memberJobIds[0]!)?.order ?? 0 }));
+	const tierRank = (job: Job) => (job.tier === "peer" ? 1 : 0);
+	const unsent = [...updates.filter((job) => !memberJobIds.has(job.jobId)), ...batchJobs, ...items].filter((job) => !sent.has(job.jobId) && (!finished.has(job.jobId) || ready.has(job.jobId)) && (job.images.length === 0 || job.captureRequired || capturedInboundJobs.has(job.jobId))).sort((a, b) => tierRank(a) - tierRank(b) || (a.order ?? 0) - (b.order ?? 0));
+	const actionable = unsent.filter((job) => !interrupted.has(job.jobId));
+	const retiredTasks=new Set(records.flatMap(r=>(r.type==='task_state'&&r.state==='completed')||r.type==='task_abandoned'?[r.taskId]:[]));
+	const prompts = actionable.filter((job) => !job.command&&!retiredTasks.has(job.item?.taskId??job.jobId));
+	const commands = actionable.filter((job) => job.command);
+	return {
+		cursor,
+		queued: prompts.filter(
+			(job) => !requested.has(job.jobId) && !dispatched.has(job.jobId) && !ready.has(job.jobId),
+		),
+		uncertain: prompts.filter(
+			(job) => (requested.has(job.jobId) || dispatched.has(job.jobId)) && !ready.has(job.jobId),
+		),
+		pendingCommands: commands.filter((job) => !commandsStarted.has(job.jobId) && !ready.has(job.jobId)),
+		uncertainCommands: commands.filter((job) => commandsStarted.has(job.jobId) && !ready.has(job.jobId)),
+		repliesToRetry: unsent
+			.filter((job) => ready.has(job.jobId))
+			.map((job) => ({ ...job, reply: ready.get(job.jobId) as string })),
+		orphanedActivities: [...activities.values()],
+	};
+}
 
-		/** Tells the owner which accepted requests are waiting behind other work. */
-		const postQueuedNotices = async (): Promise<void> => {
-			if (!bridge || connection.phase === "stopping") return;
-			for (const { job, position } of bridge.jobsAwaitingQueuedNotice()) {
-				const transport = transportFor(job.item);
-				if (!transport) continue;
-				let messageId: string;
-				try {
-					const context = activityContext(job.item);
-					messageId = await transport.sendActivity(`${context ? `${context}\n` : ""}${queuedNoticeText(agentLabel, position)}`, new AbortController().signal, anchorOf(job));
-				} catch (error) {
-					// A failed notice does not change the task's final reply routing.
-					lastActivityError = `queued: ${sanitizeError(error)}`;
-					updateStatus();
-					continue;
-				}
-				await bridge.recordActivityStarted(job.jobId, messageId, 'private');
+export function splitPlainText(text: string, limit = 4_000): string[] {
+	if (text.length <= limit) return [text];
+	const chunks: string[] = [];
+	let remaining = text;
+	while (remaining.length > limit) {
+		const window = remaining.slice(0, limit + 1);
+		let split = Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf(" "));
+		if (split < Math.floor(limit * 0.6)) split = limit;
+		chunks.push(remaining.slice(0, split));
+		remaining = remaining.slice(split).trimStart();
+	}
+	if (remaining) chunks.push(remaining);
+	return chunks;
+}
+
+export class TelegramOwnerBridge {
+	private records: JournalRecord[] = [];
+	private active?: Job;
+	private dispatchConfirmed = false;
+	private sawOwnInput = false;
+	private assistantText?: string;
+	private turnOutcome?: TurnOutcome;
+	private stopped = false;
+	private appendTail: Promise<void> = Promise.resolve();
+
+	private readonly journal: Journal;
+	private readonly ownerUserId: number;
+	private readonly privateChatId: number;
+	private readonly formattedDelivery: boolean;
+	private readonly inboundQuietWindowMs: number;
+	private readonly groupChatId?: number;
+	private readonly now: () => number;
+
+	constructor(journal: Journal, ownerUserId: number, privateChatId: number, options: TelegramBridgeOptions = {}) {
+		this.journal = journal;
+		this.ownerUserId = ownerUserId;
+		this.privateChatId = privateChatId;
+		this.formattedDelivery = options.formattedDelivery === true;
+		this.inboundQuietWindowMs = options.inboundQuietWindowMs ?? DEFAULT_INBOUND_QUIET_WINDOW_MS;
+		if (!Number.isSafeInteger(this.inboundQuietWindowMs) || (this.inboundQuietWindowMs !== 0 && this.inboundQuietWindowMs < MIN_INBOUND_QUIET_WINDOW_MS) || this.inboundQuietWindowMs > MAX_INBOUND_QUIET_WINDOW_MS) throw new StateCorruptionError("Inbound quiet window is out of bounds");
+		this.now = options.now ?? Date.now;
+		this.groupChatId = options.groupChatId;
+	}
+
+	/** Group updates in arrival order. */
+	groupUpdates(): Array<{ updateId: number; payload: GroupUpdatePayload }> {
+		return this.records.filter((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.disposition === "group" && Boolean(record.group)).map((record) => ({ updateId: record.updateId, payload: record.group! }));
+	}
+
+	taskId(job: Job): string { return job.item?.taskId ?? job.jobId; }
+	taskState(taskId: string): Extract<TaskRecord,{type:'task_state'}> | undefined {
+		return this.records.findLast((r): r is Extract<TaskRecord,{type:'task_state'}> => r.type === 'task_state' && r.taskId === taskId);
+	}
+	private async setTaskState(taskId: string, state: 'executing'|'waiting'|'completed', disposition?: Disposition): Promise<void> {
+		if (this.taskState(taskId)?.state === 'completed') return;
+		await this.append({type:'task_state',taskId,state,...(disposition?{disposition}:{}),timestamp:new Date(this.now()).toISOString()},()=>this.taskState(taskId)?.state!=='completed');
+	}
+	isTaskAbandoned(taskId:string):boolean{return this.records.some(r=>r.type==='task_abandoned'&&r.taskId===taskId);}
+	private rootItem(taskId: string): WorkItem | undefined { return this.itemFor(taskId); }
+	obligationFor(taskId: string): Obligation | undefined { return this.rootItem(taskId)?.obligation; }
+	async completeObligation(requestId: string, recipientBotId: number, disposition: Disposition): Promise<void> {
+		const ids=new Set(this.records.filter((r):r is Extract<JournalRecord,{type:'work_item'}>=>r.type==='work_item'&&r.obligation?.requestId===requestId&&r.obligation.recipientBotId===recipientBotId).map(r=>r.taskId??r.itemId));
+		for(const taskId of ids){
+			await this.setTaskState(taskId,'completed',disposition);
+			for(const job of recover(this.records,this.now()).queued.filter(j=>j.item?.taskId===taskId))await this.append({type:'turn_finished',jobId:job.jobId,mode:'silent',timestamp:new Date(this.now()).toISOString()});
+			await this.reconcileCompletedResults(taskId);
+		}
+	}
+	private async reconcileCompletedResults(taskId:string):Promise<void>{
+		if(this.taskState(taskId)?.state!=='completed'||this.isTaskAbandoned(taskId))return;
+		for(const result of this.pendingResults(taskId)){
+			const origin=this.rootItem(taskId),chatId=origin?.reply.kind==='group'?origin.reply.chatId:this.groupChatId;
+			await this.admitItem({channel:'group',authority:'peer',sender:`configured peer ${result.recipientBotId}`,information:true,text:result.text,reply:chatId?{kind:'group',chatId}:{kind:'none'},itemId:workItemIdForKey('group',`result-info:${taskId}:${result.messageId}`),context:[`Informational result for completed request ${result.requestId}. Do not resume its old destination.`]});
+		}
+	}
+	async addDependency(taskId: string, requestId: string, recipients: number[]): Promise<void> {
+		if (this.taskState(taskId)?.state === 'completed' || this.records.some(r=>r.type==='task_dependency'&&r.taskId===taskId&&r.requestId===requestId)) return;
+		await this.append({type:'task_dependency',taskId,requestId,recipients,timestamp:new Date(this.now()).toISOString()},()=>this.taskState(taskId)?.state!=='completed'&&!this.records.some(r=>r.type==='task_dependency'&&r.taskId===taskId&&r.requestId===requestId));
+	}
+	dependency(requestId: string): Extract<TaskRecord,{type:'task_dependency'}> | undefined {
+		return this.records.find((r):r is Extract<TaskRecord,{type:'task_dependency'}>=>r.type==='task_dependency'&&r.requestId===requestId);
+	}
+	private results(taskId: string): Array<Extract<TaskRecord,{type:'task_result'}>> {
+		return [...new Map(this.records.filter((r):r is Extract<TaskRecord,{type:'task_result'}>=>r.type==='task_result'&&r.taskId===taskId).map(r=>[r.messageId,r])).values()];
+	}
+	pendingResults(taskId: string): Array<Extract<TaskRecord,{type:'task_result'}>> {
+		const consumed = new Set(this.records.filter((r):r is Extract<TaskRecord,{type:'task_presented'}>=>r.type==='task_presented'&&r.taskId===taskId&&this.records.some(d=>d.type==='dispatched'&&d.jobId===r.jobId)).flatMap(r=>r.messageIds));
+		return this.results(taskId).filter(r=>!consumed.has(r.messageId));
+	}
+	private pendingDependencies(taskId: string): Array<{requestId:string;recipientBotId:number}> {
+		return this.records.filter((r):r is Extract<TaskRecord,{type:'task_dependency'}>=>r.type==='task_dependency'&&r.taskId===taskId).flatMap(r=>r.recipients.filter(id=>!this.results(taskId).some(x=>x.requestId===r.requestId&&x.recipientBotId===id)).map(recipientBotId=>({requestId:r.requestId,recipientBotId})));
+	}
+	async receiveResult(input: Omit<Extract<TaskRecord,{type:'task_result'}>,'type'|'timestamp'>): Promise<boolean> {
+		if (this.taskState(input.taskId)?.state==='completed'||this.results(input.taskId).some(r=>r.requestId===input.requestId&&r.recipientBotId===input.recipientBotId)) return false;
+		await this.append({type:'task_result',...input,timestamp:new Date(this.now()).toISOString()});
+		return this.taskState(input.taskId)?.state !== 'completed';
+	}
+	get taskStatus(): Array<{taskId:string;state:string;disposition?:Disposition;pending:Array<{requestId:string;recipientBotId:number}>}> {
+		const ids=new Set(this.records.filter((r):r is Extract<TaskRecord,{type:'task_state'}>=>r.type==='task_state').map(r=>r.taskId));
+		return [...ids].map(taskId=>({taskId,state:this.taskState(taskId)!.state,disposition:this.taskState(taskId)!.disposition,pending:this.pendingDependencies(taskId)}));
+	}
+	continuations(): Array<Omit<WorkItem,'timestamp'>> {
+		return this.taskStatus.filter(t=>t.state==='waiting'&&!this.isTaskAbandoned(t.taskId)&&this.pendingResults(t.taskId).length&&!this.records.some(r=>r.type==='task_output'&&r.taskId===t.taskId&&r.mode==='terminal')).flatMap(t=>{
+			const original=this.rootItem(t.taskId), privateJob=this.privateJobFor(t.taskId);
+			if (!original&&!privateJob) return [];
+			const result=this.pendingResults(t.taskId)[0]!;
+			return [{...(original??{channel:'private' as const,authority:'owner' as const,sender:'the owner',text:privateJob!.text,reply:{kind:'private' as const,messageId:privateJob!.messageId}}),taskId:t.taskId,itemId:workItemIdForKey('group',`continue:${t.taskId}:${result.messageId}`),context:[...(original?.context??[]),'Continue the recorded waiting task. Evaluate child results before replying to its pinned audience.']}];
+		});
+	}
+	acceptedTerminalReply(job:Job):Extract<GroupWork,{kind:'reply'}>|undefined{
+		const obligation=job.item?.obligation;
+		if(!obligation)return undefined;
+		const plan=this.records.findLast(r=>r.type==='group_send_planned'&&r.work?.kind==='reply'&&r.work.requestId===obligation.requestId&&r.work.recipientBotId===obligation.recipientBotId&&this.records.some(a=>a.type==='group_send_accepted'&&a.sendId===r.sendId));
+		return plan?.type==='group_send_planned'&&plan.work?.kind==='reply'?plan.work:undefined;
+	}
+	private async retireSuppliedReply(job:Job):Promise<boolean>{
+		const reply=this.acceptedTerminalReply(job);
+		if(!reply)return false;
+		// Telegram acceptance suppresses duplicate output, not metadata recovery or completion.
+		await this.prepareOutput(job,'terminal',reply.disposition);
+		await this.setTaskState(this.taskId(job),'waiting');
+		await this.append({type:'turn_finished',jobId:job.jobId,mode:'waiting',timestamp:new Date(this.now()).toISOString()});
+		return true;
+	}
+	private async prepareOutput(job: Job, mode:'terminal'|'progress', disposition:Disposition='completed'): Promise<void> {
+		const taskId=this.taskId(job), obligation=job.item?.obligation;
+		const work:GroupWork=obligation&&mode==='terminal'?{version:1,kind:'reply',...obligation,disposition}:{version:1,kind:'notify',recipients:[]};
+		if(!this.records.some(r=>r.type==='task_output'&&r.jobId===job.jobId)) await this.append({type:'task_output',taskId,jobId:job.jobId,mode,disposition,...(job.item?.reply.kind==='group'?{work}:{}),timestamp:new Date(this.now()).toISOString()});
+	}
+	private async outputAccepted(job:Job):Promise<void>{
+		const output=this.records.findLast((r):r is Extract<TaskRecord,{type:'task_output'}>=>r.type==='task_output'&&r.jobId===job.jobId);
+		if(output?.mode==='terminal') {await this.setTaskState(output.taskId,'completed',output.disposition);await this.reconcileCompletedResults(output.taskId);}
+	}
+
+	/** Delivery can commit before completion; reconcile that boundary without transport calls. */
+	private async reconcileDeliveredTasks(): Promise<void> {
+		const sent = new Set(this.records.filter(record => record.type === "reply_sent").map(record => record.jobId));
+		for (const record of this.records) {
+			if (record.type !== "task_output" || record.mode !== "terminal" || !sent.has(record.jobId)) continue;
+			await this.setTaskState(record.taskId, "completed", record.disposition);
+			await this.reconcileCompletedResults(record.taskId);
+		}
+	}
+
+	appendGroupRecord(record: GroupProgressRecord): Promise<void> {
+		return this.append(record);
+	}
+
+	async initialize(): Promise<Recovery> {
+		this.records = await this.journal.load();
+		validateMediaLifecycle(this.records);
+		recover(this.records,this.now());
+		await this.reconcileDeliveredTasks();
+		for(const task of this.taskStatus)await this.reconcileCompletedResults(task.taskId);
+		return recover(this.records,this.now());
+	}
+
+	get activeJob(): Job | undefined {
+		return this.active;
+	}
+
+	get marker(): string | undefined {
+		if (!this.active) return undefined;
+		if (this.active.item) return `${WORK_ITEM_MARKER_PREFIX}${this.active.jobId}]`;
+		return this.active.batchId ? `[telegram-batch:${this.active.batchId}]` : `[telegram-job:${this.active.jobId}]`;
+	}
+
+	get nextBatchReadyDelayMs(): number | undefined {
+		const open = [...this.latestBatchRecords().values()].filter((batch) => batch.state === "open").sort((a, b) => new Date(a.readyAt).valueOf() - new Date(b.readyAt).valueOf())[0];
+		return open ? Math.max(0, new Date(open.readyAt).valueOf() - this.now()) : undefined;
+	}
+
+	get queueDepth(): number {
+		return recover(this.records, this.now()).queued.length;
+	}
+
+	/** Pending private-chat replies, which hold back further private dispatch to keep replies in order. */
+	get pendingReplyCount(): number {
+		return recover(this.records, this.now()).repliesToRetry.filter((job) => !job.item || job.item.reply.kind === "private").length;
+	}
+
+	get queueDepthByTier(): { owner: number; peer: number } {
+		const queued = recover(this.records, this.now()).queued;
+		return { owner: queued.filter((job) => job.tier !== "peer").length, peer: queued.filter((job) => job.tier === "peer").length };
+	}
+
+	/** Durably admits a non-private work item. Repeating an item ID returns the original item. */
+	async admitItem(input: Omit<WorkItem, "itemId" | "timestamp"> & { itemId?: string }): Promise<{ item: WorkItem; duplicate: boolean }> {
+		const itemId = input.itemId ?? (input.idempotencyKey ? workItemIdForKey(input.channel, input.idempotencyKey) : randomUUID());
+		const existing = this.records.find((record): record is Extract<JournalRecord, { type: "work_item" }> => record.type === "work_item" && record.itemId === itemId);
+		if (existing) {
+			const { type: _type, schemaVersion: _schemaVersion, ...item } = existing;
+			return { item, duplicate: true };
+		}
+		const { itemId: _ignored, ...fields } = input;
+		const record: Extract<JournalRecord, { type: "work_item" }> = { type: "work_item", schemaVersion: 1, ...fields, itemId, timestamp: new Date(this.now()).toISOString() };
+		validateWorkItem(record);
+		await this.append(record);
+		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+		return { item, duplicate: false };
+	}
+
+	get pendingCommands(): Job[] {
+		return recover(this.records, this.now()).pendingCommands;
+	}
+
+	get uncertainCommands(): Job[] {
+		return recover(this.records, this.now()).uncertainCommands;
+	}
+
+	get cursor(): number | undefined {
+		return recover(this.records, this.now()).cursor;
+	}
+
+	get orphanedActivities(): Array<{ jobId: string; messageId: string }> {
+		return recover(this.records, this.now()).orphanedActivities;
+	}
+
+	get status(): "idle" | "dispatch-unconfirmed" | "running" | "stopped" {
+		if (this.stopped) return "stopped";
+		if (!this.active) return "idle";
+		return this.dispatchConfirmed ? "running" : "dispatch-unconfirmed";
+	}
+
+	get journalRecords(): readonly JournalRecord[] {
+		return this.records;
+	}
+
+	appendSelectorRecord(record: SelectorRecord): Promise<void> {
+		return this.append(record);
+	}
+
+	appendArchiveRecord(record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>): Promise<void> {
+		return this.append(record);
+	}
+
+	private append(record: JournalRecord,guard?:()=>boolean): Promise<void> {
+		const result = this.appendTail.then(async () => {
+			if(guard&&!guard())return;
+			await this.journal.append(record);
+			this.records.push(record);
+		});
+		this.appendTail = result.catch(() => undefined);
+		return result;
+	}
+
+	private latestBatchRecords(): Map<string, Extract<JournalRecord, { type: "inbound_batch" }>> {
+		const latest = new Map<string, Extract<JournalRecord, { type: "inbound_batch" }>>();
+		for (const record of this.records) if (record.type === "inbound_batch") latest.set(record.batchId, record);
+		return latest;
+	}
+
+	private latestBatch(batchId: string): Extract<JournalRecord, { type: "inbound_batch" }> | undefined {
+		return this.latestBatchRecords().get(batchId);
+	}
+
+	private latestOpenBatch(): Extract<JournalRecord, { type: "inbound_batch" }> | undefined {
+		return [...this.latestBatchRecords().values()].reverse().find((batch) => batch.state === "open");
+	}
+
+	private async sealOpenBatch(): Promise<void> {
+		const open = this.latestOpenBatch();
+		if (open) await this.append({ ...open, revision: open.revision + 1, state: "sealed" });
+	}
+
+	async sealReadyBatches(): Promise<number> {
+		const ready = [...this.latestBatchRecords().values()].filter((batch) => batch.state === "open" && new Date(batch.readyAt).valueOf() <= this.now()).sort((a, b) => new Date(a.readyAt).valueOf() - new Date(b.readyAt).valueOf());
+		for (const batch of ready) await this.append({ ...batch, revision: batch.revision + 1, state: "sealed" });
+		return ready.length;
+	}
+
+	private updateForJob(jobId: string): Extract<JournalRecord, { type: "update" }> | undefined {
+		return [...this.records].reverse().find((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.jobId === jobId);
+	}
+
+	private async addTextToBatch(job: Job): Promise<void> {
+		const now = this.now();
+		let open = this.latestOpenBatch();
+		if (open) {
+			const previousJobId = open.memberJobIds.at(-1);
+			const previousUpdate = previousJobId ? this.updateForJob(previousJobId) : undefined;
+			const sameTelegramDate = previousUpdate?.telegramDate !== undefined
+				&& job.telegramDate !== undefined
+				&& previousUpdate.telegramDate === job.telegramDate;
+			if (!sameTelegramDate || now >= new Date(open.readyAt).valueOf()) {
+				await this.sealOpenBatch();
+				open = undefined;
 			}
-		};
+		}
+		const readyAt = new Date(now + this.inboundQuietWindowMs).toISOString();
+		if (!open) {
+			await this.append({ type: "inbound_batch", schemaVersion: 1, batchId: randomUUID(), revision: 1, state: "open", openedAt: new Date(now).toISOString(), readyAt, memberJobIds: [job.jobId], messageIds: [job.messageId], segmentSha256: [sha256(job.text)], boundaries: [{ start: 0, end: job.text.length }], text: job.text, finalMessageId: job.messageId });
+			return;
+		}
+		const start = open.text.length + 2;
+		await this.append({ ...open, revision: open.revision + 1, readyAt, memberJobIds: [...open.memberJobIds, job.jobId], messageIds: [...open.messageIds, job.messageId], segmentSha256: [...open.segmentSha256, sha256(job.text)], boundaries: [...open.boundaries, { start, end: start + job.text.length }], text: `${open.text}\n\n${job.text}`, finalMessageId: job.messageId });
+	}
 
-		const syncMediaEvents = async (): Promise<void> => {
-			if (bridge && runtimeDependencies?.mediaProjector) await runtimeDependencies.mediaProjector.reconcileMediaEvents(bridge.journalRecords);
-		};
-
-		const capturePendingInboundMedia = async (): Promise<void> => {
-			if (!bridge) return;
-			for (const job of bridge.pendingInboundMediaJobs()) {
-				if (!runtimeDependencies?.resolveImages) throw new Error("No durable Telegram image resolver configured");
-				const captured = await runtimeDependencies.resolveImages(job.images, []);
-				await bridge.recordInboundMedia(job, captured);
+	async ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number }> {
+		const seen = new Set(this.records.filter((r) => r.type === "update").map((r) => r.updateId));
+		let acceptedModelInputCount = 0;
+		for (const update of updates) {
+			if (seen.has(update.update_id)) {
+				// Even redelivered callback queries need an answer to clear the spinner.
+				if (update.callback_query) await local?.(update);
+				continue;
 			}
-			await syncMediaEvents();
-		};
+			if (await local?.(update)) {
+				await this.append({ type: "update", schemaVersion: 2, updateId: update.update_id, disposition: "local", timestamp: new Date(this.now()).toISOString() });
+				seen.add(update.update_id);
+				continue;
+			}
+			const message = update.message;
+			let disposition: UpdateDisposition;
+			let image: TelegramImageRef | undefined;
+			const group = this.classifyGroup(update);
+			if (group) {
+				await this.append({ type: "update", schemaVersion: 2, updateId: update.update_id, disposition: "group", timestamp: new Date(this.now()).toISOString(), group });
+				seen.add(update.update_id);
+				continue;
+			}
+			if (
+				message &&
+				message.chat.type === "private" &&
+				message.chat.id === this.privateChatId &&
+				message.from?.id === this.ownerUserId
+			) {
+				image = imageFromMessage(message);
+				const hasText = Boolean(message.text?.trim());
+				disposition = hasText || image ? "accepted" : "unsupported";
+			} else {
+				disposition = message ? "unauthorized" : "unsupported";
+			}
+			const accepted = disposition === "accepted";
+			const text = message?.text?.trim() || message?.caption?.trim() || "Please analyze this image.";
+			const parsedCommand = accepted ? parseTelegramOwnerCommand(text) : undefined;
+			const jobId = accepted ? randomUUID() : undefined;
+			const command = parsedCommand?.kind === "known" ? parsedCommand.name : parsedCommand ? "unknown" as const : undefined;
+			await this.append({ type: "update", schemaVersion: accepted && image ? 3 : 2, updateId: update.update_id, disposition, timestamp: new Date(this.now()).toISOString(), ...(accepted ? { jobId, messageId: message!.message_id, chatId: message!.chat.id, userId: message!.from!.id, text, rawText: message?.text ?? message?.caption ?? "", telegramDate: message?.date, telegramEditDate: message?.edit_date, entities: message?.entities ?? message?.caption_entities, images: image ? [image] : [], command } : {}) });
+			if (accepted) {
+				const job: Job = { jobId: jobId!, updateId: update.update_id, messageId: message!.message_id, text, telegramDate: message!.date, images: image ? [image] : [], command };
+				if (!command) acceptedModelInputCount += 1;
+				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) await this.addTextToBatch(job);
+				else await this.sealOpenBatch();
+			}
+			seen.add(update.update_id);
+		}
+		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount };
+	}
 
-		const dispatchIfIdle = async (ctx: ExtensionContext): Promise<void> => {
-			if (!bridge || bridge.pendingReplyCount > 0 || compacting || switching || !ctx.isIdle()) return;
-			await bridge.dispatchNext(
-				ctx.sessionManager.getSessionId(),
-				(text, images) => {
-					const content = images?.length
-						? [{ type: "text" as const, text }, ...images.map((image) => ({ type: "image" as const, ...image }))]
-						: text;
-					void pi.sendUserMessage(content, { expandPromptTemplates: false });
-				},
-				runtimeDependencies?.resolveImages,
-				async (item) => {
-					// An image that cannot be read is left out rather than holding the queue.
-					const images = [];
-					for (const image of item.images ?? []) {
-						try {
-							if (!groupJournal) throw new Error("the group chat is not configured");
-							images.push({ data: (await groupJournal.readAttachment(image.path)).toString("base64"), mimeType: image.mimeType });
-						} catch (error) {
-							lastGroupError = `image: ${sanitizeError(error)}`;
-						}
-					}
-					return images;
-				},
-				(job) => job.item?.reply.kind !== "group" || Boolean(groupRuntime?.verified),
+	private classifyGroup(update: TelegramUpdate): GroupUpdatePayload | undefined {
+		if (this.groupChatId === undefined) return undefined;
+		const member = update.chat_member ?? update.my_chat_member;
+		if (member) {
+			if (member.chat.id === this.groupChatId) return { kind: "member", member, self: Boolean(update.my_chat_member) };
+			return member.chat.type === "private" ? undefined : { kind: "foreign-chat", chatId: member.chat.id, chatType: member.chat.type };
+		}
+		const message = update.message;
+		if (!message) return undefined;
+		if (message.chat.id === this.groupChatId) return { kind: "message", message };
+		return message.chat.type === "private" ? undefined : { kind: "foreign-chat", chatId: message.chat.id, chatType: message.chat.type };
+	}
+
+	pendingInboundMediaJobs(): Job[] {
+		const captures = new Map(this.records.filter((record): record is Extract<JournalRecord, { type: "media_captured" }> => record.type === "media_captured" && record.direction === "in").map((record) => [record.jobId, record]));
+		return this.records.filter((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.schemaVersion === 3 && record.disposition === "accepted" && Boolean(record.jobId && record.messageId && record.text && record.images?.length) && !captures.has(record.jobId!)).map((record) => ({ jobId: record.jobId!, updateId: record.updateId, messageId: record.messageId!, text: record.text!, telegramDate: record.telegramDate, images: record.images!, command: record.command }));
+	}
+
+	private capturedMedia(jobId: string, direction: "in" | "out"): Extract<JournalRecord, { type: "media_captured" }>[] {
+		return this.records.filter((record): record is Extract<JournalRecord, { type: "media_captured" }> => record.type === "media_captured" && record.jobId === jobId && record.direction === direction);
+	}
+
+	async recordInboundMedia(job: Job, captured: readonly ResolvedArchivedImage[]): Promise<void> {
+		const existing = new Set(this.capturedMedia(job.jobId, "in").map((record) => record.mediaId));
+		for (let index = 0; index < captured.length; index++) {
+			const item = captured[index]!;
+			const source = job.images[index];
+			const mediaId = `in:${job.jobId}:${index}:${item.attachment.sha256}`;
+			if (existing.has(mediaId)) continue;
+			await this.append({ type: "media_captured", schemaVersion: 1, mediaId, jobId: job.jobId, direction: "in", attachment: item.attachment, telegram: { updateId: job.updateId, messageId: job.messageId, ...(source ? { fileId: source.fileId } : {}) }, timestamp: new Date(this.now()).toISOString() });
+		}
+	}
+
+	equivalentOutboundPhoto(attachment: ArchivedTelegramAttachment, caption: string | undefined, replyToMessageId: number): { plan: Extract<JournalRecord, { type: "photo_send_planned" }>; receipt?: Extract<JournalRecord, { type: "photo_sent" }> } | undefined {
+		const deliveryKey = outboundPhotoDeliveryKey(attachment, caption, replyToMessageId);
+		const plan = this.records.find((record): record is Extract<JournalRecord, { type: "photo_send_planned" }> => record.type === "photo_send_planned" && record.deliveryKey === deliveryKey);
+		return plan ? { plan, receipt: this.outboundPhotoReceipt(plan.photoId) } : undefined;
+	}
+
+	async planOutboundPhoto(photoId: string, job: Job, caption: string | undefined, attachment: ArchivedTelegramAttachment): Promise<Extract<JournalRecord, { type: "photo_send_planned" }>> {
+		const plans = this.records.filter((record): record is Extract<JournalRecord, { type: "photo_send_planned" }> => record.type === "photo_send_planned" && record.photoId === photoId);
+		if (plans.length > 1) throw new StateCorruptionError("Outbound photo has duplicate plans");
+		const planned: Extract<JournalRecord, { type: "photo_send_planned" }> = { type: "photo_send_planned", schemaVersion: 1, photoId, deliveryKey: outboundPhotoDeliveryKey(attachment, caption, job.messageId), jobId: job.jobId, caption: caption ?? "", replyToMessageId: job.messageId, attachment, timestamp: new Date(this.now()).toISOString() };
+		if (plans[0]) {
+			const { timestamp: _existingTimestamp, ...existingIdentity } = plans[0];
+			const { timestamp: _plannedTimestamp, ...plannedIdentity } = planned;
+			if (JSON.stringify(existingIdentity) !== JSON.stringify(plannedIdentity)) throw new StateCorruptionError("Outbound photo plan identity changed");
+			return plans[0];
+		}
+		const mediaId = `out:${photoId}:${attachment.sha256}`;
+		const capture = this.records.find((record): record is Extract<JournalRecord, { type: "media_captured" }> => record.type === "media_captured" && record.mediaId === mediaId);
+		if (capture && (capture.jobId !== job.jobId || JSON.stringify(capture.attachment) !== JSON.stringify(attachment))) throw new StateCorruptionError("Outbound photo media capture identity changed");
+		if (!capture) await this.append({ type: "media_captured", schemaVersion: 1, mediaId, jobId: job.jobId, direction: "out", attachment, telegram: {}, timestamp: planned.timestamp });
+		await this.append(planned);
+		return planned;
+	}
+
+	outboundPhotoPlan(photoId: string): Extract<JournalRecord, { type: "photo_send_planned" }> | undefined {
+		const plans = this.records.filter((record): record is Extract<JournalRecord, { type: "photo_send_planned" }> => record.type === "photo_send_planned" && record.photoId === photoId);
+		if (plans.length > 1) throw new StateCorruptionError("Outbound photo has duplicate plans");
+		return plans[0];
+	}
+
+	outboundPhotoReceipt(photoId: string): Extract<JournalRecord, { type: "photo_sent" }> | undefined {
+		const receipts = this.records.filter((record): record is Extract<JournalRecord, { type: "photo_sent" }> => record.type === "photo_sent" && record.photoId === photoId);
+		if (receipts.length > 1) throw new StateCorruptionError("Outbound photo has duplicate receipts");
+		return receipts[0];
+	}
+
+	async recordOutboundPhotoSent(photoId: string, jobId: string, messageId: string): Promise<void> {
+		if (!/^[1-9][0-9]*$/.test(messageId)) throw new StateCorruptionError("Telegram returned an invalid photo message ID");
+		const existing = this.outboundPhotoReceipt(photoId);
+		if (existing) {
+			if (existing.jobId !== jobId || existing.messageId !== messageId) throw new StateCorruptionError("Outbound photo receipt identity changed");
+			return;
+		}
+		await this.append({ type: "photo_sent", schemaVersion: 1, photoId, jobId, messageId, timestamp: new Date(this.now()).toISOString() });
+	}
+
+	async startCommand(job: Job): Promise<void> {
+		if (!job.command) throw new Error("Cannot start a non-command Telegram job");
+		await this.append({ type: "command_started", jobId: job.jobId, command: job.command });
+	}
+
+	async completeCommand(job: Job, text: string): Promise<void> {
+		if (!job.command) throw new Error("Cannot complete a non-command Telegram job");
+		await this.append({ type: "reply_ready", jobId: job.jobId, text });
+	}
+
+	async interruptCommand(job: Job, reason: string, notice: string): Promise<void> {
+		if (!job.command) throw new Error("Cannot interrupt a non-command Telegram job");
+		await this.append({ type: "interrupted", jobId: job.jobId, reason });
+		await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });
+	}
+
+	async interruptActive(reason: string, notice: string): Promise<Job | undefined> {
+		if (!this.active) return undefined;
+		const job = this.active;
+		await this.append({ type: "interrupted", jobId: job.jobId, reason });
+		if(this.taskState(this.taskId(job))?.state==='completed')await this.append({type:'turn_finished',jobId:job.jobId,mode:'silent',timestamp:new Date(this.now()).toISOString()});
+		else {await this.prepareOutput(job,'terminal','failed');await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });}
+		this.active = undefined;
+		this.dispatchConfirmed = false;
+		this.sawOwnInput = false;
+		this.assistantText = undefined;
+		return job;
+	}
+
+	async recordActivityStarted(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
+		await this.append({ type: "activity_started", jobId, messageId, ...(destination?{destination}:{}) });
+	}
+
+	async recordActivityCleared(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
+		await this.append({ type: "activity_cleared", jobId, messageId, ...(destination?{destination}:{}) });
+	}
+
+	private openActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
+		const open = new Map<string, { jobId: string; messageId: string; destination: 'private' | 'group' }>();
+		for (const record of this.records) {
+			if (record.type === "activity_started") open.set(activityKey(this.records,record), { jobId: record.jobId, messageId: record.messageId, destination: activityDestination(this.records,record) });
+			else if (record.type === "activity_cleared") open.delete(activityKey(this.records,record));
+		}
+		return [...open.values()];
+	}
+
+	/** A private-chat job's anchor message and text, for answers that return to it. */
+	privateJobFor(jobId: string): { messageId: number; text: string } | undefined {
+		const batch = this.latestBatch(jobId);
+		if (batch) return { messageId: batch.finalMessageId, text: batch.text };
+		const update = this.updateForJob(jobId);
+		return update?.messageId !== undefined && update.text !== undefined ? { messageId: update.messageId, text: update.text } : undefined;
+	}
+
+	/** Ends queued non-private items, giving each a notice as its reply. Returns the ended items. */
+	async interruptQueuedItems(reason: string, notice: string): Promise<WorkItem[]> {
+		const ended: WorkItem[] = [];
+		for (const job of recover(this.records, this.now()).queued) {
+			if (job.jobId === this.active?.jobId) continue;
+			if(job.item?.taskId){await this.append({type:'turn_finished',jobId:job.jobId,mode:'silent',timestamp:new Date(this.now()).toISOString()});continue;}
+			await this.append({type:'task_abandoned',taskId:this.taskId(job),timestamp:new Date(this.now()).toISOString()});
+			await this.prepareOutput(job,'terminal','cancelled');
+			await this.append({ type: "interrupted", jobId: job.jobId, reason });
+			await this.append({ type: "reply_ready", jobId: job.jobId, text: notice, timestamp: new Date(this.now()).toISOString() });
+			if(job.item) ended.push(job.item);
+		}
+		for(const task of this.taskStatus.filter(t=>t.state==='waiting')){
+			const original=this.rootItem(task.taskId),privateJob=this.privateJobFor(task.taskId);
+			if(!original&&!privateJob)continue;
+			if(!this.isTaskAbandoned(task.taskId))await this.append({type:'task_abandoned',taskId:task.taskId,timestamp:new Date(this.now()).toISOString()});
+			const {item}=await this.admitItem({...original,channel:original?.channel??'private',authority:original?.authority??'owner',sender:original?.sender??'the owner',text:notice,reply:original?.reply??{kind:'private',messageId:privateJob!.messageId},taskId:task.taskId,itemId:workItemIdForKey('endpoint',`reset:${task.taskId}`)});
+			const job:Job={jobId:item.itemId,item,messageId:item.reply.kind==='none'||(item.reply.kind==='group'&&item.reply.quote)?0:item.reply.messageId??0,updateId:0,text:notice,images:[]};
+			if(!this.records.some(r=>r.type==='reply_ready'&&r.jobId===job.jobId)){
+				await this.prepareOutput(job,'terminal','cancelled');
+				await this.append({type:'interrupted',jobId:job.jobId,reason});
+				await this.append({type:'reply_ready',jobId:job.jobId,text:notice,timestamp:new Date(this.now()).toISOString()});
+			}
+		}
+		return ended;
+	}
+
+	/** The work item behind a job ID, if the job is not a private-chat job. */
+	itemFor(jobId: string): WorkItem | undefined {
+		const record = this.records.find((candidate): candidate is Extract<JournalRecord, { type: "work_item" }> => candidate.type === "work_item" && candidate.itemId === jobId);
+		if (!record) return undefined;
+		const { type: _type, schemaVersion: _schemaVersion, ...item } = record;
+		return item;
+	}
+
+	/** The open activity or queued-notice message for a job, if any. */
+	openActivity(jobId: string, destination?: 'private' | 'group'): string | undefined {
+		return this.openActivities().find((activity) => activity.jobId === jobId && (destination === undefined || activity.destination === destination))?.messageId;
+	}
+
+	/** Open activities whose job no longer needs them: its reply was sent, or it ended without one. */
+	finishedActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
+		const sent = new Set<string>();
+		const interrupted = new Set<string>();
+		for (const record of this.records) {
+			if (record.type === "reply_sent") sent.add(record.jobId);
+			else if (record.type === "interrupted" || record.type === 'turn_finished') interrupted.add(record.jobId);
+		}
+		// Interrupted execution has stopped even when its pinned failure notice awaits delivery.
+		return this.openActivities().filter((activity) => sent.has(activity.jobId) || interrupted.has(activity.jobId)||this.taskState(this.itemFor(activity.jobId)?.taskId??activity.jobId)?.state==='completed');
+	}
+
+	/** Queued jobs waiting behind other work that have no queued notice yet, with their queue position. */
+	jobsAwaitingQueuedNotice(): Array<{ job: Job; position: number }> {
+		const noticed = new Set(this.openActivities().map((activity) => activity.jobId));
+		return recover(this.records, this.now()).queued
+			.map((job, position) => ({ job, position }))
+			.filter(({ job }) => job.jobId !== this.active?.jobId && !noticed.has(job.jobId));
+	}
+
+	async interruptUncertain(reason: string, notice?: string): Promise<Job[]> {
+		const uncertain = recover(this.records, this.now()).uncertain;
+		for (const job of uncertain) {
+			await this.append({ type: "interrupted", jobId: job.jobId, reason });
+			if(await this.retireSuppliedReply(job))continue;
+			if (notice) {await this.prepareOutput(job,'terminal','failed');await this.append({ type: "reply_ready", jobId: job.jobId, text: notice });}
+		}
+		return uncertain;
+	}
+
+	private replyAnchorRejected(jobId: string): boolean {
+		const records = this.records.filter((record): record is Extract<JournalRecord, { type: "reply_anchor_rejected" }> => record.type === "reply_anchor_rejected" && record.jobId === jobId);
+		if (records.length > 1 || records.some((record) => record.index !== 0 || record.code !== "REPLY_TARGET_MISSING")) throw new StateCorruptionError("Reply anchor rejection receipt is invalid");
+		return records.length === 1;
+	}
+
+	private async sendWithAnchorRecovery(job: Job, text: string, format: "HTML" | "plain" | undefined, send: SendReply): Promise<string> {
+		if (job.messageId <= 0 || this.replyAnchorRejected(job.jobId)) return send(text, undefined, format);
+		try {
+			return await send(text, job.messageId, format);
+		} catch (error) {
+			if (!isReplyAnchorRejection(error)) throw error;
+			await this.append({ type: "reply_anchor_rejected", jobId: job.jobId, index: 0, code: "REPLY_TARGET_MISSING", timestamp: new Date().toISOString() });
+			return send(text, undefined, format);
+		}
+	}
+
+	private async deliverLegacy(job: Job, text: string, send: SendReply): Promise<void> {
+		let firstId = "";
+		for (const [index, chunk] of splitPlainText(text).entries()) {
+			const id = index === 0 ? await this.sendWithAnchorRecovery(job, chunk, undefined, send) : await send(chunk);
+			if (!firstId) firstId = id;
+		}
+		await this.append({ type: "reply_sent", jobId: job.jobId, messageId: firstId });
+	}
+
+	/**
+	 * Records that the active turn already responded to another agent's message
+	 * with a request replying to it, such as a clarifying question. Returns false
+	 * otherwise.
+	 */
+	async recordRespondedByRequest(replyToMessageId: number | undefined, requestMessageId: number): Promise<boolean> {
+		const job = this.active;
+		const destination = job?.item?.reply;
+		// Only a peer's message: replying to the owner's message, such as asking everyone on the owner's behalf, is not a response.
+		if (!job || job.item?.authority !== "peer" || destination?.kind !== "group" || !destination.messageId || destination.messageId !== replyToMessageId) return false;
+		await this.append({ type: "responded_by_request", jobId: job.jobId, messageId: requestMessageId, timestamp: new Date(this.now()).toISOString() });
+		return true;
+	}
+
+	private async deliver(job: Job, text: string, send: SendReply, route?: ItemReplyRoute): Promise<void> {
+		const destination = job.item?.reply;
+		const respondedByRequest = this.records.some((record) => record.type === "responded_by_request" && record.jobId === job.jobId);
+		if (destination?.kind === "none" || respondedByRequest) {
+			await this.append({ type: "reply_sent", jobId: job.jobId, messageIds: [], timestamp: new Date(this.now()).toISOString() });
+			return;
+		}
+		if (destination?.kind === "group") {
+			const groupSend = route?.(job.item!);
+			if (!groupSend) throw new ReplyDestinationUnavailableError("The group chat is not available for this reply");
+			return this.deliverPlan(job, destination.quote ? quotedReplyText(destination.quote, text) : text, groupSend);
+		}
+		return this.deliverPlan(job, text, send);
+	}
+
+	private async deliverPlan(job: Job, text: string, send: SendReply): Promise<void> {
+		const plans = this.records.filter((record): record is Extract<JournalRecord, { type: "reply_plan" }> => record.type === "reply_plan" && record.jobId === job.jobId);
+		if (plans.length > 1) throw new StateCorruptionError("Reply job has duplicate durable plans");
+		let planRecord = plans[0];
+		if (!planRecord) {
+			if (!this.formattedDelivery) return this.deliverLegacy(job, text, send);
+			planRecord = journalPlan(job.jobId, text, createTelegramTransportPlan(text));
+			validateJournalPlan(planRecord, text);
+			await this.append(planRecord);
+		} else validateJournalPlan(planRecord, text);
+		const receipts = new Map<number, Extract<JournalRecord, { type: "reply_chunk_sent" }>>();
+		for (const record of this.records.filter((candidate): candidate is Extract<JournalRecord, { type: "reply_chunk_sent" }> => candidate.type === "reply_chunk_sent" && candidate.jobId === job.jobId)) {
+			if (!Number.isSafeInteger(record.index) || record.index < 0 || record.index >= planRecord.chunks.length || receipts.has(record.index) || !/^[1-9][0-9]*$/.test(record.messageId) || (record.format !== "HTML" && record.format !== "plain")) throw new StateCorruptionError("Reply chunk receipt is invalid");
+			receipts.set(record.index, record);
+		}
+		const rejected = new Set<number>();
+		for (const record of this.records.filter((candidate): candidate is Extract<JournalRecord, { type: "reply_chunk_rejected" }> => candidate.type === "reply_chunk_rejected" && candidate.jobId === job.jobId)) {
+			if (!Number.isSafeInteger(record.index) || record.index < 0 || record.index >= planRecord.chunks.length || planRecord.chunks[record.index]?.format !== "HTML" || rejected.has(record.index)) throw new StateCorruptionError("Reply rejection receipt is invalid");
+			rejected.add(record.index);
+		}
+		for (const chunk of planRecord.chunks) {
+			if (receipts.has(chunk.index)) continue;
+			let format = rejected.has(chunk.index) ? "plain" as const : chunk.format;
+			let id: string;
+			try {
+				id = chunk.index === 0
+					? await this.sendWithAnchorRecovery(job, format === "HTML" ? chunk.payload : chunk.plainFallback, format, send)
+					: await send(format === "HTML" ? chunk.payload : chunk.plainFallback, undefined, format);
+			} catch (error) {
+				if (format !== "HTML" || !isHtmlRejection(error)) throw error;
+				await this.append({ type: "reply_chunk_rejected", jobId: job.jobId, index: chunk.index, code: "HTML_REJECTED", timestamp: new Date().toISOString() });
+				rejected.add(chunk.index);
+				format = "plain";
+				id = chunk.index === 0
+					? await this.sendWithAnchorRecovery(job, chunk.plainFallback, format, send)
+					: await send(chunk.plainFallback, undefined, format);
+			}
+			if (!/^[1-9][0-9]*$/.test(id)) throw new StateCorruptionError("Telegram returned an invalid message ID");
+			const receipt = { type: "reply_chunk_sent" as const, jobId: job.jobId, index: chunk.index, messageId: id, format, timestamp: new Date().toISOString() };
+			await this.append(receipt);
+			receipts.set(chunk.index, receipt);
+		}
+		const messageIds = planRecord.chunks.map((chunk) => receipts.get(chunk.index)?.messageId);
+		if (messageIds.some((id) => id === undefined)) throw new StateCorruptionError("Reply plan is missing a durable chunk receipt");
+		await this.append({ type: "reply_sent", jobId: job.jobId, messageIds: messageIds as string[], timestamp: new Date().toISOString() });
+	}
+
+	async retryReadyReplies(send: SendReply, route?: ItemReplyRoute): Promise<number> {
+		await this.reconcileDeliveredTasks();
+		const retries = recover(this.records, this.now()).repliesToRetry;
+		let delivered = 0;
+		let firstError: unknown;
+		let privateBlocked = false;
+		for (const job of retries) {
+			// Private replies stay in order; a group outage must not hold them.
+			const isPrivate = !job.item || job.item.reply.kind === "private";
+			if (isPrivate && privateBlocked) continue;
+			try {
+				await this.deliver(job, job.reply, send, route);
+				await this.outputAccepted(job);
+				delivered += 1;
+			} catch (error) {
+				if (isPrivate) privateBlocked = true;
+				firstError ??= error;
+			}
+		}
+		if (firstError !== undefined) throw firstError;
+		return delivered;
+	}
+
+	async dispatchNext(
+		sessionId: string,
+		sendUserMessage: (text: string, images?: ResolvedImage[]) => void,
+		resolveImages?: (images: TelegramImageRef[], archived: readonly ArchivedTelegramAttachment[]) => Promise<ResolvedArchivedImage[]>,
+		resolveItemImages?: (item: WorkItem) => Promise<ResolvedImage[]>,
+		/** Jobs whose destination is unavailable, such as a paused group, stay queued. */
+		canDispatch?: (job: Job) => boolean,
+	): Promise<Job | undefined> {
+		if (this.active || this.stopped) return undefined;
+		await this.sealReadyBatches();
+		const job = recover(this.records, this.now()).queued.find((candidate) => canDispatch?.(candidate) ?? true);
+		if (!job) return undefined;
+		const archived = this.capturedMedia(job.jobId, "in").map((record) => record.attachment);
+		const captured = job.images.length ? await resolveImages?.(job.images, archived) : undefined;
+		if (job.images.length && !captured) throw new Error("No Telegram image resolver configured");
+		if (captured) await this.recordInboundMedia(job, captured);
+		const images = job.item?.images?.length && resolveItemImages ? await resolveItemImages(job.item) : captured?.map((item) => item.image);
+		this.active = job;
+		this.dispatchConfirmed = false;
+		this.sawOwnInput = false;
+		this.assistantText = undefined;
+		if (job.batchId) {
+			const batch = this.latestBatch(job.batchId);
+			if (!batch) throw new StateCorruptionError("Dispatch batch is missing");
+			if (batch.state !== "dispatching") await this.append({ ...batch, revision: batch.revision + 1, state: "dispatching" });
+		}
+		const taskId=this.taskId(job);
+		await this.setTaskState(taskId,'executing');
+		const results=this.pendingResults(taskId);
+		if(results.length){
+			await this.append({type:'task_presented',taskId,jobId:job.jobId,messageIds:results.map(r=>r.messageId),timestamp:new Date(this.now()).toISOString()});
+			job.text+=taskResultContext(this.records,job.jobId);
+		}
+		await this.append({ type: "dispatch_requested", jobId: job.jobId, sessionId });
+		sendUserMessage(`${this.marker}\n${job.text}`, images);
+		return job;
+	}
+
+	observeInput(source: string, text: string): "continue" | "handled" {
+		if (!this.active) return "continue";
+		if (source === "extension" && text.startsWith(`${this.marker}\n`)) this.sawOwnInput = true;
+		if (source === "interactive") return "handled";
+		return "continue";
+	}
+
+	async beforeAgentStart(prompt: string, sessionId: string): Promise<boolean> {
+		if (this.dispatchConfirmed || !this.active || !this.sawOwnInput || !prompt.startsWith(`${this.marker}\n`)) return false;
+		await this.append({ type: "dispatched", jobId: this.active.jobId, sessionId });
+		this.dispatchConfirmed = true;
+		return true;
+	}
+
+	captureAgentEnd(outcome: string | TurnOutcome | undefined): void {
+		if (!this.dispatchConfirmed) return;
+		const result = typeof outcome === "string" || outcome === undefined ? { text: outcome } : outcome;
+		this.turnOutcome = result.failure || !result.text ? { failure: result.failure ?? "NO_REPLY", ...(result.detail ? { detail: result.detail } : {}) } : { text: result.text };
+		this.assistantText = this.turnOutcome.text;
+	}
+
+	/** The most recent turn that ended without a usable reply. */
+	get lastTurnFailure(): Extract<JournalRecord, { type: "turn_failed" }> | undefined {
+		return this.records.findLast((record): record is Extract<JournalRecord, { type: "turn_failed" }> => record.type === "turn_failed");
+	}
+
+	async settle(send: SendReply, route?: ItemReplyRoute): Promise<boolean> {
+		if (!this.active || !this.dispatchConfirmed || !this.turnOutcome) return false;
+		const job = this.active;
+		const outcome = this.turnOutcome;
+		this.turnOutcome = undefined;
+		const taskId=this.taskId(job), completed=this.taskState(taskId)?.state==='completed';
+		const pending=this.pendingDependencies(taskId).length>0||this.pendingResults(taskId).length>0;
+		const waiting=!completed&&pending&&(!outcome.failure||outcome.failure==='NO_REPLY');
+		const silent=completed||(job.item?.information&&!!outcome.failure)||(waiting&&!outcome.text);
+		if(outcome.failure&&outcome.failure!=='NO_REPLY') await this.append({type:'turn_failed',jobId:job.jobId,code:outcome.failure,...(outcome.detail?{detail:outcome.detail}:{}),timestamp:new Date(this.now()).toISOString()});
+		if(!completed&&await this.retireSuppliedReply(job)){
+			this.active=undefined;this.dispatchConfirmed=false;this.assistantText=undefined;
+			return true;
+		}
+		if(waiting) await this.setTaskState(taskId,'waiting');
+		if(silent){
+			await this.append({type:'turn_finished',jobId:job.jobId,mode:waiting?'waiting':'silent',timestamp:new Date(this.now()).toISOString()});
+			if(!waiting&&!completed) await this.setTaskState(taskId,'completed');
+			this.active=undefined;this.dispatchConfirmed=false;this.assistantText=undefined;
+			return true;
+		}
+		const text=outcome.failure?turnFailureNotice(outcome.failure):outcome.text!;
+		if(outcome.failure==='NO_REPLY') await this.append({type:'turn_failed',jobId:job.jobId,code:'NO_REPLY',timestamp:new Date(this.now()).toISOString()});
+		await this.prepareOutput(job,waiting?'progress':'terminal',outcome.failure?'failed':'completed');
+		await this.append({ type: "reply_ready", jobId: job.jobId, text, timestamp: new Date().toISOString() });
+		// The durable ready reply is retried by retryReadyReplies if delivery
+		// fails, so the job no longer holds the queue.
+		this.active = undefined;
+		this.dispatchConfirmed = false;
+		this.assistantText = undefined;
+		await this.deliver(job, text, send, route);
+		await this.outputAccepted(job);
+		return true;
+	}
+
+	async shutdown(reason: string): Promise<void> {
+		if (this.stopped) return;
+		this.stopped = true;
+		if (this.active) {
+			const hasReadyReply = this.records.some(
+				(record) => record.type === "reply_ready" && record.jobId === this.active?.jobId,
 			);
-			updateStatus();
-		};
-
-		const scheduleQuietDispatch = (ctx: ExtensionContext): void => {
-			if (quietTimer) clearTimeout(quietTimer);
-			quietTimer = undefined;
-			const delay = bridge?.nextBatchReadyDelayMs;
-			if (delay === undefined || (delay === 0 && !ctx.isIdle())) return;
-			quietTimer = setTimeout(() => { quietTimer = undefined; void serialized(async () => { await bridge?.sealReadyBatches(); await dispatchIfIdle(ctx); await postQueuedNotices(); scheduleQuietDispatch(ctx); }); }, delay);
-			quietTimer.unref?.();
-		};
-
-		const scheduleProjectionRefresh = (ownGeneration: number): void => {
-			if (datastorePolicy.mode === "off" || (!integration.available() && !options.dependencies?.requestLexicalRefresh)) return;
-			projectionRefreshPending = true;
-			if (projectionRefreshTimer || projectionRefreshInFlight || !runtimeDependencies?.requestLexicalRefresh) return;
-			projectionRefreshTimer = setTimeout(() => {
-				projectionRefreshTimer = undefined;
-				if (generation !== ownGeneration || !runtimeDependencies?.requestLexicalRefresh || projectionRefreshController?.signal.aborted) return;
-				projectionRefreshPending = false;
-				const request = runtimeDependencies.requestLexicalRefresh;
-				const signal = projectionRefreshController?.signal;
-				projectionRefreshInFlight = request(signal).then(() => {
-					lastIndexError = undefined;
-				}, (error) => {
-					if (!signal?.aborted) lastIndexError = sanitizeError(error);
-				}).finally(() => {
-					projectionRefreshInFlight = undefined;
-					updateStatus();
-					if (projectionRefreshPending && generation === ownGeneration) scheduleProjectionRefresh(ownGeneration);
-				});
-			}, projectionRefreshDebounceMs);
-			projectionRefreshTimer.unref?.();
-		};
-
-		const reconcileMarkdown = async (ctx?: ExtensionContext): Promise<void> => {
-			if (!bridge || !runtimeDependencies?.markdownProjector || !ctx) return;
-			try {
-				const result = await runtimeDependencies.markdownProjector.reconcile(
-					bridge.journalRecords,
-					ctx.sessionManager,
-					(record) => bridge!.appendArchiveRecord(record),
-					ctx.signal,
-				);
-				if (result.projected > 0) scheduleProjectionRefresh(generation);
-			} catch (error) {
-				noteError(error);
-			}
-		};
-
-		const retryPendingReplies = async (): Promise<void> => {
-			if (!bridge || !runtimeDependencies) return;
-			try {
-				const sent = await bridge.retryReadyReplies(runtimeDependencies.sendReply, routeItemReply);
-				if (sent > 0) lastOperationError = undefined;
-			} catch (error) {
-				noteError(error);
-			} finally {
-				await reconcileMarkdown(currentContext);
-				await cleanupFinishedActivities().catch((error) => noteError(error));
-				groupRuntime?.notifyReplies();
-			}
-		};
-
-		const contextText = (ctx: ExtensionContext): string => {
-			const usage = ctx.getContextUsage?.();
-			if (!usage || usage.percent === null || usage.tokens === null) {
-				return "Context: recalculating";
-			}
-			return `Context: ${Math.round(usage.percent)}% of ${Math.round(usage.contextWindow / 1_000)}k`;
-		};
-
-		const ownerStatusText = (ctx: ExtensionContext): string => {
-			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unavailable";
-			const state = switching ? "switching" : compacting ? "compacting" : ctx.isIdle() ? "idle" : "working";
-			const active = bridge?.activeJob ? `, active ${bridge.activeJob.jobId.slice(0, 8)}` : "";
-			const queued = bridge?.queueDepthByTier;
-			const group = groupRuntime?.state;
-			const failure = bridge?.lastTurnFailure;
-			return [
-				`State: ${state}`,
-				contextText(ctx),
-				`Model: ${model}, ${ctx.thinkingLevel ?? "off"}`,
-				`Telegram: ${connection.phase}, queue ${queued ? `${queued.owner} owner, ${queued.peer} peer` : "0"}${active}`,
-				...(group ? [`Group: ${group.state === "unverified" ? `paused, ${group.reason}` : group.state}${lastGroupError ? ` (last error: ${lastGroupError})` : ""}`] : []),
-				...(runtimeDependencies?.queuePort !== undefined ? [`Queue endpoint: ${endpoint ? `${QUEUE_ENDPOINT_HOST}:${endpoint.port}` : `unavailable${lastEndpointError ? `, ${lastEndpointError}` : ""}`}`] : []),
-				...(bridge?.taskStatus.filter(t=>t.state!=='completed').map(t=>`Task ${t.taskId}: ${t.state}, pending ${t.pending.map(p=>`${p.requestId}/${p.recipientBotId}`).join(', ')||'none'}`)??[]),
-				...(failure ? [`Last failed turn: ${failure.code} at ${failure.timestamp}${failure.detail ? ` (${failure.detail})` : ""}`] : []),
-			].join("\n");
-		};
-
-		const completeCommand = async (job: Job, text: string): Promise<void> => {
-			if (!bridge) return;
-			await bridge.completeCommand(job, text);
-			await retryPendingReplies();
-			updateStatus();
-		};
-
-		const processCommand = async (job: Job, ctx: ExtensionContext): Promise<"continue" | "switching"> => {
-			if (!bridge || !job.command) return "continue";
-			await bridge.startCommand(job);
-			switch (job.command) {
-				case "help":
-					await completeCommand(job, telegramOwnerHelpText());
-					return "continue";
-				case "status":
-					await completeCommand(job, ownerStatusText(ctx));
-					return "continue";
-				case "unknown":
-					await completeCommand(job, unsupportedTelegramCommandText());
-					return "continue";
-				case "stop": {
-					if (switching) {
-						await completeCommand(job, "Session replacement is already in progress; /stop cannot cancel it.");
-						return "continue";
-					}
-					if (ctx.isIdle() && !compacting && !bridge.activeJob) {
-						await completeCommand(job, `${agentLabel} is idle; nothing to stop.`);
-						return "continue";
-					}
-					ctx.abort();
-					await stopTyping();
-					await haltActivity();
-					await bridge.interruptActive("Stopped by Telegram owner command", "Stopped by /stop.");
-					await completeCommand(job, "Stop requested.");
-					return "continue";
+			if (!hasReadyReply) {
+				if(this.taskState(this.taskId(this.active))?.state!=='completed'&&!await this.retireSuppliedReply(this.active)){
+					await this.prepareOutput(this.active,'terminal','failed');
+					await this.append({type:'reply_ready',jobId:this.active.jobId,text:'Interrupted before completion; the model turn was not replayed.',timestamp:new Date(this.now()).toISOString()});
 				}
-				case "compact": {
-					if (!ctx.isIdle() || compacting) {
-						await completeCommand(job, `${agentLabel} is busy; /compact was not started.`);
-						return "continue";
-					}
-					compacting = true;
-					updateStatus();
-					ctx.compact({
-						onComplete: () => {
-							void serialized(async () => {
-								compacting = false;
-								await completeCommand(job, `Compaction complete.\n${contextText(ctx)}`);
-								await processPendingCommands(ctx);
-								await dispatchIfIdle(ctx);
-							});
-						},
-						onError: (error) => {
-							void serialized(async () => {
-								compacting = false;
-								await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
-								await processPendingCommands(ctx);
-								await dispatchIfIdle(ctx);
-							});
-						},
-					});
-					return "continue";
-				}
-				case "new":
-					if (!ctx.isIdle() || compacting || switching) {
-						await completeCommand(job, `${agentLabel} is busy; /new was not started.`);
-						return "continue";
-					}
-					switching = true;
-					updateStatus();
-					try {
-						await Promise.resolve(
-							pi.sendUserMessage(`/telegram-status __new-session__:${job.jobId}`, { expandPromptTemplates: true }),
-						);
-						return "switching";
-					} catch (error) {
-						switching = false;
-						await bridge.interruptCommand(job, "Session replacement command dispatch failed", `/new failed: ${sanitizeError(error)}`);
-						await retryPendingReplies();
-						return "continue";
-					}
+				await this.append({ type: "interrupted", jobId: this.active.jobId, reason });
 			}
-		};
-
-		const processPendingCommands = async (ctx: ExtensionContext): Promise<void> => {
-			if (!bridge) return;
-			for (const job of bridge.pendingCommands) {
-				if (await processCommand(job, ctx) === "switching") return;
-			}
-		};
-
-		const recoverUncertainCommands = async (reason: string, ctx: ExtensionContext): Promise<void> => {
-			if (!bridge) return;
-			for (const job of bridge.uncertainCommands) {
-				if (job.command === "new" && reason === "new") {
-					await bridge.completeCommand(job, `Started a new session.\nSession: ${ctx.sessionManager.getSessionId()}\n${contextText(ctx)}`);
-					// Queued group and endpoint work ends visibly; a requesting agent is woken by the notice.
-					await bridge.interruptQueuedItems("Owner started a new session", `Not handled: the owner reset ${agentLabel}'s session.`);
-					await bridge.appendGroupRecord({ type: "group_requests_closed", requestIds:bridge.journalRecords.flatMap(r=>r.type==='group_send_planned'&&r.work?.kind==='request'?[r.work.requestId]:[]), timestamp: new Date().toISOString() });
-				} else {
-					await bridge.interruptCommand(
-						job,
-						"Telegram command outcome was uncertain after session restart",
-						`/${job.command} was interrupted; its outcome is uncertain. Use /status to inspect the current runtime.`,
-					);
-				}
-			}
-		};
-
-		/** Idle for elections: nothing running, queued, being collected in the quiet window, or awaiting delivery. */
-		const electionIdle = (): boolean => {
-			if (!bridge || !currentContext || compacting || switching || !currentContext.isIdle()) return false;
-			const queued = bridge.queueDepthByTier;
-			return !bridge.activeJob && queued.owner + queued.peer === 0 && bridge.nextBatchReadyDelayMs === undefined && bridge.pendingReplyCount === 0;
-		};
-
-		const isBusy = (): boolean => !electionIdle();
-
-		/** Durably admits a work item, then dispatches it or posts its queued notice. */
-		const admitAndDispatch = async (input: Parameters<TelegramOwnerBridge["admitItem"]>[0]) => {
-			if (!bridge) throw new Error("The agent's Telegram transport is not running");
-			const result = await bridge.admitItem(input);
-			try {
-				if (currentContext) {
-					await dispatchIfIdle(currentContext);
-					await postQueuedNotices();
-				}
-			} catch (error) {
-				noteError(error);
-			}
-			updateStatus();
-			return result;
-		};
-
-		const endpointHandlers = (ownGeneration: number): QueueEndpointHandlers => ({
-			queue: async (body) => {
-				const parsed = parseQueueRequest(body);
-				if (!parsed.ok) return { status: 400, body: { error: parsed.error } };
-				if (generation !== ownGeneration || !bridge) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
-				const request = parsed.value;
-				const group = groupRuntime;
-				if (!group && (request.kind === "group-message" || request.reply === "group")) return { status: 409, body: { error: "The group chat is not configured" } };
-				if (request.kind === "group-message") return group!.acceptWakeUp(request.messageId);
-				const reply = request.reply === "group" ? { kind: "group" as const, chatId: group!.config.chatId } : { kind: request.reply };
-				const admitted = await serialized(async () => (generation === ownGeneration && bridge ? admitAndDispatch({ channel: "endpoint", authority: "owner", sender: request.source, text: request.text, reply, ...(request.id ? { idempotencyKey: request.id } : {}) }) : undefined));
-				if (!admitted) return { status: 503, body: { error: "The agent's Telegram transport is not running" } };
-				return { status: 202, body: { itemId: admitted.item.itemId, duplicate: admitted.duplicate } };
-			},
-			coordinate: async (body) => (groupRuntime ? groupRuntime.acceptCoordination(body) : { status: 409, body: { error: "The group chat is not configured" } }),
-			status: async () => ({
-				status: 200,
-				body: {
-					state: isBusy() ? "busy" : "idle",
-					queue: bridge?.queueDepthByTier ?? { owner: 0, peer: 0 },
-					group: groupRuntime ? groupRuntime.state.state : "unconfigured",
-					tasks: bridge?.taskStatus ?? [],
-				},
-			}),
-		});
-
-		let groupRefreshTimer: ReturnType<typeof setTimeout> | undefined;
-		/** Coalesces lexical refreshes of the group store; never queued against an absent integration. */
-		const scheduleGroupRefresh = (): void => {
-			if (groupRefreshTimer || groupPolicy.mode === "off" || !groupIntegration.available()) return;
-			groupRefreshTimer = setTimeout(() => {
-				groupRefreshTimer = undefined;
-				if (!groupIntegration.available()) return;
-				void groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" }).catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
-			}, projectionRefreshDebounceMs);
-			groupRefreshTimer.unref?.();
-		};
-
-		const stopGroup = async (): Promise<void> => {
-			if (groupRefreshTimer) clearTimeout(groupRefreshTimer);
-			groupRefreshTimer = undefined;
-			const current = groupRuntime;
-			groupRuntime = undefined;
-			groupJournal = undefined;
-			groupConfigured = false;
-			groupIntegration.stop();
-			const groupTools = new Set([GROUP_RECALL_TOOL, GROUP_TIMELINE_TOOL, GROUP_SEND_TOOL]);
-			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter((name) => !groupTools.has(name)));
-			await current?.stop().catch((error) => noteError(error));
-		};
-
-		const startGroup = async (deps: PrototypeDependencies, ownGeneration: number): Promise<void> => {
-			const group = deps.groupChat;
-			if (!group) return;
-			groupPolicy = group.config.datastore;
-			groupIntegration.start();
-			groupJournal = new GroupJournal(group.config.sharedRoot, group.journalOptions);
-			groupRuntime = new GroupRuntime({
-				config: group.config,
-				ownerUserId: deps.ownerUserId,
-				api: group.api,
-				journal: groupJournal,
-				bridge: () => (generation === ownGeneration ? bridge : undefined),
-				admit: (input) => serialized(async () => {
-					if (generation !== ownGeneration) throw new Error("The agent's Telegram transport is not running");
-					return admitAndDispatch(input);
-				}),
-				// The same window the bridge applies to private messages.
-				quietWindowMs: deps.inboundQuietWindowMs ?? (options.dependencies ? 0 : DEFAULT_INBOUND_QUIET_WINDOW_MS),
-				wake: group.wake,
-				...(group.retryDelayMs ? { retryDelayMs: group.retryDelayMs } : {}),
-				coordinate: group.coordinate ?? (async (peer, body) => {
-					const response = await postToPeer(peer.queuePort, "/coordinate", body);
-					return "status" in response ? response : undefined;
-				}),
-				isIdle: () => generation === ownGeneration && electionIdle(),
-				report: (text) => { void deps.sendReply(text).catch((error) => noteError(error)); },
-				onError: (error) => { lastGroupError = sanitizeError(error); updateStatus(); },
-				onStatus: updateStatus,
-				onJournalChanged: scheduleGroupRefresh,
-			});
-			groupConfigured = true;
-			updateRecall();
-			lastGroupError = undefined;
-			await groupRuntime.start();
-		};
-
-		const stopEndpoint = async (): Promise<void> => {
-			const current = endpoint;
-			endpoint = undefined;
-			await current?.close();
-		};
-
-		const makeDefaultDependencies = async (): Promise<PrototypeDependencies | undefined> => {
-			let loaded;
-			try {
-				loaded = await loadTelegramOwnerConfig(configPath, environment);
-			} catch (error) {
-				disabledReason = sanitizeError(error);
-				connection = { phase: "disabled", lastError: disabledReason };
-				return undefined;
-			}
-			if (loaded.kind === "absent" || !loaded.config) {
-				disabledReason = `configuration absent (${loaded.configPath})`;
-				connection = { phase: "disabled" };
-				return undefined;
-			}
-			const config = loaded.config;
-			datastorePolicy = overridePolicy ?? config.datastore;
-			let lock: PollerLock;
-			try {
-				lock = await PollerLock.acquire(config.lockPath);
-			} catch (error) {
-				disabledReason = sanitizeError(error);
-				connection = { phase: "disabled", lastError: disabledReason };
-				return undefined;
-			}
-			const groupUpdates = ["message", "chat_member", "my_chat_member"];
-			const api = config.createApiClient(config.groupChat ? { allowedUpdates: groupUpdates } : {});
-			const groupApi = config.groupChat ? config.createApiClient({ chatId: config.groupChat.chatId }) : undefined;
-			const requests = new AbortController();
-			const mediaProjector = new TelegramMarkdownProjector(config.markdownProjection ?? { enabled: true, root: projectRoot, rootId: "pi-sessions" });
-			const poller = new LongPollSource(api, (next) => {
-				connection = next;
-				updateStatus();
-			});
-			return {
-				journal: new JsonlJournal(config.journalPath),
-				ownerUserId: config.ownerUserId,
-				privateChatId: config.privateChatId,
-				agentLabel: config.agentLabel,
-				formattedDelivery: config.formattedDelivery,
-				inboundQuietWindowMs: config.inboundQuietWindowMs,
-				queuePort: config.queuePort,
-				...(config.groupChat && groupApi ? { groupChat: { config: config.groupChat, api: groupApi } } : {}),
-				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
-				mediaProjector,
-				requestLexicalRefresh: async (signal) => { if (integration.available()) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
-				resolveAgentLabel: config.agentLabel === undefined
-					? (signal) => api.getBotFirstName(signal ?? requests.signal)
-					: undefined,
-				source: {
-					async start(onBatch, cursor) {
-						const stop = await poller.start(onBatch, cursor);
-						return stop;
-					},
-				},
-				sendReply: (text, replyTo, format) => api.sendMessage(text, replyTo, requests.signal, format),
-				reconcileCommandMenu: (signal) => api.setOwnerCommandMenu(signal ?? requests.signal),
-				sendActivity: async (text, signal, replyTo) => {
-					try {
-						return await api.sendMessage(text, replyTo, signal);
-					} catch (error) {
-						if (replyTo === undefined || !(error instanceof TelegramReplyAnchorError)) throw error;
-						return api.sendMessage(text, undefined, signal);
-					}
-				},
-				editActivity: (messageId, text, signal) => api.editMessageText(messageId, text, signal),
-				deleteActivity: (messageId, signal) => api.deleteMessage(messageId, signal),
-				resolveImages: async (images, archived) => {
-					if (archived.length === images.length) return Promise.all(archived.map(async (attachment) => ({ image: await mediaProjector.readLiveMedia(attachment), attachment })));
-					return Promise.all(images.map(async (image) => {
-						const resolved = await api.downloadImage(image, requests.signal);
-						const bytes = Buffer.from(resolved.data, "base64");
-						const attachment = await mediaProjector.captureLiveMedia(bytes, image.mimeType, "in");
-						return { image: resolved, attachment };
-					}));
-				},
-				stageOutboundPhoto: async (path, projectRoot) => {
-					const image = await readSafeOutboundImage(path, projectRoot);
-					const attachment = await mediaProjector.captureLiveMedia(image.bytes, image.mimeType as ArchivedTelegramAttachment["mimeType"], "out");
-					return { image, attachment };
-				},
-				sendPhoto: async (image, caption, replyTo, signal) => {
-					const combinedSignal = signal ? AbortSignal.any([requests.signal, signal]) : requests.signal;
-					return api.sendPhoto(image, caption, replyTo, combinedSignal);
-				},
-				sendTyping: (signal) => api.sendChatAction(signal),
-				close: async () => {
-					requests.abort(new Error("Telegram owner bridge stopped"));
-					await lock.release();
-				},
-			};
-		};
-
-		registerTelegramRecallTool(pi, datastoreClient, () => datastorePolicy.store);
-		registerGroupRecallTool(pi, groupIntegration.service, () => groupPolicy.store);
-		registerGroupTimelineTool(pi, () => (groupRuntime?.verified && groupJournal ? { journal: groupJournal, chatId: groupRuntime.config.chatId } : undefined));
-		pi.registerTool({
-			name: GROUP_SEND_TOOL,
-			label: "Send to group chat",
-			description: "Post explicit Request, Reply or Notify work in the shared group. Requests require configured @username recipients, automatically prepend any missing recipient @mentions to the body, and return requestId/chainId. Reply closes your recipient obligation for requestId; Notify creates no reply obligation. Threading and mentions in text do not route work. Only supplied text, recipient mentions and public work metadata are sent.",
-			promptSnippet: "Send an explicit request, correlated reply or informational notification",
-			promptGuidelines: [
-				"Use kind request and explicit recipients to delegate work. End normally without text to wait; accepted child results resume only a recorded waiting task. Normal final text while dependencies remain is progress, not completion.",
-				"Use kind reply with requestId for an explicit terminal result, including failed, blocked or cancelled. Only that recipient obligation is completed. A normal final also completes a request when no dependencies or unconsumed results remain.",
-				"Use kind notify for information; omit recipients for room context without wake-ups. Processing information or an accepted Reply requires no acknowledgment. Completed tasks never reopen merely because a late result arrives.",
-				"Outstanding requests are not execution locks. Handle independent dependency work serially; if an answer logically requires its own unfinished ancestor result, return a blocked Reply explaining that dependency.",
-			],
-			parameters: GroupSendParameters as any,
-			executionMode: "sequential",
-			execute: async (toolCallId, params) => {
-				if (!groupRuntime) throw new Error("CAPABILITY_UNAVAILABLE: the group chat is not configured.");
-				const result=await groupRuntime.sendWork(`tool:${toolCallId}`,params);
-				return {content:[{type:'text' as const,text:`Published ${result.kind} as group message ${result.messageId}. Publication is not completion of requested work.`}],details:result};
-			},
-		});
-		pi.on("resources_discover", () => { updateRecall(); updateStatus(); });
-		registerTelegramTimelineTool(pi, () => runtimeDependencies?.markdownProjector);
-
-		pi.registerTool({
-			name: "telegram_send_photo",
-			label: "Send Telegram photo",
-			description: "Send a JPEG, PNG, or WebP file from inside the current project to the verified Telegram owner. Only available while handling a Telegram turn.",
-			parameters: {
-				type: "object",
-				properties: {
-					path: { type: "string", description: "Project-relative image path" },
-					caption: { type: "string", maxLength: 1024 },
-				},
-				required: ["path"],
-				additionalProperties: false,
-			} as any,
-			executionMode: "sequential",
-			execute: async (_id, params, signal, _onUpdate, ctx) => {
-				const photo = params as { path: string; caption?: string };
-				if (!bridge?.activeJob || bridge.status !== "running" || !runtimeDependencies?.stageOutboundPhoto || !runtimeDependencies.sendPhoto) {
-					throw new Error("telegram_send_photo is only available during an active Telegram turn");
-				}
-				const activeJob = bridge.activeJob;
-				const photoId = _id;
-				await syncMediaEvents();
-				const priorReceipt = bridge.outboundPhotoReceipt(photoId);
-				if (priorReceipt) return { content: [{ type: "text", text: `Photo already sent to the verified owner (message ${priorReceipt.messageId}).` }], details: {} };
-				if (bridge.outboundPhotoPlan(photoId)) throw new Error("Outbound photo delivery is uncertain after an interrupted send; it will not be resent automatically");
-				const staged = await runtimeDependencies.stageOutboundPhoto(photo.path, projectRoot);
-				const equivalent = bridge.equivalentOutboundPhoto(staged.attachment, photo.caption, activeJob.messageId);
-				if (equivalent?.receipt) return { content: [{ type: "text", text: `An equivalent photo was already sent to the verified owner (message ${equivalent.receipt.messageId}).` }], details: {} };
-				if (equivalent) throw new Error("Equivalent outbound photo delivery is uncertain after an interrupted send; it will not be resent automatically");
-				await bridge.planOutboundPhoto(photoId, activeJob, photo.caption, staged.attachment);
-				const messageId = await runtimeDependencies.sendPhoto(staged.image, photo.caption, activeJob.messageId, signal);
-				await bridge.recordOutboundPhotoSent(photoId, activeJob.jobId, messageId);
-				await syncMediaEvents();
-				await reconcileMarkdown(ctx);
-				return { content: [{ type: "text", text: `Photo sent to the verified owner (message ${messageId}).` }], details: {} };
-			},
-		});
-
-		pi.registerCommand("telegram-status", {
-			description: "Show the private-owner Telegram bridge status",
-			handler: async (args, ctx: ExtensionCommandContext) => {
-				const internalMatch = /^__new-session__:([0-9a-f-]+)$/i.exec(args.trim());
-				if (!internalMatch) {
-					ctx.ui.notify(`Telegram owner bridge: ${statusText()}`);
-					return;
-				}
-				const job = bridge?.uncertainCommands.find(
-					(candidate) => candidate.command === "new" && candidate.jobId === internalMatch[1],
-				);
-				if (!job || !bridge) return;
-				try {
-					const result = await ctx.newSession();
-					if (result.cancelled) {
-						await serialized(async () => {
-							switching = false;
-							await bridge?.interruptCommand(job, "Session replacement was cancelled", "/new was cancelled; the current session is unchanged.");
-							await retryPendingReplies();
-							await processPendingCommands(ctx);
-							await dispatchIfIdle(ctx);
-						});
-					}
-				} catch (error) {
-					await serialized(async () => {
-						switching = false;
-						await bridge?.interruptCommand(job, "Session replacement failed", `/new failed: ${sanitizeError(error)}`);
-						await retryPendingReplies();
-						await processPendingCommands(ctx);
-						await dispatchIfIdle(ctx);
-					});
-				}
-			},
-		});
-
-		pi.on("session_start", async (event, ctx) => {
-			currentContext = ctx;
-			integration.start();
-			updateRecall();
-			generation += 1;
-			await stopReceiptTyping();
-			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
-			projectionRefreshTimer = undefined;
-			projectionRefreshPending = false;
-			projectionRefreshController?.abort(new Error("Telegram owner session replaced"));
-			await projectionRefreshInFlight;
-			projectionRefreshInFlight = undefined;
-			projectionRefreshController = new AbortController();
-			lastIndexError = undefined;
-			const ownGeneration = generation;
-			runtimeDependencies = options.dependencies ?? (await makeDefaultDependencies());
-			updateRecall();
-			if (options.dependencies) connection = { phase: "connecting" };
-			if (!runtimeDependencies) {
-				updateStatus();
-				return;
-			}
-			agentLabel = runtimeDependencies.agentLabel ?? GENERIC_AGENT_LABEL;
-			lastIdentityError = undefined;
-			if (!runtimeDependencies.agentLabel && runtimeDependencies.resolveAgentLabel) {
-				try {
-					agentLabel = await runtimeDependencies.resolveAgentLabel();
-				} catch (error) {
-					lastIdentityError = sanitizeError(error);
-					updateStatus();
-				}
-			}
-			try {
-				bridge = new TelegramOwnerBridge(
-					runtimeDependencies.journal,
-					runtimeDependencies.ownerUserId,
-					runtimeDependencies.privateChatId,
-					{ formattedDelivery: runtimeDependencies.formattedDelivery, inboundQuietWindowMs: runtimeDependencies.inboundQuietWindowMs ?? (options.dependencies ? 0 : undefined), groupChatId: runtimeDependencies.groupChat?.config.chatId },
-				);
-				typing = runtimeDependencies.sendTyping
-					? new TelegramTypingActivity(runtimeDependencies.sendTyping, (error) => {
-						lastTypingError = sanitizeError(error);
-						updateStatus();
-					})
-					: undefined;
-				const recovered = await bridge.initialize();
-				await capturePendingInboundMedia();
-				await reconcileMarkdown(ctx);
-				if (runtimeDependencies.reconcileCommandMenu) {
-					try {
-						await runtimeDependencies.reconcileCommandMenu();
-						lastMenuError = undefined;
-					} catch (error) {
-						lastMenuError = sanitizeError(error);
-						updateStatus();
-					}
-				}
-				await cleanupFinishedActivities();
-				await bridge.interruptUncertain(
-					"Pi restarted before dispatch outcome was durable",
-					"Previous request was interrupted by Pi restart; please resend.",
-				);
-				await recoverUncertainCommands(event.reason, ctx);
-				stopSource = await runtimeDependencies.source.start(async (updates) =>
-					serialized(async () => {
-						if (generation !== ownGeneration || !bridge) return bridge?.cursor;
-						const state = await bridge.ingestBatch(updates);
-						groupRuntime?.notifyUpdates();
-						groupRuntime?.notifyIdle();
-						for (let index = 0; index < state.acceptedModelInputCount; index++) startReceiptTyping();
-						await capturePendingInboundMedia();
-						await retryPendingReplies();
-						await processPendingCommands(ctx);
-						await dispatchIfIdle(ctx);
-						await postQueuedNotices();
-						scheduleQuietDispatch(ctx);
-						return state.cursor;
-					}),
-					recovered.cursor,
-				);
-				await startGroup(runtimeDependencies, ownGeneration);
-				if (runtimeDependencies.queuePort !== undefined) {
-					lastEndpointError = undefined;
-					try {
-						endpoint = await startQueueEndpoint(runtimeDependencies.queuePort, endpointHandlers(ownGeneration));
-					} catch (error) {
-						lastEndpointError = sanitizeError(error);
-					}
-					updateStatus();
-				}
-				await serialized(async () => {
-					await retryPendingReplies();
-					await processPendingCommands(ctx);
-					await dispatchIfIdle(ctx);
-					await postQueuedNotices();
-					scheduleQuietDispatch(ctx);
-				});
-			} catch (error) {
-				noteError(error);
-				await stopEndpoint().catch((endpointError) => noteError(endpointError));
-				await stopReceiptTyping();
-				await stopTyping();
-				typing = undefined;
-				const stop = stopSource;
-				stopSource = undefined;
-				if (stop) await stop().catch((stopError) => noteError(stopError));
-				await stopGroup();
-				const close = runtimeDependencies.close;
-				runtimeDependencies = undefined;
-				bridge = undefined;
-				if (close) await close().catch((closeError) => noteError(closeError));
-			}
-		});
-
-		pi.on("input", (event, ctx) => {
-			if (!bridge) return;
-			const result = bridge.observeInput(event.source, event.text);
-			if (result === "handled") {
-				ctx.ui.notify("Telegram turn active; wait before entering a local prompt.", "warning");
-				return { action: "handled" as const };
-			}
-		});
-
-		pi.on("before_agent_start", async (event, ctx) => {
-			updateRecall();
-			await serialized(async () => {
-				if (!bridge) return;
-				const began = await bridge.beforeAgentStart(event.prompt, ctx.sessionManager.getSessionId());
-				if (began && bridge.activeJob) {
-					startTyping();
-					startActivity(bridge.activeJob, ctx);
-				}
-				updateStatus();
-			});
-		});
-
-		pi.on("tool_execution_start", (event, ctx) => {
-			if (bridge?.status !== "running" || !activity) return;
-			activity.update(formatTelegramToolActivity(
-				ctx.sessionManager.getBranch(),
-				event.toolCallId,
-				event.toolName,
-			));
-		});
-
-		pi.on("agent_end", (event) => {
-			bridge?.captureAgentEnd(turnOutcome(event.messages));
-		});
-
-		pi.on("agent_settled", async (_event, ctx) => {
-			// The final reply is sent and recorded before the activity message is
-			// deleted. A failed or uncertain final leaves the activity visible.
-			const typingStopped = stopTyping();
-			await serialized(async () => {
-				const halted = await haltActivity();
-				if (bridge && runtimeDependencies) {
-					try {
-						const sent = await bridge.settle(runtimeDependencies.sendReply, routeItemReply);
-						if (sent) lastOperationError = undefined;
-						await reconcileMarkdown(ctx);
-					} catch (error) {
-						noteError(error);
-						await halted?.annotate("Reply delivery failed; it will be retried.");
-					}
-				}
-				await typingStopped;
-				await retryPendingReplies();
-				await dispatchIfIdle(ctx);
-				await postQueuedNotices();
-				updateStatus();
-			});
-			groupRuntime?.notifyIdle();
-		});
-
-		pi.on("session_before_switch", () => (bridge?.activeJob ? { cancel: true } : undefined));
-		pi.on("session_before_fork", () => (bridge?.activeJob ? { cancel: true } : undefined));
-
-		pi.on("session_shutdown", async (event, ctx) => {
-			integration.stop();
-			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter(name => name !== "telegram_recall"));
-			generation += 1;
-			if (quietTimer) clearTimeout(quietTimer);
-			quietTimer = undefined;
-			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
-			projectionRefreshTimer = undefined;
-			projectionRefreshPending = false;
-			projectionRefreshController?.abort(new Error("Telegram owner bridge stopped"));
-			projectionRefreshController = undefined;
-			await projectionRefreshInFlight;
-			projectionRefreshInFlight = undefined;
-			connection = { phase: "stopping" };
-			updateStatus();
-			await stopEndpoint().catch((error) => noteError(error));
-			const receiptTypingStopped = stopReceiptTyping();
-			const typingStopped = stopTyping();
-			const stop = stopSource;
-			stopSource = undefined;
-			if (stop) await stop();
-			await receiptTypingStopped;
-			await typingStopped;
-			await operationTail;
-			await stopTyping();
-			await haltActivity();
-			await stopGroup();
-			if (bridge) {
-				await bridge.shutdown(event.reason);
-				await cleanupFinishedActivities().catch((error) => noteError(error));
-			}
-			bridge = undefined;
-			typing = undefined;
-			activity = undefined;
-			const close = runtimeDependencies?.close;
-			runtimeDependencies = undefined;
-			if (close) await close().catch((error) => noteError(error));
-			ctx.ui.setStatus("telegram-owner", undefined);
-			currentContext = undefined;
-		});
-	};
+		}
+		this.active = undefined;
+	}
 }
 
-export default createTelegramOwnerExtension();
+export function extractAssistantText(messages: unknown[]): string | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index] as { role?: string; content?: unknown };
+		if (message.role !== "assistant") continue;
+		if (typeof message.content === "string") return message.content;
+		if (Array.isArray(message.content)) {
+			const text = message.content
+				.filter((part): part is { type: "text"; text: string } =>
+					Boolean(part && typeof part === "object" && (part as { type?: string }).type === "text"),
+				)
+				.map((part) => part.text)
+				.join("");
+			if (text) return text;
+		}
+	}
+	return undefined;
+}

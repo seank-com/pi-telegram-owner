@@ -3,10 +3,11 @@ import { mkdir, open, readFile, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
+import type { SelectorRecord } from "./selectors.ts";
 import { parseTelegramOwnerCommand, type TelegramOwnerCommandName } from "./commands.ts";
 import { createTelegramTransportPlan, MAX_TELEGRAM_CHUNKS, TELEGRAM_HTML_LIMIT, type TelegramTransportPlan } from "./format.ts";
 
-export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported" | "group";
+export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported" | "group" | "local";
 
 export interface TelegramImageRef {
 	fileId: string;
@@ -66,9 +67,17 @@ export interface TelegramChatMemberUpdate {
 	new_chat_member: { status: string; user: TelegramUser };
 }
 
+export interface TelegramCallbackQuery {
+	id: string;
+	from: { id: number };
+	message?: { message_id: number; chat: { id: number; type: string } };
+	data?: string;
+}
+
 export interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
 	chat_member?: TelegramChatMemberUpdate;
 	my_chat_member?: TelegramChatMemberUpdate;
 }
@@ -216,6 +225,7 @@ export interface TurnOutcome {
 
 export type JournalRecord =
 	| TaskRecord
+	| SelectorRecord
 	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
 	| { type: "turn_failed"; jobId: string; code: TurnFailureCode; detail?: string; timestamp: string }
 	/** The turn responded with a telegram_group_send request replying to its own message; its final reply is not posted. */
@@ -861,6 +871,10 @@ export class TelegramOwnerBridge {
 		return this.records;
 	}
 
+	appendSelectorRecord(record: SelectorRecord): Promise<void> {
+		return this.append(record);
+	}
+
 	appendArchiveRecord(record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>): Promise<void> {
 		return this.append(record);
 	}
@@ -927,11 +941,20 @@ export class TelegramOwnerBridge {
 		await this.append({ ...open, revision: open.revision + 1, readyAt, memberJobIds: [...open.memberJobIds, job.jobId], messageIds: [...open.messageIds, job.messageId], segmentSha256: [...open.segmentSha256, sha256(job.text)], boundaries: [...open.boundaries, { start, end: start + job.text.length }], text: `${open.text}\n\n${job.text}`, finalMessageId: job.messageId });
 	}
 
-	async ingestBatch(updates: TelegramUpdate[]): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number }> {
+	async ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number }> {
 		const seen = new Set(this.records.filter((r) => r.type === "update").map((r) => r.updateId));
 		let acceptedModelInputCount = 0;
 		for (const update of updates) {
-			if (seen.has(update.update_id)) continue;
+			if (seen.has(update.update_id)) {
+				// Even redelivered callback queries need an answer to clear the spinner.
+				if (update.callback_query) await local?.(update);
+				continue;
+			}
+			if (await local?.(update)) {
+				await this.append({ type: "update", schemaVersion: 2, updateId: update.update_id, disposition: "local", timestamp: new Date(this.now()).toISOString() });
+				seen.add(update.update_id);
+				continue;
+			}
 			const message = update.message;
 			let disposition: UpdateDisposition;
 			let image: TelegramImageRef | undefined;
