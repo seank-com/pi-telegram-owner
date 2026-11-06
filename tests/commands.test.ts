@@ -226,7 +226,7 @@ test("slash captions on authorized images are handled locally and never dispatch
 test("help, status, and unknown commands bypass model dispatch and reply in update order", async () => {
 	const harness = createHarness();
 	await harness.emit("session_start", { reason: "startup" });
-	await harness.poll([update(10, "/help"), update(11, "/status"), update(12, "/model")]);
+	await harness.poll([update(10, "/help"), update(11, "/status"), update(12, "/future")]);
 
 	assert.equal(harness.sentMessages.length, 0);
 	assert.equal(harness.replies.length, 3);

@@ -238,7 +238,7 @@ test("Telegram API uses long-poll, typing, and sanitized sendMessage payloads", 
 		return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: messageId } }; } };
 	});
 	await api.getUpdates(90);
-	assert.deepEqual(requests[0]?.body, { offset: 91, timeout: 25, allowed_updates: ["message"] });
+	assert.deepEqual(requests[0]?.body, { offset: 91, timeout: 25, allowed_updates: ["message", "callback_query"] });
 	assert.ok(requests[0]?.signal);
 	await api.sendChatAction();
 	assert.equal(requests[1]?.url.endsWith("/sendChatAction"), true);
