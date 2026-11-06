@@ -10,6 +10,53 @@ input, dispatched jobs, replies, commands, photos and transient activity without
 resending uncertain outcomes. Source evidence is retained. Work lifecycle
 transitions append records without rewriting messages, journal history or cursors.
 
+Local model/thinking selectors use a separate `selector` v1 control-record
+stream in the same forward-only journal. The bridge records their updates as
+`local`, without job IDs, queue admission, receipt typing, session messages or
+archive projections. Callback receipt is acknowledged before entering the
+serialized operation queue. Authorization checks both the sender and original
+private chat; a button is additionally bound to its sent message ID. Unknown
+buttons never authorize edits to arbitrary messages.
+
+Each keyboard button has a random 128-bit opaque token (26 ASCII bytes including
+its prefix), mapped only in memory to an action, picker, expiry and catalog/session
+fingerprint. Tokens contain no model IDs, commands, endpoints or credentials.
+The fingerprint includes effective available models, public model capabilities,
+session scope, current model/thinking level, session ID and local lifecycle epoch;
+only hashes of routing metadata are compared, never displayed or journaled.
+Model choices always come from the available registry objects, not callback
+strings. Limits are six model rows per page, a navigation row, 32 retained
+pickers and a ten-minute TTL. Display text is bounded plain text.
+
+The durable ordering is receipt, requested selection, mutation start, terminal
+outcome, then message edit. Callback-query identity is hashed for deduplication;
+raw payloads and host errors are not retained. Duplicate receipt never repeats
+a mutation. Startup records incomplete requests as `interrupted` without
+replay, since Pi setters and the local journal cannot form an atomic transaction.
+A failed edit records `delivery_failed` after the durable mutation outcome; a
+failed callback answer records `answer_failed`. Both succeed and reject paths
+attempt callback answers. Display delivery is intentionally at-most-once, unlike
+ordinary command-response retry; inspect `/status` after an uncertain result.
+
+The extension tracks public compaction and session transition hooks in addition
+to local command flags. Idle also excludes queued work, pending/uncertain ordinary
+commands, open quiet-window batches and undelivered private replies. It rejects
+mutations while those guards are active and
+cancels compaction/switch/fork/tree admission during a selector mutation. It
+rechecks idle state and fingerprints after journal I/O, immediately before
+invoking a public setter. External UI activity is not serialized by this
+extension; the public host API provides no cross-UI atomic mutation primitive.
+Pi manual compaction aborts an active turn before `session_before_compact`, so
+that hook cannot prevent the earlier abort of accepted Telegram work.
+In the installed 0.87.1 SDK, automatic compaction skips before the before hook
+when preparation is empty; once that hook runs, cancellation/failure emits
+`session_compact_failed` and success emits `session_compact`. Thus an automatic
+skip does not latch the compaction guard, and local `/compact` must not cancel
+its own before hook merely because its local command flag is already set.
+The synthetic public-host probe covers the skip, both setters and stale API
+metadata; it is not a live Telegram end-to-end test. Actual Telegram E2E has
+not been performed.
+
 Canonical Markdown is authoritative. The projector joins exact Telegram text
 segments by owner, conversation and timestamp, preserves individual membership
 and provenance, and atomically publishes identified notes. Transport chunks are

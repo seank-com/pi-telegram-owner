@@ -6,7 +6,7 @@ transport, commands, protected canonical Markdown archive, photos and chronologi
 `telegram_timeline`. Datastore and observability are optional integrations.
 
 Build with Node 24.14.1+, `npm ci`, then `npm run build`. The manifest loads only
-`dist/index.js`. Pi and TypeBox are host peers; the package does not install a
+`dist/index.js`. Pi, pi-ai and TypeBox are host peers; the package does not install a
 second Pi runtime. Stock Pi 0.87.1 and the explicitly tested existing patched
 0.87.1 artifact are the acceptance targets; other versions are unverified.
 
@@ -21,6 +21,13 @@ with mode 0600, positive `ownerUserId`/`privateChatId`, and `tokenEnv` naming th
 bot token environment variable. Never commit a token. Configuration absence
 registers tools/commands but starts no poller and writes no state.
 See [setup](docs/setup.md) for configuration and CLI arguments.
+
+Private-owner `/model` and `/thinking` open local inline selectors without an
+agent turn. Choices respect the authenticated catalog, session model scope and
+active-model thinking capabilities. These two commands are typed manually;
+`/help` and the reconciled Telegram menu retain their five-command baseline.
+See [local selectors](docs/setup.md#local-model-and-thinking-selectors) for
+expiry, recovery and host requirements.
 
 Optionally, an agent can share an owner-controlled Telegram group with other
 agents. Every message in the room is recorded in one shared journal; agents

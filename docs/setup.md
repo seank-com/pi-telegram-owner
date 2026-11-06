@@ -252,6 +252,57 @@ missing from the shared journal are added, so repeating an import changes
 nothing. The importer takes the shared journal lock, so running agents need not
 be stopped.
 
+## Local model and thinking selectors
+
+In the configured owner's private chat, type exactly `/model` or `/thinking`
+without arguments. `/model` shows the current model and six choices per page.
+Choices are the intersection of Pi's session scope and authenticated available
+catalog; an empty session scope uses the available catalog. `/thinking` offers
+only levels supported by the active model, including `off` for non-reasoning
+models. If the active model is unavailable in scope, no levels are selectable.
+Current choices have a check mark. A selection edits that message with the
+confirmed result, host-adjusted thinking level, or a safe failure explanation.
+
+Mutations are admitted only while idle, without an active Telegram job, queued
+host messages, compaction or session transition. Busy selections are rejected,
+not queued. Open a fresh picker after the agent settles. Pickers expire after
+ten minutes; only the latest 32 are retained. Pagination replaces the previous
+page's buttons. Model, thinking, scope, catalog or session changes invalidate
+existing selections. Restart also invalidates every button. Expired or rejected
+callbacks are answered, but never invoke a setter.
+
+The selectors use public Pi 0.87.1 `ExtensionContext.scopedModels`,
+`modelRegistry.getAvailable()`, `ExtensionAPI.setModel()`, `getThinkingLevel()`
+and `setThinkingLevel()`, plus pi-ai's `getSupportedThinkingLevels(model)`.
+The host's pi-ai peer must provide that helper (0.87.1+). Other host versions are
+unverified; missing context capabilities fail closed rather than guessing a
+catalog or pretending a change succeeded. Custom dependency injections must
+supply `selectorTransport` for keyboard send/edit and callback answers.
+
+Requests, selected display labels/model identity hashes, mutation starts and
+terminal outcomes are local transport-journal records, not jobs or model
+messages. An interrupted request is recorded as uncertain at startup and never
+replayed. Inspect `/status` and open a new picker before retrying. Failed or
+uncertain selector sends/edits are not automatically resent; the journal retains
+the outcome and delivery failure. Existing ordinary command replies keep their
+durable delivery/retry behavior.
+
+A cancelled external session switch/fork/tree navigation can leave selectors
+fail-closed because Pi has no public transition-cancelled notification. A fresh
+`session_start` (for example restarting the Pi session) clears that guard; a
+completed tree navigation also clears it. Ordinary commands and queues continue
+unchanged. The public host setter is not a global lock against independent local
+UI actions; admission is revalidated immediately before calling it. Avoid local
+model operations while a Telegram selection is in flight. Pi manual
+compaction aborts an active turn before its public `session_before_compact` hook,
+so the hook cannot prevent that earlier abort. Avoid manual Pi compaction while
+accepted Telegram work is active; this remains a host limitation.
+
+The default `/help`, Telegram command-menu reconciliation and menu CLI still
+advertise only `/help`, `/status`, `/stop`, `/compact` and `/new`. Publishing new
+menu entries is a separate operator action; no live menu activation is needed
+to test selectors with the synthetic suite.
+
 ## CLIs
 
 `pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]` reconciles the
