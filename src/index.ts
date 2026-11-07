@@ -158,6 +158,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const projectionRefreshDebounceMs = options.projectionRefreshDebounceMs ?? 250;
 		let bridge: TelegramOwnerBridge | undefined;
 		let selectors: LocalSelectors | undefined;
+		let selectorAnswerController = new AbortController();
+		const selectorAnswers = new Set<Promise<void>>();
 		let hostCompacting = false;
 		let hostTransition = false;
 		let runtimeDependencies: PrototypeDependencies | undefined;
@@ -251,6 +253,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		const noteError = (error: unknown, token?: string): void => {
 			lastOperationError = sanitizeError(error, token);
 			updateStatus();
+		};
+
+		const stopSelectorAnswers = async (): Promise<void> => {
+			selectorAnswerController.abort(new Error("Telegram owner bridge stopped"));
+			await Promise.all([...selectorAnswers]);
 		};
 
 		const startReceiptTyping = (): void => {
@@ -778,7 +785,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				selectorTransport: {
 					send: (text, keyboard, replyTo) => api.sendMessage(text, replyTo, requests.signal, "plain", keyboard),
 					edit: (messageId, text, keyboard) => api.editMessageText(messageId, text, requests.signal, keyboard),
-					answer: (callbackId, text) => api.answerCallbackQuery(callbackId, requests.signal, text),
+					answer: (callbackId, text, signal) => api.answerCallbackQuery(callbackId, signal ? AbortSignal.any([requests.signal, signal]) : requests.signal, text),
 				},
 				reconcileCommandMenu: (signal) => api.setOwnerCommandMenu(signal ?? requests.signal),
 				sendActivity: async (text, signal, replyTo) => {
@@ -983,6 +990,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						selectorBridge.nextBatchReadyDelayMs === undefined,
 				});
 				await selectors.initialize();
+				const localSelectors = selectors;
+				const answerController = new AbortController();
+				selectorAnswerController = answerController;
 				await capturePendingInboundMedia();
 				await reconcileMarkdown(ctx);
 				if (runtimeDependencies.reconcileCommandMenu) {
@@ -1001,12 +1011,18 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				);
 				await recoverUncertainCommands(event.reason, ctx);
 				stopSource = await runtimeDependencies.source.start(async (updates) => {
-					const localSelectors = selectors;
-					// Answer at receipt, not behind a slow reply, journal reconciliation or model setter.
-					await Promise.all(updates.flatMap(update => update.callback_query ? [localSelectors?.answer(update.callback_query)] : []));
+					if (generation !== ownGeneration || !bridge) return bridge?.cursor;
+					// Start answers immediately, but never gate update admission or /stop
+					// on their network completion. Shutdown cancels and drains them.
+					for (const update of updates) {
+						if (!update.callback_query) continue;
+						const pending = localSelectors.answer(update.callback_query, answerController.signal).catch(error => noteError(error));
+						selectorAnswers.add(pending);
+						void pending.then(() => selectorAnswers.delete(pending));
+					}
 					return serialized(async () => {
 						if (generation !== ownGeneration || !bridge) return bridge?.cursor;
-						const state = await bridge.ingestBatch(updates, (update) => localSelectors!.handle(update, true));
+						const state = await bridge.ingestBatch(updates, (update) => localSelectors.handle(update, true));
 						groupRuntime?.notifyUpdates();
 						groupRuntime?.notifyIdle();
 						for (let index = 0; index < state.acceptedModelInputCount; index++) startReceiptTyping();
@@ -1041,12 +1057,14 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			} catch (error) {
 				noteError(error);
 				await stopEndpoint().catch((endpointError) => noteError(endpointError));
+				const answersStopped = stopSelectorAnswers();
 				await stopReceiptTyping();
 				await stopTyping();
 				typing = undefined;
 				const stop = stopSource;
 				stopSource = undefined;
 				if (stop) await stop().catch((stopError) => noteError(stopError));
+				await answersStopped;
 				await stopGroup();
 				const close = runtimeDependencies.close;
 				runtimeDependencies = undefined;
@@ -1140,6 +1158,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter(name => name !== "telegram_recall"));
 			generation += 1;
 			selectors?.invalidate();
+			const answersStopped = stopSelectorAnswers();
 			if (quietTimer) clearTimeout(quietTimer);
 			quietTimer = undefined;
 			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
@@ -1157,6 +1176,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			const stop = stopSource;
 			stopSource = undefined;
 			if (stop) await stop();
+			await answersStopped;
 			await receiptTypingStopped;
 			await typingStopped;
 			await operationTail;

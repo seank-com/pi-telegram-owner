@@ -13,14 +13,19 @@ transitions append records without rewriting messages, journal history or cursor
 Local model/thinking selectors use a separate `selector` v1 control-record
 stream in the same forward-only journal. The bridge records their updates as
 `local`, without job IDs, queue admission, receipt typing, session messages or
-archive projections. Callback receipt is acknowledged before entering the
-serialized operation queue. Authorization checks both the sender and original
+archive projections. Callback answers start at receipt without awaiting network
+completion before serialized update admission or command processing. `/stop`
+and subsequent polls proceed while an answer is pending. Session shutdown
+cancels and drains outstanding answers before releasing journal/transport state;
+answer and journal failures remain observed. Authorization checks both the sender and original
 private chat; a button is additionally bound to its sent message ID. Unknown
 buttons never authorize edits to arbitrary messages.
 
 Each keyboard button has a random 128-bit opaque token (26 ASCII bytes including
 its prefix), mapped only in memory to an action, picker, expiry and catalog/session
 fingerprint. Tokens contain no model IDs, commands, endpoints or credentials.
+Display labels use public `provider/model-id` identities so matching friendly
+names across providers or aliases do not obscure the selected model.
 The fingerprint includes effective available models, public model capabilities,
 session scope, current model/thinking level, session ID and local lifecycle epoch;
 only hashes of routing metadata are compared, never displayed or journaled.
@@ -48,14 +53,14 @@ invoking a public setter. External UI activity is not serialized by this
 extension; the public host API provides no cross-UI atomic mutation primitive.
 Pi manual compaction aborts an active turn before `session_before_compact`, so
 that hook cannot prevent the earlier abort of accepted Telegram work.
-In the installed 0.87.1 SDK, automatic compaction skips before the before hook
-when preparation is empty; once that hook runs, cancellation/failure emits
-`session_compact_failed` and success emits `session_compact`. Thus an automatic
-skip does not latch the compaction guard, and local `/compact` must not cancel
-its own before hook merely because its local command flag is already set.
-The synthetic public-host probe covers the skip, both setters and stale API
-metadata; it is not a live Telegram end-to-end test. Actual Telegram E2E has
-not been performed.
+Compaction cancellation/failure releases the guard through
+`session_compact_failed`; completion releases it through `session_compact`.
+Local `/compact` does not cancel its own before hook merely because its local
+command flag is already set. The offline host probe uses public
+`AgentSession.compact()`, `SessionManager.appendMessage()` and extension hooks
+to cover too-small input, cancellation after guard admission and completion with
+an extension-supplied summary. It also covers both setters and stale API metadata,
+with no Telegram or model calls. Live Telegram end-to-end acceptance is separate.
 
 Canonical Markdown is authoritative. The projector joins exact Telegram text
 segments by owner, conversation and timestamp, preserves individual membership

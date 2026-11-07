@@ -256,7 +256,8 @@ be stopped.
 
 In the configured owner's private chat, type exactly `/model` or `/thinking`
 without arguments. `/model` shows the current model and six choices per page.
-Choices are the intersection of Pi's session scope and authenticated available
+Labels and confirmations use `provider/model-id`, distinguishing models even
+when their friendly names match. Choices are the intersection of Pi's session scope and authenticated available
 catalog; an empty session scope uses the available catalog. `/thinking` offers
 only levels supported by the active model, including `off` for non-reasoning
 models. If the active model is unavailable in scope, no levels are selectable.
@@ -277,7 +278,10 @@ and `setThinkingLevel()`, plus pi-ai's `getSupportedThinkingLevels(model)`.
 The host's pi-ai peer must provide that helper (0.87.1+). Other host versions are
 unverified; missing context capabilities fail closed rather than guessing a
 catalog or pretending a change succeeded. Custom dependency injections must
-supply `selectorTransport` for keyboard send/edit and callback answers.
+supply `selectorTransport` for keyboard send/edit and callback answers. Its
+`answer(callbackId, text?, signal?)` implementation must honor the supplied
+session abort signal. Answer requests run independently of poll admission and
+`/stop`; shutdown cancels and drains them before closing journal/transport state.
 
 Requests, selected display labels/model identity hashes, mutation starts and
 terminal outcomes are local transport-journal records, not jobs or model
