@@ -151,7 +151,11 @@ test("an instruction is durably queued, runs as an owner-authority turn and repl
 	await host.emit("agent_settled", { type: "agent_settled" });
 	assert.ok(host.calls.includes("reply:undefined:Set an early alarm."));
 	assert.ok(host.calls.includes("activity:undefined:Thinking (context recalculating)"));
-	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "idle", queue: { owner: 0, peer: 0 }, group: "unconfigured", tasks:[{taskId:accepted.body.itemId,state:'completed',disposition:'completed',pending:[]}] });
+	const idleStatus = await (await fetch(`http://127.0.0.1:${port}/status`)).json();
+	assert.equal(idleStatus.ownerActivity.lastOwnerMessageAt, null);
+	assert.equal(typeof idleStatus.ownerActivity.lastAgentMessageAt, "string");
+	const { ownerActivity: _sentActivity, ...idleRest } = idleStatus;
+	assert.deepEqual(idleRest, { state: "idle", queue: { owner: 0, peer: 0 }, group: "unconfigured", tasks:[{taskId:accepted.body.itemId,state:'completed',disposition:'completed',pending:[]}] });
 	await host.emit("session_shutdown", { type: "session_shutdown", reason: "exit" });
 	await assert.rejects(fetch(`http://127.0.0.1:${port}/status`), "the endpoint stops on shutdown");
 });
@@ -164,7 +168,7 @@ test("an instruction for nobody runs silently, and group requests are refused wi
 	const quiet = await post(port, "/queue", { kind: "instruction", reply: "none", text: "Refresh your notes." });
 	assert.equal(quiet.status, 202);
 	assert.equal(host.calls.length, 0, "an item with no reply destination gets no queued notice");
-	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "busy", queue: { owner: 1, peer: 0 }, group: "unconfigured", tasks: [] });
+	assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/status`)).json(), { state: "busy", queue: { owner: 1, peer: 0 }, group: "unconfigured", tasks: [], ownerActivity: { lastOwnerMessageAt: null, lastAgentMessageAt: null } });
 	assert.equal((await post(port, "/queue", { kind: "instruction", reply: "group", text: "x" })).status, 409);
 	assert.equal((await post(port, "/queue", { kind: "group-message", messageId: 4 })).status, 409);
 	assert.equal((await post(port, "/queue", { kind: "instruction", reply: "private" })).status, 400);

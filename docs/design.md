@@ -683,7 +683,41 @@ the private chat while delivery keeps retrying.
   group is verified. It also reports local task identities, execution/waiting
   state, pending request/recipient identities and terminal dispositions without
   including task text or private destination details. `idle` describes the
-  execution queue, not the absence of waiting obligations.
+  execution queue, not the absence of waiting obligations. `ownerActivity` is
+  a separate facts-only object. A successful response includes it:
+
+  ```json
+  {
+    "ownerActivity": {
+      "lastOwnerMessageAt": null,
+      "lastAgentMessageAt": null
+    }
+  }
+  ```
+
+  Each field is an ISO timestamp or null. The fields are independent. Null
+  means that direction has not been counted, not that the other direction is
+  quiet and not that the fact was unreadable. Omitting the object, or putting
+  a non-ISO value in either field, is outside this success shape. The producer
+  does not emit an unavailable marker, an `active` flag, or a recency window,
+  and it does not compare either timestamp with a clock. A consumer that wants
+  a window supplies its own. No message text is included. This is not a busy
+  flag and not a mail schedule.
+
+  `lastOwnerMessageAt` is the latest accepted update in the configured private
+  chat. When that update has a Telegram message date, the timestamp is that
+  date; otherwise it is the journal time. A queue instruction is not an owner
+  message. Group messages do not count.
+
+  `lastAgentMessageAt` is the latest private reply Telegram accepted, including
+  one chunk of a split reply and a plain send. The job is a private-chat update
+  or a work item whose reply destination is private. A reply that produced no
+  message ID does not count, and neither does a group reply or peer traffic.
+  The timestamp is the time that send was recorded. An accepted private send
+  with no counted owner message sets only `lastAgentMessageAt`.
+
+  If this handler answers while the transport bridge is absent, both fields are
+  null. Two nulls do not prove that transport is healthy.
 
 The endpoint starts with the transport and stops on shutdown. A port that
 cannot be bound disables the endpoint with a diagnostic and leaves the

@@ -640,7 +640,11 @@ test("explicit plain delivery preserves exact legacy journal behavior", async ()
 	await bridge.retryReadyReplies(async (text, _replyTo, format) => (calls.push({ text, format }), "390"));
 	assert.deepEqual(calls, [{ text: "**literal**", format: undefined }]);
 	assert.equal(journal.records.some((record) => record.type === "reply_plan"), false);
-	assert.deepEqual(journal.records.at(-1), { type: "reply_sent", jobId: "plain-opt-out", messageId: "390" });
+	const sent = journal.records.at(-1);
+	assert.equal(sent?.type, "reply_sent");
+	assert.equal(sent && "jobId" in sent ? sent.jobId : undefined, "plain-opt-out");
+	assert.equal(sent && "messageId" in sent ? sent.messageId : undefined, "390");
+	assert.equal(sent && "timestamp" in sent && Number.isFinite(Date.parse(sent.timestamp)), true);
 });
 
 test("durable formatted reply plans record every chunk and recover without resending receipts", async () => {
