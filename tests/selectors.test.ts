@@ -196,14 +196,15 @@ test("picker cache evicts oldest selectors and remains bounded", async () => {
 	await f.selectors.handle(callback(100, old)); assert.equal(f.outcome(), "stale"); assert.equal(f.calls, 0);
 });
 
-test("commands stay argument-free, private-owner only, and absent from the default menu/help", async () => {
+test("advertised selectors stay argument-free and private-owner only", async () => {
 	const f = fixture();
 	for (const update of [command(1, "/model", 8), command(2, "/thinking", 7, 71), command(3, "/model extra"), command(4, "/model@fixture")]) {
 		assert.equal(await f.selectors.handle(update), false);
 	}
 	assert.equal(f.reads, 0); assert.equal(f.journal.records.length, 0);
-	assert.deepEqual(telegramOwnerMenuCommands().map(c => c.command), ["help", "status", "stop", "compact", "new"]);
-	assert.ok(!telegramOwnerHelpText().includes("/model"));
+	assert.deepEqual(telegramOwnerMenuCommands().map(c => c.command), ["help", "status", "stop", "compact", "new", "model", "thinking"]);
+	assert.ok(telegramOwnerHelpText().includes("/model - Choose the active model."));
+	assert.ok(telegramOwnerHelpText().includes("/thinking - Choose the thinking level."));
 });
 
 function extensionFixture(options: { inboundQuietWindowMs?: number; sendReply?: () => Promise<string> } = {}) {

@@ -22,8 +22,9 @@ See [setup](docs/setup.md) for configuration and CLI arguments.
 
 Private-owner `/model` and `/thinking` open local inline selectors without an
 agent turn. Choices respect the authenticated catalog, session model scope and
-active-model thinking capabilities. These two commands are typed manually;
-`/help` and the reconciled Telegram menu retain their five-command baseline.
+active-model thinking capabilities. Both commands appear in `/help` and the
+reconciled private-chat command menu alongside `/help`, `/status`, `/stop`,
+`/compact` and `/new`; they can also be typed directly.
 See [local selectors](docs/setup.md#local-model-and-thinking-selectors) for
 expiry, recovery and host requirements.
 

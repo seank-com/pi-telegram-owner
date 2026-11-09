@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolve } from "node:path";
+import { telegramOwnerMenuCommands } from "../commands.ts";
 
 import {
 	loadTelegramOwnerConfig,
@@ -18,7 +19,7 @@ async function main(): Promise<void> {
 		throw new Error(`Telegram owner configuration is absent for ${projectRoot}`);
 	}
 	await loaded.config.createApiClient().setOwnerCommandMenu();
-	process.stdout.write("Registered the five Telegram owner commands.\n");
+	process.stdout.write(`Registered ${telegramOwnerMenuCommands().length} Telegram owner commands.\n`);
 }
 
 main().catch((error) => {

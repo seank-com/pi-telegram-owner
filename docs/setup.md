@@ -309,15 +309,15 @@ compaction aborts an active turn before its public `session_before_compact` hook
 so the hook cannot prevent that earlier abort. Avoid manual Pi compaction while
 accepted Telegram work is active; this remains a host limitation.
 
-Type `/model` and `/thinking` manually. `/help`, automatic command-menu
-reconciliation and the menu CLI advertise `/help`, `/status`, `/stop`, `/compact`
-and `/new`; they do not add selector entries. Menu registration is an explicit
-operator action.
+The private-chat command menu and `/help` advertise `/model` and `/thinking`
+alongside `/help`, `/status`, `/stop`, `/compact` and `/new`. They can also be typed
+directly. Startup reconciliation and the menu CLI publish the same command list;
+menu visibility does not change selector ownership or idle-admission checks.
 
 ## CLIs
 
 `pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]` reconciles the
-five-command owner menu for private chats using protected config. This contacts Telegram. Tests
+seven-command owner menu for private chats using protected config. This contacts Telegram. Tests
 intercept fetch with a synthetic fixture; no test contacts the service.
 
 ### Private archive import

@@ -21,7 +21,7 @@ Pi lifecycle hooks. The major responsibilities are:
 | [`index.ts`](../src/index.ts) | Starts and stops resources, serializes bridge operations, dispatches Pi turns and connects delivery to lifecycle events. |
 | [`runtime.ts`](../src/runtime.ts) | Validates configuration, owns the poller lock, calls Telegram and manages polling, typing and ephemeral activity. |
 | [`core.ts`](../src/core.ts), [`work.ts`](../src/work.ts) | Classify updates, append/recover the private transport journal and track queues, tasks, dependencies and delivery outcomes. |
-| [`commands.ts`](../src/commands.ts), [`selectors.ts`](../src/selectors.ts) | Define the ordinary command interface and implement local model/thinking pickers without model turns. `index.ts` executes ordinary commands. |
+| [`commands.ts`](../src/commands.ts), [`selectors.ts`](../src/selectors.ts) | Own shared menu/help metadata, parse ordinary commands and implement local model/thinking pickers without model turns. `index.ts` executes ordinary commands. |
 | [`group-runtime.ts`](../src/group-runtime.ts), [`endpoint.ts`](../src/endpoint.ts), [`group-tools.ts`](../src/group-tools.ts) | Coordinate group membership, routing, elections and peer delivery; accept local work and expose group tools. |
 | [`group-journal.ts`](../src/group-journal.ts) | Own the shared group's locked event log and canonical Markdown projection. |
 | [`markdown-projector.ts`](../src/markdown-projector.ts), [`importer.ts`](../src/importer.ts), `src/cli/` | Publish and validate private conversation notes/media, read their timeline and import reviewed Telegram Desktop exports. |
@@ -64,8 +64,9 @@ an uncertain message. The detailed delivery rules are in
 
 ### Local selector
 
-A `/model` or `/thinking` update opens a picker through `LocalSelectors`, not
-through Pi inference. The transport starts a button callback answer at receipt
+The shared advertised command list includes `/model` and `/thinking` in the
+private-chat menu and `/help`. Their updates open pickers through `LocalSelectors`
+before ordinary command-job admission, not through Pi inference. The transport starts a button callback answer at receipt
 without waiting for its network completion before admitting the batch. A
 successful acknowledgment clears Telegram's spinner; it does not create a model
 turn or confirm a mutation. The selector then checks ownership, button and

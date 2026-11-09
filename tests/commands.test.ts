@@ -151,11 +151,13 @@ function createHarness(
 	};
 }
 
-test("the owner command registry is exact and parsing rejects arguments locally", () => {
+test("ordinary command parsing stays separate from advertised local selectors", () => {
 	assert.deepEqual(TELEGRAM_OWNER_COMMANDS.map(({ name }) => name), ["help", "status", "stop", "compact", "new"]);
 	assert.deepEqual(parseTelegramOwnerCommand(" /status "), { kind: "known", name: "status" });
 	assert.deepEqual(parseTelegramOwnerCommand("/status extra"), { kind: "unknown", token: "/status" });
 	assert.deepEqual(parseTelegramOwnerCommand("/session"), { kind: "unknown", token: "/session" });
+	assert.deepEqual(parseTelegramOwnerCommand("/model"), { kind: "unknown", token: "/model" });
+	assert.deepEqual(parseTelegramOwnerCommand("/thinking"), { kind: "unknown", token: "/thinking" });
 	assert.equal(parseTelegramOwnerCommand("ordinary text"), undefined);
 	assert.equal(telegramOwnerHelpText(), [
 		"Available commands:",
@@ -164,6 +166,8 @@ test("the owner command registry is exact and parsing rejects arguments locally"
 		"/stop - Stop the current run.",
 		"/compact - Compact the current session context.",
 		"/new - Start a fresh session.",
+		"/model - Choose the active model.",
+		"/thinking - Choose the thinking level.",
 	].join("\n"));
 	assert.equal(initialThinkingText(24.6), "Thinking (25%)");
 	assert.equal(initialThinkingText(null), "Thinking (context recalculating)");
