@@ -616,7 +616,9 @@ test("quiet timer durably seals once during a busy turn and idle settlement disp
 	const emit = async (name: string, event: object) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
 	await emit("session_start", { type: "session_start", reason: "startup" });
 	await onBatch?.([textUpdate(50, "wait for idle")]);
-	await new Promise((resolve) => setTimeout(resolve, 140));
+	while (!journal.records.some((record) => record.type === "inbound_batch" && record.state === "sealed")) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
 	const batches = journal.records.filter((record) => record.type === "inbound_batch");
 	assert.equal(batches.at(-1)?.state, "sealed");
 	assert.equal(batches.length, 2);

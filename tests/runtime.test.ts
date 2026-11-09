@@ -56,13 +56,20 @@ function accepted(jobId: string, updateId: number): JournalRecord {
 	};
 }
 
-async function waitFor(predicate: () => boolean, timeout = 1_000): Promise<void> {
-	const deadline = Date.now() + timeout;
+async function waitFor(predicate: () => boolean): Promise<void> {
 	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error("condition timed out");
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
 }
+
+test("fixture readiness waits for completion despite a wall-clock jump", async (t) => {
+	let clock = 0;
+	t.mock.method(Date, "now", () => clock += 86_400_000);
+	let ready = false;
+	setImmediate(() => { ready = true; });
+	await waitFor(() => ready);
+	assert.equal(ready, true);
+});
 
 const TEST_BOOT: BootIdentity = { id: "test-boot-current", startedAtMs: 1 };
 const testBoot = () => TEST_BOOT;
@@ -1512,7 +1519,7 @@ test("the durable reply precedes activity cleanup and delete failure is best eff
 		toolName: "bash",
 		args: { command: "do-not-leak --token hidden" },
 	});
-	await waitFor(() => calls.includes("edit:Inspect the persisted state safely"), 1_500);
+	await waitFor(() => calls.includes("edit:Inspect the persisted state safely"));
 	assert.equal(calls.some((call) => call.includes("do-not-leak") || call.includes("hidden")), false);
 	await emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: "done" }] });
 	await emit("agent_settled", { type: "agent_settled" });

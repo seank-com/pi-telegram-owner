@@ -15,10 +15,8 @@ const OWNER = 7;
 const CHAT = 70;
 const PROJECT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
-async function waitFor(predicate: () => boolean, timeout = 1_000): Promise<void> {
-	const deadline = Date.now() + timeout;
+async function waitFor(predicate: () => boolean): Promise<void> {
 	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error("Timed out waiting for condition");
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 }

@@ -114,10 +114,10 @@ if(process.env.TEST_COMPANIONS){
   const state=await start(order,{mode,store:"telegram"});const api=(globalThis as any).fixtureApi;const client=createMarkdownDatastoreClient(api.events,{timeoutMs:5000});
   try{
    assert.ok(state.session.getActiveToolNames().includes("telegram_recall"));
-   const startupDeadline=Date.now()+5000;let status:any;do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<startupDeadline);
+   let status:any;do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(status.data.stores[0].sourceReconciliation.state!=="succeeded");
    assert.equal(status.data.stores[0].sourceReconciliation.state,"succeeded",JSON.stringify(status.data));
    const receipt=await client.refresh({action:"start",store:"telegram",mode:"semantic"});const refreshId=receipt.data.qmd.refreshId;assert.ok(refreshId);
-   const deadline=Date.now()+5000;do{status=await client.status({store:"telegram"});const job=status.data.stores[0].sourceReconciliation.job;if(job?.refreshId===refreshId&&job.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<deadline);
+   do{status=await client.status({store:"telegram"});const job=status.data.stores[0].sourceReconciliation.job;if(job?.refreshId===refreshId&&job.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(status.data.stores[0].sourceReconciliation.job?.refreshId!==refreshId||status.data.stores[0].sourceReconciliation.job?.state!=="succeeded");
    assert.equal(status.data.stores[0].sourceReconciliation.job?.refreshId,refreshId);assert.equal(status.data.stores[0].sourceReconciliation.job?.state,"succeeded",JSON.stringify(status.data));
    const recalled=await state.session.getToolDefinition("telegram_recall").execute("recall-fixture",{query:"Prior",limit:2});assert.equal(recalled.details.returned,1);
    const hit=JSON.parse(recalled.content[0].text).data.hits[0];assert.equal(hit.path,messagePath);assert.equal(hit.note.path,messagePath);assert.equal(hit.uri,`datastore://telegram/${messagePath}`);
@@ -130,7 +130,7 @@ if(process.env.TEST_COMPANIONS){
    assert.equal((await client.search({store:"telegram",query:"Shared group source",mode:"lexical"})).data.returned,0);
    const liveTimeline=await state.session.getToolDefinition("telegram_timeline").execute("root-timeline",{operation:"recent",limit:50});assert.ok(JSON.parse(liveTimeline.content[0].text).messages.some((message:any)=>message.path===first.path));
    const integration=local.createDatastoreIntegration(api.events,()=>({mode:"auto",store:"telegram"}),1000);integration.start();assert.equal((await integration.service.refresh({action:"start",store:"telegram",mode:"lexical"})).operation,"refresh");integration.stop();
-   const lexicalDeadline=Date.now()+5000;do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(Date.now()<lexicalDeadline);assert.equal(status.data.stores[0].sourceReconciliation.state,"succeeded");
+   do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(status.data.stores[0].sourceReconciliation.state!=="succeeded");assert.equal(status.data.stores[0].sourceReconciliation.state,"succeeded");
    // Actual owner persists the intent before Telegram consumes it.
    const owner=state.loader.getExtensions().extensions.find((extension:any)=>extension.path===obsEntry);const branch:any[]=[];const ctx={sessionManager:{getBranch:()=>branch}};
    const loaded=state.loader.getExtensions();const original=loaded.runtime.appendEntry;loaded.runtime.appendEntry=(customType:string,data:any)=>branch.push({type:"custom",customType,data});

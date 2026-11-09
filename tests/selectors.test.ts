@@ -251,7 +251,7 @@ test("callback answer happens promptly before a blocked serialized model mutatio
 });
 
 for (const splitBatches of [false, true]) {
-	test(`pending callback answer does not block /stop (${splitBatches ? "later poll" : "same poll"})`, { timeout: 5000 }, async t => {
+	test(`pending callback answer does not block /stop (${splitBatches ? "later poll" : "same poll"})`, async t => {
 		const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
 		let release!: () => void;
 		const hold = new Promise<void>(resolve => { release = resolve; });
@@ -268,7 +268,7 @@ for (const splitBatches of [false, true]) {
 	});
 }
 
-test("shutdown cancels and drains a callback answer before releasing its journal", { timeout: 5000 }, async () => {
+test("shutdown cancels and drains a callback answer before releasing its journal", async () => {
 	const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
 	let aborted = false;
 	h.f.transport.answer = async (_id: string, _text?: string, signal?: AbortSignal) => {
@@ -283,7 +283,7 @@ test("shutdown cancels and drains a callback answer before releasing its journal
 	assert.ok(h.journal.records.some(r => r.type === "selector" && r.phase === "answer_failed"));
 });
 
-test("shutdown drains an answer registered while its transport starts teardown", { timeout: 5000 }, async () => {
+test("shutdown drains an answer registered while its transport starts teardown", async () => {
 	const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
 	let release!: () => void, began!: () => void;
 	const hold = new Promise<void>(resolve => { release = resolve; });

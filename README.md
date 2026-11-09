@@ -76,7 +76,10 @@ native Node programs without loading Pi. Pure helpers are exported as `/format`,
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
 `npm pack --dry-run`, `npm run test:package`. Default tests need no companion or
-real Telegram. Explicit composition checks use actual candidate tarballs:
+real Telegram. Qualification waits for completion, cancellation or expected
+fixture state, without a wall-clock pass/fail deadline on tests or child commands.
+Runtime/protocol timing contracts are exercised separately. Explicit composition
+checks use actual candidate tarballs:
 
 ```bash
 DATASTORE_TARBALL=/path/to/datastore.tgz OBSERVABILITY_TARBALL=/path/to/observability.tgz \
