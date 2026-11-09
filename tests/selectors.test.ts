@@ -283,6 +283,33 @@ test("shutdown cancels and drains a callback answer before releasing its journal
 	assert.ok(h.journal.records.some(r => r.type === "selector" && r.phase === "answer_failed"));
 });
 
+test("shutdown drains an answer registered while its transport starts teardown", { timeout: 5000 }, async () => {
+	const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
+	let release!: () => void, began!: () => void;
+	const hold = new Promise<void>(resolve => { release = resolve; });
+	const writing = new Promise<void>(resolve => { began = resolve; });
+	let shutdown: Promise<unknown> | undefined, stopped = false, written = false;
+	const append = h.journal.append.bind(h.journal);
+	h.journal.append = async record => {
+		if (record.type === "selector" && record.phase === "answer_failed") { began(); await hold; written = true; }
+		await append(record);
+	};
+	h.f.transport.answer = async (_id: string, _text?: string, signal?: AbortSignal) => {
+		// Supported transport injection can synchronously initiate teardown before
+		// the receipt loop registers the returned answer promise in its owned set.
+		shutdown = h.emit("session_shutdown", { reason: "exit" }).then(() => { stopped = true; });
+		assert.equal(signal?.aborted, true);
+		throw new Error("synthetic cancellation");
+	};
+	try {
+		await h.poll([callback(1, "unknown")]); await writing;
+		await new Promise<void>(resolve => setImmediate(resolve));
+		assert.equal(stopped, false, "teardown must await the late-registered answer's journal write");
+	} finally { release(); await shutdown; }
+	assert.equal(written, true);
+	assert.equal(stopped, true);
+});
+
 test("callback answer journal failure is observed without blocking ordinary command admission", async () => {
 	const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
 	const append = h.journal.append.bind(h.journal);

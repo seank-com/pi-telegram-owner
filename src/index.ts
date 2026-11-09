@@ -255,9 +255,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			updateStatus();
 		};
 
-		const stopSelectorAnswers = async (): Promise<void> => {
+		const cancelSelectorAnswers = (): void => {
 			selectorAnswerController.abort(new Error("Telegram owner bridge stopped"));
-			await Promise.all([...selectorAnswers]);
 		};
 
 		const startReceiptTyping = (): void => {
@@ -1057,14 +1056,14 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			} catch (error) {
 				noteError(error);
 				await stopEndpoint().catch((endpointError) => noteError(endpointError));
-				const answersStopped = stopSelectorAnswers();
+				cancelSelectorAnswers();
 				await stopReceiptTyping();
 				await stopTyping();
 				typing = undefined;
 				const stop = stopSource;
 				stopSource = undefined;
 				if (stop) await stop().catch((stopError) => noteError(stopError));
-				await answersStopped;
+				await Promise.all([...selectorAnswers]);
 				await stopGroup();
 				const close = runtimeDependencies.close;
 				runtimeDependencies = undefined;
@@ -1158,7 +1157,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter(name => name !== "telegram_recall"));
 			generation += 1;
 			selectors?.invalidate();
-			const answersStopped = stopSelectorAnswers();
+			cancelSelectorAnswers();
 			if (quietTimer) clearTimeout(quietTimer);
 			quietTimer = undefined;
 			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
@@ -1176,7 +1175,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			const stop = stopSource;
 			stopSource = undefined;
 			if (stop) await stop();
-			await answersStopped;
+			// The source is quiescent: include answers registered during cancellation.
+			await Promise.all([...selectorAnswers]);
 			await receiptTypingStopped;
 			await typingStopped;
 			await operationTail;

@@ -93,8 +93,10 @@ stream in the same forward-only journal. The bridge records their updates as
 `local`, without job IDs, queue admission, receipt typing, session messages or
 archive projections. Callback answers start at receipt independently of serialized
 admission. An outstanding answer does not block `/stop` or subsequent polling.
-The extension tracks answer work and observes failures; session shutdown aborts
-and drains it before releasing journal/transport state. Authorization checks
+The extension tracks answer work and observes failures. Session shutdown aborts
+answers, stops the poll source, then drains answer work before releasing
+journal/transport state. Stopping the source closes receipt admission before
+taking the drain snapshot. Authorization checks
 both the sender and original private chat; a button is additionally bound to its
 sent message ID. Unknown buttons never authorize edits to arbitrary messages.
 
