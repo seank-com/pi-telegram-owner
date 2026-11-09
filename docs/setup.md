@@ -262,6 +262,8 @@ only levels supported by the active model, including `off` for non-reasoning
 models. If the active model is unavailable in scope, no levels are selectable.
 Current choices have a check mark. A selection edits that message with the
 confirmed result, host-adjusted thinking level, or a safe failure explanation.
+The callback acknowledgment only clears Telegram's spinner; it does not confirm
+a model/thinking change. Use the edited result or `/status` to check the outcome.
 
 Mutations are admitted only while idle, without an active Telegram job, queued
 host messages, compaction or session transition. Busy selections are rejected,
@@ -287,21 +289,23 @@ uncertain selector sends/edits are not automatically resent; the journal retains
 the outcome and delivery failure. Existing ordinary command replies keep their
 durable delivery/retry behavior.
 
-A cancelled external session switch/fork/tree navigation can leave selectors
-fail-closed because Pi has no public transition-cancelled notification. A fresh
-`session_start` (for example restarting the Pi session) clears that guard; a
-completed tree navigation also clears it. Ordinary commands and queues continue
-unchanged. The public host setter is not a global lock against independent local
-UI actions; admission is revalidated immediately before calling it. Avoid local
+A cancelled external session switch/fork/tree navigation can leave selector
+mutations blocked because Pi has no public transition-cancelled notification.
+A fresh session start or a completed tree navigation clears that guard. Use
+`/new` only when replacing the conversation is intended; otherwise use the
+normal operator-approved session recovery procedure. The selector guard does
+not itself block ordinary commands or queues. The public host setter is not a
+global lock against independent local UI actions; admission is revalidated
+immediately before calling it. Avoid local
 model operations while a Telegram selection is in flight. Pi manual
 compaction aborts an active turn before its public `session_before_compact` hook,
 so the hook cannot prevent that earlier abort. Avoid manual Pi compaction while
 accepted Telegram work is active; this remains a host limitation.
 
-The default `/help`, Telegram command-menu reconciliation and menu CLI still
-advertise only `/help`, `/status`, `/stop`, `/compact` and `/new`. Publishing new
-menu entries is a separate operator action; no live menu activation is needed
-to test selectors with the synthetic suite.
+Type `/model` and `/thinking` manually. `/help`, automatic command-menu
+reconciliation and the menu CLI advertise `/help`, `/status`, `/stop`, `/compact`
+and `/new`; they do not add selector entries. Menu registration is an explicit
+operator action.
 
 ## CLIs
 
@@ -402,13 +406,13 @@ All archive/control schemas use `pi-telegram-owner/<kind>/v1`: `source-set`,
 `archive-manifest`, `media-event`, `message`, `private-import-prepare`, and
 `boundary-candidates`; for the shared group root, `group-event` (journal entries),
 `group-message` (notes), `group-speaker-map`, `group-import-prepare`, and
-`group-import-report`. Earlier names and boundary shapes have no aliases in this unpublished package. Existing Telegram Desktop
-HTML and media exports can be reused. Regenerate the source manifest, speaker
-map and explicit boundary, then create a fresh dry-run checkpoint and publish
-to a fresh output directory. Keep the existing archive available for verification.
-Do not relabel old checkpoints or rewrite existing notes in place: their hashes
-bind the original metadata and plan. Preserve original Pi sessions and transport
-journals. These development changes do not migrate or activate live state.
+`group-import-report`. To import an existing Telegram Desktop HTML/media export
+into a separate archive, prepare controls in a new directory, review its source
+manifest, speaker map and explicit boundary, then create a matching dry-run
+checkpoint before committing to the chosen output directory. Keep any existing
+archive available for comparison. Checkpoints bind their original metadata and
+plan; do not relabel them or rewrite existing notes to make changed inputs pass.
+Preserve original Pi sessions and transport journals.
 
 Importer output reports counts and publication results. Repeating an accepted
 commit is idempotent; changed inputs require a new reviewed dry-run. Do not repair
