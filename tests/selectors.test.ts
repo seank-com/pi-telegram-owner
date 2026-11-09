@@ -46,12 +46,12 @@ function fixture(records: SelectorRecord[] = []) {
 test("model picker uses authenticated catalog, marks active model, mutates once, and journals lifecycle", async () => {
 	const f = fixture(); await f.selectors.initialize();
 	await f.selectors.handle(command(1));
-	assert.match(f.sends[0].text, /Model: Model a/);
-	assert.equal(f.sends[0].keyboard.inline_keyboard[0][0].text, "✓ Model a");
+	assert.match(f.sends[0].text, /Model: fixture\/a/);
+	assert.equal(f.sends[0].keyboard.inline_keyboard[0][0].text, "✓ fixture/a");
 	const cb = callback(2, f.button(1));
 	await f.selectors.handle(cb); await f.selectors.handle(cb);
 	assert.equal(f.current.id, "b"); assert.equal(f.calls, 1); assert.equal(f.answers.length, 2);
-	assert.equal(f.edits[0].text, "Model: Model b\nThinking: medium");
+	assert.equal(f.edits[0].text, "Model: fixture/b\nThinking: medium");
 	assert.deepEqual(f.journal.records.filter(r => r.operationId.startsWith("callback:")).map(r => r.phase), ["received", "requested", "mutation_started", "outcome", "duplicate"]);
 	assert.ok(!JSON.stringify(f.journal.records).includes("private.invalid"));
 	assert.ok(!JSON.stringify(f.sends).includes("private.invalid"));
@@ -61,10 +61,20 @@ test("session scope intersects available catalog and empty scope falls back to c
 	const f = fixture(); f.setScope([{ model: f.models[1] }, { model: model("unauthenticated") }]);
 	await f.selectors.handle(command(1));
 	assert.equal(f.sends[0].keyboard.inline_keyboard.length, 1);
-	assert.equal(f.sends[0].keyboard.inline_keyboard[0][0].text, "Model b");
+	assert.equal(f.sends[0].keyboard.inline_keyboard[0][0].text, "fixture/b");
 	f.setScope([]); await f.selectors.handle(command(2)); assert.equal(f.sends[1].keyboard.inline_keyboard.length, 2);
 	f.setModels([]); await f.selectors.handle(command(3)); assert.deepEqual(f.sends[2].keyboard.inline_keyboard, []);
 	assert.match(f.sends[2].text, /No authenticated/);
+});
+
+test("provider-qualified identities distinguish matching display names and provider aliases", async () => {
+	const f = fixture();
+	f.setModels([{ ...model("a"), provider: "provider-one", name: "Shared" }, { ...model("a"), provider: "provider-two", name: "Shared" }, { ...model("b"), provider: "provider-two", name: "Shared" }]);
+	await f.selectors.handle(command(1));
+	assert.deepEqual(f.sends[0].keyboard.inline_keyboard.flat().map(button => button.text), ["provider-one/a", "provider-two/a", "provider-two/b"]);
+	await f.selectors.handle(callback(2, f.button(1)));
+	assert.equal(f.current.provider, "provider-two");
+	assert.match(f.edits[0].text, /Model: provider-two\/a/);
 });
 
 test("thinking uses active-model capability helper, reports host clamping, and handles non-reasoning models", async () => {
@@ -237,6 +247,50 @@ test("callback answer happens promptly before a blocked serialized model mutatio
 	const second = h.poll([callback(3, "bad")]);
 	assert.deepEqual(h.f.answers, ["callback-2", "callback-3"]);
 	release(); await Promise.all([first, second]); assert.equal(h.f.calls, 1);
+	await h.emit("session_shutdown", { reason: "exit" });
+});
+
+for (const splitBatches of [false, true]) {
+	test(`pending callback answer does not block /stop (${splitBatches ? "later poll" : "same poll"})`, { timeout: 5000 }, async t => {
+		const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
+		let release!: () => void;
+		const hold = new Promise<void>(resolve => { release = resolve; });
+		t.signal.addEventListener("abort", release, { once: true });
+		h.f.transport.answer = async () => { await hold; };
+		let aborts = 0; h.ctx.isIdle = () => false; h.ctx.abort = () => { aborts++; };
+		try {
+			const cb = callback(1, "unknown");
+			if (splitBatches) { await h.poll([cb]); await h.poll([command(2, "/stop")]); }
+			else await h.poll([cb, command(2, "/stop")]);
+			assert.equal(aborts, 1, "abort must run while the callback answer is still pending");
+			assert.equal(recover(h.journal.records).cursor, 2);
+		} finally { release(); await h.emit("session_shutdown", { reason: "exit" }); }
+	});
+}
+
+test("shutdown cancels and drains a callback answer before releasing its journal", { timeout: 5000 }, async () => {
+	const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
+	let aborted = false;
+	h.f.transport.answer = async (_id: string, _text?: string, signal?: AbortSignal) => {
+		assert.ok(signal);
+		await new Promise<void>((_resolve, reject) => {
+			signal.addEventListener("abort", () => { aborted = true; reject(new Error("synthetic cancellation")); }, { once: true });
+		});
+	};
+	await h.poll([callback(1, "unknown")]);
+	await h.emit("session_shutdown", { reason: "exit" });
+	assert.equal(aborted, true);
+	assert.ok(h.journal.records.some(r => r.type === "selector" && r.phase === "answer_failed"));
+});
+
+test("callback answer journal failure is observed without blocking ordinary command admission", async () => {
+	const h = extensionFixture(); await h.emit("session_start", { reason: "startup" });
+	const append = h.journal.append.bind(h.journal);
+	h.journal.append = async record => { if (record.type === "selector" && record.phase === "answer_failed") throw new Error("synthetic journal failure"); await append(record); };
+	h.f.transport.answer = async () => { throw new Error("synthetic answer failure"); };
+	let aborts = 0; h.ctx.isIdle = () => false; h.ctx.abort = () => { aborts++; };
+	await h.poll([callback(1, "unknown"), command(2, "/stop")]);
+	assert.equal(aborts, 1);
 	await h.emit("session_shutdown", { reason: "exit" });
 });
 

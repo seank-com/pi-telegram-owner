@@ -65,10 +65,11 @@ an uncertain message. The detailed delivery rules are in
 ### Local selector
 
 A `/model` or `/thinking` update opens a picker through `LocalSelectors`, not
-through Pi inference. The transport attempts a button callback answer before
-serialized batch processing. A successful acknowledgment clears Telegram's
-spinner; it does not create a model turn or confirm a mutation. The selector
-then checks ownership, button and session/catalog identity. A mutation also requires idle admission. It records
+through Pi inference. The transport starts a button callback answer at receipt
+without waiting for its network completion before admitting the batch. A
+successful acknowledgment clears Telegram's spinner; it does not create a model
+turn or confirm a mutation. The selector then checks ownership, button and
+session/catalog identity. A mutation also requires idle admission. It records
 the request and mutation start, rechecks admission after journal I/O, invokes the
 public Pi setter and records the confirmed result before editing the picker.
 Restart expires buttons and diagnoses unfinished operations instead of repeating
@@ -90,10 +91,12 @@ change the audience. See [Group chat](#group-chat) and
 Local model/thinking selectors use a separate `selector` v1 control-record
 stream in the same forward-only journal. The bridge records their updates as
 `local`, without job IDs, queue admission, receipt typing, session messages or
-archive projections. Callback answers are attempted before entering the
-serialized operation queue. Authorization checks both the sender and original
-private chat; a button is additionally bound to its sent message ID. Unknown
-buttons never authorize edits to arbitrary messages.
+archive projections. Callback answers start at receipt independently of serialized
+admission. An outstanding answer does not block `/stop` or subsequent polling.
+The extension tracks answer work and observes failures; session shutdown aborts
+and drains it before releasing journal/transport state. Authorization checks
+both the sender and original private chat; a button is additionally bound to its
+sent message ID. Unknown buttons never authorize edits to arbitrary messages.
 
 Each keyboard button has a random 128-bit opaque token (26 ASCII bytes including
 its prefix), mapped only in memory to an action, picker, expiry and catalog/session
@@ -103,7 +106,9 @@ session scope, current model/thinking level, session ID and local lifecycle epoc
 only hashes of routing metadata are compared, never displayed or journaled.
 Model choices always come from the available registry objects, not callback
 strings. Limits are six model rows per page, a navigation row, 32 retained
-pickers and a ten-minute TTL. Display text is bounded plain text.
+pickers and a ten-minute TTL. Display text is bounded plain text; model labels
+use public `provider/model-id` identities rather than potentially shared friendly
+names.
 
 For a model/thinking mutation, the durable ordering is receipt, requested
 selection, mutation start, terminal outcome, then message edit. Opening a picker

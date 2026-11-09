@@ -24,7 +24,7 @@ export interface SelectorRecord {
 export interface SelectorTransport {
 	send(text: string, keyboard: InlineKeyboard, replyTo: number): Promise<string>;
 	edit(messageId: string, text: string, keyboard: InlineKeyboard): Promise<void>;
-	answer(callbackId: string, text?: string): Promise<void>;
+	answer(callbackId: string, text?: string, signal?: AbortSignal): Promise<void>;
 }
 export interface SelectorJournal {
 	readonly records: readonly SelectorRecord[];
@@ -59,9 +59,10 @@ const TTL_MS = 10 * 60_000;
 const EMPTY_KEYBOARD: InlineKeyboard = { inline_keyboard: [] };
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const key = (model: Model) => JSON.stringify([model.provider, model.id]);
-// Names are display-only, bounded plain text; no endpoint, auth or provider diagnostics are used.
+// Public provider/model identities distinguish catalog aliases. Endpoints and
+// authentication diagnostics are never displayed.
 const display = (text: string) => Array.from(text.replace(/[\p{Cc}\p{Cf}]/gu, " ")).slice(0, 80).join("");
-const label = (model: Model | undefined) => model ? display(model.name || model.id) : "unavailable";
+const label = (model: Model | undefined) => model ? display(`${model.provider}/${model.id}`) : "unavailable";
 export function selectorCommand(update: TelegramUpdate, owner: number, chat: number): SelectorKind | undefined {
 	const message = update.message;
 	if (message?.chat.type !== "private" || message.chat.id !== chat || message.from?.id !== owner) return;
@@ -127,12 +128,12 @@ export class LocalSelectors {
 		}
 	}
 	/** Called at poll receipt, before the extension's serialized work queue. Failure never permits a mutation retry. */
-	async answer(callback: TelegramCallbackQuery): Promise<void> {
+	async answer(callback: TelegramCallbackQuery, signal?: AbortSignal): Promise<void> {
 		try {
 			const authorized = callback.from?.id === this.options.owner && callback.message?.chat?.type === "private" && callback.message.chat.id === this.options.chat;
 			const button = typeof callback.data === "string" && /^sel:[A-Za-z0-9_-]{22}$/.test(callback.data) ? this.buttons.get(callback.data) : undefined;
 			const valid = button && button.picker.messageId === String(callback.message?.message_id) && this.now() - button.picker.createdAt < TTL_MS;
-			await this.options.transport?.answer(callback.id, !authorized ? "Not authorized." : !valid ? "Selector already handled or expired. Open /model or /thinking again." : undefined);
+			await this.options.transport?.answer(callback.id, !authorized ? "Not authorized." : !valid ? "Selector already handled or expired. Open /model or /thinking again." : undefined, signal);
 		} catch { await this.record(`callback:${hash(String(callback.id))}`, { phase: "answer_failed" }); }
 	}
 	private expire(): void {
