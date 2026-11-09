@@ -1,6 +1,4 @@
 # pi-telegram-owner
-A simple extension for Pi that allows and agent to chat with it's owner over Telegram
-
 A standalone Pi extension for one verified Telegram owner in a private chat:
 transport, commands, protected canonical Markdown archive, photos and chronological
 `telegram_timeline`. Datastore and observability are optional integrations.
@@ -39,7 +37,9 @@ Ephemeral queued/thinking/tool status appears only in each agent's private owner
 chat, including for group work; actual group replies remain in the group.
 An unaddressed owner message is claimed by whichever agent is free. A local queue endpoint on `127.0.0.1` lets
 automation running under the same account queue owner-authority instructions.
-See [design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
+See [group design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
+For the implementation map and normal/control request paths, start with
+[Module map](docs/design.md#module-map) and [Main flows](docs/design.md#main-flows).
 
 The optional `datastore` object selects `mode: "auto"` (default), `"off"`, or
 `"required"`, and an exact `store` (default `"telegram"`). Auto enables recall
@@ -97,6 +97,5 @@ Public README/MIT history and extracted implementation attribution are preserved
 Only compiled code/declarations, generic docs, README, LICENSE and metadata ship.
 
 Archive/control schemas use `pi-telegram-owner/<kind>/v1`. The boundary requires
-an explicit session list and matching mode. This unpublished contract has no
-legacy aliases; reuse existing Telegram exports with fresh import controls and
-a separate output archive as described in [setup](docs/setup.md).
+an explicit session list and matching mode. See [setup](docs/setup.md) for source
+controls, dry-run review and publication.
