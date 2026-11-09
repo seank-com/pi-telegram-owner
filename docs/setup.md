@@ -256,14 +256,17 @@ be stopped.
 
 In the configured owner's private chat, type exactly `/model` or `/thinking`
 without arguments. `/model` shows the current model and six choices per page.
-Choices are the intersection of Pi's session scope and authenticated available
+Model labels use `provider/model-id` so matching friendly names from different
+providers or aliases remain distinguishable. Choices are the intersection of
+Pi's session scope and authenticated available
 catalog; an empty session scope uses the available catalog. `/thinking` offers
 only levels supported by the active model, including `off` for non-reasoning
 models. If the active model is unavailable in scope, no levels are selectable.
 Current choices have a check mark. A selection edits that message with the
 confirmed result, host-adjusted thinking level, or a safe failure explanation.
 The callback acknowledgment only clears Telegram's spinner; it does not confirm
-a model/thinking change. Use the edited result or `/status` to check the outcome.
+a model/thinking change. Its network completion does not hold up `/stop` or later
+updates. Use the edited result or `/status` to check the outcome.
 
 Mutations are admitted only while idle, without an active Telegram job, queued
 host messages, compaction or session transition. Busy selections are rejected,
