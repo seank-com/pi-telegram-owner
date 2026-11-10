@@ -56,6 +56,7 @@ function createHarness(
 	let idle = true;
 	let aborts = 0;
 	let compactOptions: any;
+	let compactCalls = 0;
 	const statuses: string[] = [];
 
 	const api = {
@@ -153,6 +154,7 @@ function createHarness(
 			aborts += 1;
 		},
 		compact: (options: any) => {
+			compactCalls += 1;
 			compactOptions = options;
 		},
 	};
@@ -169,6 +171,7 @@ function createHarness(
 		statuses,
 		get aborts() { return aborts; },
 		get compactOptions() { return compactOptions; },
+		get compactCalls() { return compactCalls; },
 		get activePollers() { return activePollers; },
 		get maxActivePollers() { return maxActivePollers; },
 		get stops() { return stops; },
@@ -469,6 +472,38 @@ test("shutdown aborts a held receipt send and does not start compaction afterwar
 	await pending;
 	await stopping;
 	assert.equal(harness.compactOptions, undefined);
+});
+
+test("a reused extension accepts compact and automatic compaction after shutdown", async () => {
+	const journal = new MemoryJournal();
+	const harness = createHarness(journal);
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(88, "/compact")]);
+	harness.compactOptions.onComplete({});
+	const callsBeforeReuse = harness.compactCalls;
+	await harness.emit("session_shutdown", { reason: "new" });
+	await harness.emit("session_start", { reason: "new" });
+	await harness.poll([update(89, "/compact")]);
+	assert.equal(harness.compactCalls, callsBeforeReuse + 1);
+	assert.ok(harness.activityEvents.filter((event) => event.startsWith("send:Received /compact")).length >= 2);
+	harness.compactOptions.onComplete({});
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: false });
+	assert.ok(harness.activityEvents.some((event) => event === "send:Compacting" || event === "edit:Compacting"));
+	await harness.emit("session_compact", { reason: "threshold", willRetry: false });
+});
+
+test("a preceding generation's receipt does not block the next session", async () => {
+	const journal = new MemoryJournal();
+	const harness = createHarness(journal);
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(90, "/compact")]);
+	assert.equal(journal.records.filter((record) => record.type === "activity_started").length, 1);
+	await harness.emit("session_shutdown", { reason: "reload" });
+	await harness.emit("session_start", { reason: "reload" });
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")), "preceding receipt is cleaned from the journal");
+	await harness.poll([update(91, "/compact")]);
+	assert.equal(harness.compactCalls, 2);
+	assert.ok(harness.activityEvents.filter((event) => event.startsWith("send:Received /compact")).length >= 2);
 });
 
 test("a failed compaction retitle is retried while the receipt is still the visible text", async () => {

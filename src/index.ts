@@ -1019,10 +1019,15 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			currentContext = ctx;
 			hostCompacting = false;
 			hostTransition = false;
+			compacting = false;
+			switching = false;
 			selectors?.invalidate();
 			integration.start();
 			updateRecall();
 			generation += 1;
+			phaseController.abort(new Error("Telegram owner session replaced"));
+			phaseController = new AbortController();
+			phaseNotice = undefined;
 			await stopReceiptTyping();
 			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
 			projectionRefreshTimer = undefined;
@@ -1101,6 +1106,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					"Previous request was interrupted by Pi restart; please resend.",
 				);
 				await recoverUncertainCommands(event.reason, ctx);
+				await cleanupFinishedActivities();
 				stopSource = await runtimeDependencies.source.start(async (updates) => {
 					if (generation !== ownGeneration || !bridge) return bridge?.cursor;
 					// Start answers immediately, but never gate update admission or /stop
