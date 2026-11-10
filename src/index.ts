@@ -1129,6 +1129,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						await bridge.rearmQuietDeadline(state.touchedBatchIds);
 						await dispatchIfIdle(ctx);
 						await postQueuedNotices();
+						await bridge.rearmQuietDeadline(state.touchedBatchIds);
 						scheduleQuietDispatch(ctx);
 						return state.cursor;
 					});

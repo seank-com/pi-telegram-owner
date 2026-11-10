@@ -47,8 +47,9 @@ for the others.
 2. Local selectors and ordinary commands take their control paths. Accepted
    conversation input joins the owner's queue; text fragments are collected
    through the configured quiet window. A batch created or extended by a poll
-   receives that full window after the poll's awaited media, reply, and command
-   work, before the callback seals, dispatches, or returns for the next poll.
+   receives that full window after the poll's awaited media, reply, command, and
+   queued-notice work, before the callback returns for the next poll. It is also
+   established before seal or dispatch, so admission time cannot close it.
    Empty polls and polls that do not create or extend the batch do not move an
    existing deadline. Once that deadline has passed, the batch is durably sealed
    even while Pi is busy; dispatch still waits for idle. Restart uses the latest
@@ -256,7 +257,7 @@ observability contract.
 
 | Restriction | Why (what failure does it prevent) |
 | --- | --- |
-| Private text quiet window: default 4,000ms, configurable integer 100 through 5,000ms (`inboundQuietWindowMs`). A batch created or extended by a poll receives that full configured window after awaited post-ingest maintenance and before seal, dispatch, or return. Empty and unrelated polls do not move it. Owner approval: issue #13, Sean authorized this origin move on 2026-11-10. The configured maximum is unchanged. | Stops this poll's own maintenance from consuming the collection window and splitting same-date fragments that were already available. It does not enlarge the window, overlap polls, or reopen a sealed batch. |
+| Private text quiet window: default 4,000ms, configurable integer 100 through 5,000ms (`inboundQuietWindowMs`). A batch created or extended by a poll receives that full configured window after awaited media, reply, command, and queued-notice work, before return, and before seal or dispatch. Empty and unrelated polls do not move it. Owner approval: issue #13, Sean authorized this origin move on 2026-11-10. The configured maximum is unchanged. | Stops this poll's own maintenance from consuming the collection window and splitting same-date fragments that were already available. It does not enlarge the window, overlap polls, or reopen a sealed batch. |
 | tests/core.test.ts quiet-timer fixture: 600,000ms outer test timeout across its busy-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
 
 ## Package boundary

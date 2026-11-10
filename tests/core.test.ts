@@ -1007,6 +1007,35 @@ test("6340ms of awaited poll maintenance does not split an already available sam
 	assert.equal(Date.parse(latest[0]?.readyAt ?? ""), base + 6_340 + 4_000);
 });
 
+test("a queued-notice send does not consume the quiet window before the next poll", async (t) => {
+	const base = 1_700_000_000_000;
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: base });
+	const journal = new MemoryJournal([updateRecord("waiting", 1)]);
+	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
+	let activitySends = 0;
+	type Handler = (event: any, ctx: ExtensionContext) => unknown;
+	const handlers = new Map<string, Handler[]>();
+	const pi = { on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerCommand() {}, registerTool() {}, sendUserMessage() {} } as unknown as ExtensionAPI;
+	createTelegramOwnerExtension({ dependencies: {
+		journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: 4_000,
+		source: { async start(handler) { onBatch = handler; return async () => undefined; } },
+		async sendReply() { return "1"; },
+		async sendActivity() {
+			activitySends += 1;
+			if (activitySends === 1) throw new Error("startup notice down");
+			t.mock.timers.tick(5_000);
+			return "notice-1";
+		},
+	} })(pi);
+	const ctx = { isIdle: () => false, sessionManager: { getSessionId: () => "session-notice" }, ui: { setStatus: () => undefined, notify: () => undefined } } as unknown as ExtensionContext;
+	t.after(async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown", reason: "test" }, ctx); });
+	for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+	await onBatch?.([textUpdate(2, "fragment", OWNER, CHAT, 100)]);
+	const latest = journal.records.filter((record) => record.type === "inbound_batch").at(-1);
+	assert.equal(latest?.state, "open");
+	assert.equal(Date.parse(latest && "readyAt" in latest ? latest.readyAt : ""), base + 5_000 + 4_000);
+});
+
 test("quiet scheduling ignores historical open revisions after a batch is sealed", async () => {
 	const open: Extract<JournalRecord, { type: "inbound_batch" }> = { type: "inbound_batch", schemaVersion: 1, batchId: "00000000-0000-4000-8000-000000000001", revision: 1, state: "open", openedAt: "2026-01-01T00:00:00.000Z", readyAt: "2026-01-01T00:00:00.500Z", memberJobIds: ["member-1"], messageIds: [10], segmentSha256: ["a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e"], boundaries: [{ start: 0, end: 5 }], text: "first", finalMessageId: 10 };
 	const bridge = new TelegramOwnerBridge(new MemoryJournal([open, { ...open, revision: 2, state: "sealed" }]), OWNER, CHAT, { now: () => Date.parse("2026-01-01T00:00:01.000Z") });
