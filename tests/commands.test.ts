@@ -47,6 +47,8 @@ function createHarness(
 	let activitySends = 0;
 	let failActivity = false;
 	let failEdits = 0;
+	let failDeletes = 0;
+	let holdSend: ((text: string, signal: AbortSignal) => Promise<string>) | undefined;
 	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
 	let activePollers = 0;
 	let maxActivePollers = 0;
@@ -93,7 +95,8 @@ function createHarness(
 			replies.push({ text, replyTo });
 			return String(replies.length);
 		},
-		async sendActivity(text: string) {
+		async sendActivity(text: string, signal: AbortSignal = new AbortController().signal) {
+			if (holdSend) return holdSend(text, signal);
 			if (failActivity) throw new Error("activity transport down");
 			activitySends += 1;
 			activityEvents.push(`send:${text}`);
@@ -107,6 +110,11 @@ function createHarness(
 			activityEvents.push(`edit:${text}`);
 		},
 		async deleteActivity(id: string) {
+			if (failDeletes > 0) {
+				failDeletes -= 1;
+				activityEvents.push(`delete-failed:${id}`);
+				throw new Error("activity delete down");
+			}
 			activityEvents.push(`delete:${id}`);
 		},
 		async resolveImages(images: Array<{ mimeType: string }>, attachments: Array<{ sha256: string; mimeType: string }>) {
@@ -167,6 +175,8 @@ function createHarness(
 		setIdle(value: boolean) { idle = value; },
 		failNextActivity() { failActivity = true; },
 		failNextEdits(count: number) { failEdits = count; },
+		failNextDeletes(count: number) { failDeletes = count; },
+		holdNextSend(wait: (text: string, signal: AbortSignal) => Promise<string>) { holdSend = wait; },
 		async emit(name: string, event: any, context = ctx) {
 			let result: any;
 			for (const handler of handlers.get(name) ?? []) result = await handler(event, context);
@@ -418,6 +428,47 @@ test("session_before_compact shows Compacting before agent start and edits an ex
 	assert.deepEqual(automatic.activityEvents, ["send:Compacting"]);
 	await automatic.emit("session_compact", { reason: "threshold", willRetry: false });
 	assert.equal(automatic.activityEvents.at(-1), "delete:activity-1");
+});
+
+test("a failed phase delete remains recoverable through the activity journal", async () => {
+	const journal = new MemoryJournal();
+	const first = createHarness(journal);
+	await first.emit("session_start", { reason: "startup" });
+	await first.poll([update(86, "/compact")]);
+	first.failNextDeletes(5);
+	first.compactOptions.onComplete({});
+	await new Promise((resolve) => setImmediate(resolve));
+	await first.emit("session_shutdown", { reason: "test" });
+	assert.equal(journal.records.filter((record) => record.type === "activity_started").length, 1);
+	assert.equal(journal.records.some((record) => record.type === "activity_cleared"), false);
+	assert.ok(first.activityEvents.some((event) => event.startsWith("delete-failed:")));
+	const second = createHarness(journal);
+	await second.emit("session_start", { reason: "startup" });
+	assert.equal(second.activityEvents.some((event) => event.startsWith("delete:")), true);
+	assert.equal(journal.records.some((record) => record.type === "activity_cleared"), true);
+});
+
+test("shutdown aborts a held receipt send and does not start compaction afterward", async () => {
+	const harness = createHarness();
+	let release: ((id: string) => void) | undefined;
+	let signal: AbortSignal | undefined;
+	const held = new Promise<string>((resolve) => { release = resolve; });
+	harness.holdNextSend((_text, next) => {
+		signal = next;
+		next.addEventListener("abort", () => release?.("aborted"), { once: true });
+		return held;
+	});
+	await harness.emit("session_start", { reason: "startup" });
+	const pending = harness.poll([update(87, "/compact")]);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(signal);
+	const stopping = harness.emit("session_shutdown", { reason: "test" });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(signal!.aborted, true);
+	release?.("late");
+	await pending;
+	await stopping;
+	assert.equal(harness.compactOptions, undefined);
 });
 
 test("a failed compaction retitle is retried while the receipt is still the visible text", async () => {

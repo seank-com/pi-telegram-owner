@@ -1149,6 +1149,12 @@ export class TelegramOwnerBridge {
 		await this.append({ type: "activity_cleared", jobId, messageId, ...(destination?{destination}:{}) });
 	}
 
+	/** Marks a phase notice finished so existing activity cleanup can delete and recover it. */
+	async appendPhaseRelease(jobId: string): Promise<void> {
+		if (this.records.some((record) => (record.type === "reply_sent" || record.type === "interrupted" || record.type === "turn_finished") && record.jobId === jobId)) return;
+		await this.append({ type: "interrupted", jobId, reason: "Ephemeral phase notice finished" });
+	}
+
 	private openActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
 		const open = new Map<string, { jobId: string; messageId: string; destination: 'private' | 'group' }>();
 		for (const record of this.records) {

@@ -1,5 +1,6 @@
 import { LocalSelectors, type SelectorTransport } from "./selectors.ts";
 import { saveProjectPreferences } from "./preferences.ts";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -197,7 +198,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			compact: "Received /compact. Working on it. This is not proof compaction has started.",
 			new: "Received /new. Working on it. This is not proof a new session has started.",
 		} as const;
-		let phaseNotice: { id?: string; commandOwned: boolean; text: string } | undefined;
+		let phaseController = new AbortController();
+		let phaseNotice: { id?: string; jobId: string; commandOwned: boolean; text: string } | undefined;
+		const stopPhaseSends = (): void => {
+			phaseController.abort(new Error("Telegram owner bridge stopped"));
+		};
 		let agentLabel = GENERIC_AGENT_LABEL;
 		let disabledReason = "configuration absent";
 
@@ -506,43 +511,45 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			].join("\n");
 		};
 
-		const showPhase = async (text: string, commandOwned: boolean): Promise<void> => {
+		const showPhase = async (jobId: string, text: string, commandOwned: boolean): Promise<void> => {
 			const send = runtimeDependencies?.sendActivity;
-			if (!send) return;
+			const signal = phaseController.signal;
+			if (!send || !bridge || signal.aborted) return;
 			try {
-				const id = await send(text, new AbortController().signal);
-				phaseNotice = { id, commandOwned, text };
+				const id = await send(text, signal);
+				await bridge.recordActivityStarted(jobId, id, "private");
+				phaseNotice = { id, jobId, commandOwned, text };
 			} catch (error) {
+				if (signal.aborted) return;
 				lastActivityError = `phase: ${sanitizeError(error)}`;
 				updateStatus();
 			}
 		};
 		const retitlePhase = async (text: string): Promise<void> => {
 			if (!phaseNotice) {
-				await showPhase(text, false);
+				await showPhase(randomUUID(), text, false);
 				return;
 			}
 			if (phaseNotice.text === text) return;
-			if (!phaseNotice.id || !runtimeDependencies?.editActivity) return;
+			if (!phaseNotice.id || !runtimeDependencies?.editActivity || phaseController.signal.aborted) return;
 			try {
-				await runtimeDependencies.editActivity(phaseNotice.id, text, new AbortController().signal);
+				await runtimeDependencies.editActivity(phaseNotice.id, text, phaseController.signal);
 				phaseNotice.text = text;
 			} catch (error) {
+				if (phaseController.signal.aborted) return;
 				lastActivityError = `phase: ${sanitizeError(error)}`;
 				updateStatus();
 			}
 		};
 		const clearPhase = async (): Promise<void> => {
-			const current = phaseNotice;
-			phaseNotice = undefined;
-			if (!current?.id || !runtimeDependencies?.deleteActivity) return;
-			try {
-				await runtimeDependencies.deleteActivity(current.id, new AbortController().signal);
-			} catch (error) {
-				lastActivityError = `phase: ${sanitizeError(error)}`;
-				updateStatus();
+			if (!phaseNotice || !bridge) return;
+			if (!phaseNotice.commandOwned) {
+				await bridge.appendPhaseRelease(phaseNotice.jobId);
 			}
+			await cleanupFinishedActivities();
+			if (!bridge.openActivity(phaseNotice.jobId, "private")) phaseNotice = undefined;
 		};
+		const phaseStillOwned = (owned: number): boolean => owned === generation && connection.phase !== "stopping" && !phaseController.signal.aborted;
 
 		const completeCommand = async (job: Job, text: string): Promise<void> => {
 			if (!bridge) return;
@@ -603,7 +610,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					compacting = true;
 					updateStatus();
-					await showPhase(commandReceipt.compact, true);
+					const owned = generation;
+					await showPhase(job.jobId, commandReceipt.compact, true);
+					if (!phaseStillOwned(owned)) {
+						compacting = false;
+						return "continue";
+					}
 					try {
 						ctx.compact({
 							onComplete: () => {
@@ -639,7 +651,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					switching = true;
 					updateStatus();
-					await showPhase(commandReceipt.new, true);
+					const owned = generation;
+					await showPhase(job.jobId, commandReceipt.new, true);
+					if (!phaseStillOwned(owned)) {
+						switching = false;
+						return "continue";
+					}
 					try {
 						await Promise.resolve(
 							pi.sendUserMessage(`/telegram-status __new-session__:${job.jobId}`, { expandPromptTemplates: true }),
@@ -1225,16 +1242,18 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			hostCompacting = true;
 			// Public start boundary, before summary completion and before_agent_start.
 			if (phaseNotice) await retitlePhase(COMPACTING_TEXT);
-			else await showPhase(COMPACTING_TEXT, false);
+			else await showPhase(randomUUID(), COMPACTING_TEXT, false);
 		});
-		const endHostCompaction = (): void => {
+		const endHostCompaction = async (): Promise<void> => {
 			hostCompacting = false;
-			if (phaseNotice && !phaseNotice.commandOwned) void clearPhase();
+			if (phaseNotice && !phaseNotice.commandOwned) await clearPhase();
 		};
 		pi.on("session_compact", endHostCompaction);
 		pi.on("session_compact_failed", endHostCompaction);
 
 		pi.on("session_shutdown", async (event, ctx) => {
+			stopPhaseSends();
+			connection = { phase: "stopping" };
 			integration.stop();
 			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter(name => name !== "telegram_recall"));
 			generation += 1;
