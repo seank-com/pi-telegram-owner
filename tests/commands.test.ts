@@ -43,6 +43,9 @@ function createHarness(
 	const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
 	const replies: Array<{ text: string; replyTo?: number }> = [];
 	const sentMessages: Array<{ content: any; options: any }> = [];
+	const activityEvents: string[] = [];
+	let activitySends = 0;
+	let failActivity = false;
 	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
 	let activePollers = 0;
 	let maxActivePollers = 0;
@@ -88,6 +91,18 @@ function createHarness(
 		async sendReply(text: string, replyTo?: number) {
 			replies.push({ text, replyTo });
 			return String(replies.length);
+		},
+		async sendActivity(text: string) {
+			if (failActivity) throw new Error("activity transport down");
+			activitySends += 1;
+			activityEvents.push(`send:${text}`);
+			return `activity-${activitySends}`;
+		},
+		async editActivity(_id: string, text: string) {
+			activityEvents.push(`edit:${text}`);
+		},
+		async deleteActivity(id: string) {
+			activityEvents.push(`delete:${id}`);
 		},
 		async resolveImages(images: Array<{ mimeType: string }>, attachments: Array<{ sha256: string; mimeType: string }>) {
 			if (attachments.length > 0) return attachments.map((attachment) => ({ data: "aW1hZ2U=", mimeType: attachment.mimeType, attachment }));
@@ -136,6 +151,7 @@ function createHarness(
 		commands,
 		replies,
 		sentMessages,
+		activityEvents,
 		ctx,
 		statuses,
 		get aborts() { return aborts; },
@@ -144,6 +160,7 @@ function createHarness(
 		get maxActivePollers() { return maxActivePollers; },
 		get stops() { return stops; },
 		setIdle(value: boolean) { idle = value; },
+		failNextActivity() { failActivity = true; },
 		async emit(name: string, event: any, context = ctx) {
 			let result: any;
 			for (const handler of handlers.get(name) ?? []) result = await handler(event, context);
@@ -333,6 +350,80 @@ test("compact is idle-only, coalesces overlap, and completes through its callbac
 		"Compaction complete.\nContext: 25% of 100k",
 	]);
 	assert.equal(harness.sentMessages.length, 1);
+});
+
+test("accepted /compact and /new emit working activity before the held host call, and a refusal does not", async () => {
+	const order: string[] = [];
+	const compacting = createHarness();
+	const recordCompact = compacting.ctx.compact;
+	compacting.ctx.compact = (options: any) => {
+		order.push(...compacting.activityEvents, "compact");
+		recordCompact(options);
+	};
+	await compacting.emit("session_start", { reason: "startup" });
+	await compacting.poll([update(70, "/compact")]);
+	assert.deepEqual(order, [
+		"send:Received /compact. Working on it. This is not proof compaction has started.",
+		"compact",
+	]);
+	assert.ok(compacting.compactOptions);
+	compacting.setIdle(false);
+	const beforeRefusal = compacting.activityEvents.length;
+	await compacting.poll([update(71, "/compact")]);
+	assert.equal(compacting.activityEvents.length, beforeRefusal);
+	assert.equal(compacting.replies.at(-1)?.text, "The agent is busy; /compact was not started.");
+
+	const replacing = createHarness();
+	let releaseNew: ((value: { cancelled: boolean }) => void) | undefined;
+	const started = new Promise<{ cancelled: boolean }>((resolve) => { releaseNew = resolve; });
+	await replacing.emit("session_start", { reason: "startup" });
+	await replacing.poll([update(72, "/new")]);
+	assert.equal(replacing.activityEvents[0], "send:Received /new. Working on it. This is not proof a new session has started.");
+	const jobId = String(replacing.sentMessages[0].content).split(":")[1];
+	const pending = replacing.commands.get("telegram-status")?.(`__new-session__:${jobId}`, {
+		...replacing.ctx,
+		newSession: () => {
+			assert.ok(replacing.activityEvents.some((event) => event.startsWith("send:Received /new")));
+			return started;
+		},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(replacing.replies.length, 0, "receipt is not the durable new-session result");
+	releaseNew?.({ cancelled: false });
+	await pending;
+});
+
+test("session_before_compact shows Compacting before agent start and edits an existing command receipt once", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(80, "/compact")]);
+	assert.equal(harness.activityEvents.length, 1);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.deepEqual(harness.activityEvents, [
+		"send:Received /compact. Working on it. This is not proof compaction has started.",
+		"edit:Compacting",
+	]);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.length, 2, "a repeated start does not send a second indicator");
+
+	const automatic = createHarness();
+	await automatic.emit("session_start", { reason: "startup" });
+	await automatic.emit("session_before_compact", { reason: "threshold", willRetry: false });
+	assert.deepEqual(automatic.activityEvents, ["send:Compacting"]);
+	await automatic.emit("session_compact", { reason: "threshold", willRetry: false });
+	assert.equal(automatic.activityEvents.at(-1), "delete:activity-1");
+});
+
+test("a failed activity send does not suppress compaction or its durable result", async () => {
+	const harness = createHarness();
+	harness.failNextActivity();
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(90, "/compact")]);
+	assert.equal(harness.activityEvents.length, 0);
+	assert.ok(harness.compactOptions);
+	harness.compactOptions.onError(new Error("provider unavailable"));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(harness.replies.at(-1)?.text ?? "", /Compaction failed/);
 });
 
 test("compact rejects an active run and reports provider failure without replay", async () => {

@@ -192,6 +192,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		let lastGroupError: string | undefined;
 		let compacting = false;
 		let switching = false;
+		const COMPACTING_TEXT = "Compacting";
+		const commandReceipt = {
+			compact: "Received /compact. Working on it. This is not proof compaction has started.",
+			new: "Received /new. Working on it. This is not proof a new session has started.",
+		} as const;
+		let phaseNotice: { id?: string; commandOwned: boolean; text: string } | undefined;
 		let agentLabel = GENERIC_AGENT_LABEL;
 		let disabledReason = "configuration absent";
 
@@ -500,6 +506,44 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			].join("\n");
 		};
 
+		const showPhase = async (text: string, commandOwned: boolean): Promise<void> => {
+			const send = runtimeDependencies?.sendActivity;
+			if (!send) return;
+			try {
+				const id = await send(text, new AbortController().signal);
+				phaseNotice = { id, commandOwned, text };
+			} catch (error) {
+				lastActivityError = `phase: ${sanitizeError(error)}`;
+				updateStatus();
+			}
+		};
+		const retitlePhase = async (text: string): Promise<void> => {
+			if (!phaseNotice) {
+				await showPhase(text, false);
+				return;
+			}
+			if (phaseNotice.text === text) return;
+			phaseNotice.text = text;
+			if (!phaseNotice.id || !runtimeDependencies?.editActivity) return;
+			try {
+				await runtimeDependencies.editActivity(phaseNotice.id, text, new AbortController().signal);
+			} catch (error) {
+				lastActivityError = `phase: ${sanitizeError(error)}`;
+				updateStatus();
+			}
+		};
+		const clearPhase = async (): Promise<void> => {
+			const current = phaseNotice;
+			phaseNotice = undefined;
+			if (!current?.id || !runtimeDependencies?.deleteActivity) return;
+			try {
+				await runtimeDependencies.deleteActivity(current.id, new AbortController().signal);
+			} catch (error) {
+				lastActivityError = `phase: ${sanitizeError(error)}`;
+				updateStatus();
+			}
+		};
+
 		const completeCommand = async (job: Job, text: string): Promise<void> => {
 			if (!bridge) return;
 			await bridge.completeCommand(job, text);
@@ -559,24 +603,33 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					compacting = true;
 					updateStatus();
-					ctx.compact({
-						onComplete: () => {
-							void serialized(async () => {
-								compacting = false;
-								await completeCommand(job, `Compaction complete.\n${contextText(ctx)}`);
-								await processPendingCommands(ctx);
-								await dispatchIfIdle(ctx);
-							});
-						},
-						onError: (error) => {
-							void serialized(async () => {
-								compacting = false;
-								await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
-								await processPendingCommands(ctx);
-								await dispatchIfIdle(ctx);
-							});
-						},
-					});
+					await showPhase(commandReceipt.compact, true);
+					try {
+						ctx.compact({
+							onComplete: () => {
+								void serialized(async () => {
+									compacting = false;
+									await completeCommand(job, `Compaction complete.\n${contextText(ctx)}`);
+									await clearPhase();
+									await processPendingCommands(ctx);
+									await dispatchIfIdle(ctx);
+								});
+							},
+							onError: (error) => {
+								void serialized(async () => {
+									compacting = false;
+									await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
+									await clearPhase();
+									await processPendingCommands(ctx);
+									await dispatchIfIdle(ctx);
+								});
+							},
+						});
+					} catch (error) {
+						compacting = false;
+						await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
+						await clearPhase();
+					}
 					return "continue";
 				}
 				case "new":
@@ -586,6 +639,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					switching = true;
 					updateStatus();
+					await showPhase(commandReceipt.new, true);
 					try {
 						await Promise.resolve(
 							pi.sendUserMessage(`/telegram-status __new-session__:${job.jobId}`, { expandPromptTemplates: true }),
@@ -594,6 +648,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					} catch (error) {
 						switching = false;
 						await bridge.interruptCommand(job, "Session replacement command dispatch failed", `/new failed: ${sanitizeError(error)}`);
+						await clearPhase();
 						await retryPendingReplies();
 						return "continue";
 					}
@@ -924,6 +979,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						await serialized(async () => {
 							switching = false;
 							await bridge?.interruptCommand(job, "Session replacement was cancelled", "/new was cancelled; the current session is unchanged.");
+							await clearPhase();
 							await retryPendingReplies();
 							await processPendingCommands(ctx);
 							await dispatchIfIdle(ctx);
@@ -933,6 +989,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					await serialized(async () => {
 						switching = false;
 						await bridge?.interruptCommand(job, "Session replacement failed", `/new failed: ${sanitizeError(error)}`);
+						await clearPhase();
 						await retryPendingReplies();
 						await processPendingCommands(ctx);
 						await dispatchIfIdle(ctx);
@@ -1160,15 +1217,22 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		pi.on("session_before_fork", beforeTransition);
 		pi.on("session_before_tree", beforeTransition);
 		pi.on("session_tree", () => { hostTransition = false; selectors?.invalidate(); });
-		pi.on("session_before_compact", () => {
+		pi.on("session_before_compact", async () => {
 			// This hook is too late to prevent Pi manual compaction's earlier turn abort.
 			// Cancelling only an in-flight selector mutation is safe and helps that case.
 			// Other queued work may remain blocked by this extension's busy admission gate.
 			if (selectors?.mutating) return { cancel: true };
 			hostCompacting = true;
+			// Public start boundary, before summary completion and before_agent_start.
+			if (phaseNotice) await retitlePhase(COMPACTING_TEXT);
+			else await showPhase(COMPACTING_TEXT, false);
 		});
-		pi.on("session_compact", () => { hostCompacting = false; });
-		pi.on("session_compact_failed", () => { hostCompacting = false; });
+		const endHostCompaction = (): void => {
+			hostCompacting = false;
+			if (phaseNotice && !phaseNotice.commandOwned) void clearPhase();
+		};
+		pi.on("session_compact", endHostCompaction);
+		pi.on("session_compact_failed", endHostCompaction);
 
 		pi.on("session_shutdown", async (event, ctx) => {
 			integration.stop();
@@ -1200,6 +1264,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			await operationTail;
 			await stopTyping();
 			await haltActivity();
+			await clearPhase();
 			await stopGroup();
 			if (bridge) {
 				await bridge.shutdown(event.reason);
