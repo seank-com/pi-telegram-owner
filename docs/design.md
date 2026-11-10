@@ -46,7 +46,10 @@ for the others.
    authenticates/classifies updates and records them before the cursor advances.
 2. Local selectors and ordinary commands take their control paths. Accepted
    conversation input joins the owner's queue; text fragments are collected
-   through the configured quiet window. Photos are captured before dispatch.
+   through the configured quiet window. Expired batches are durably sealed even
+   while Pi is busy, including when journal admission outlasts the quiet window
+   before the timer is armed; dispatch still waits for idle. Photos are captured
+   before dispatch.
 3. When Pi and delivery state permit, `dispatchNext()` records the work and sends
    its envelope/input to the existing Pi session. Lifecycle hooks start private
    activity, update it from tool intents and capture the model's outcome.
@@ -242,6 +245,14 @@ quotes, Markdown and redaction markers are ordinary text. Missing or malformed
 audit evidence falls back to the established bounded tool name, never raw tool
 arguments. Persisted identifiers/types are checked against the versioned
 observability contract.
+
+## Restrictions register
+
+### Quiet-timer regression qualification
+
+| Restriction | Why (what failure does it prevent) |
+| --- | --- |
+| tests/core.test.ts quiet-timer fixture: 600,000ms outer test timeout across its admission-before/after-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
 
 ## Package boundary
 

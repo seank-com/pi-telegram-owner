@@ -416,7 +416,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			if (quietTimer) clearTimeout(quietTimer);
 			quietTimer = undefined;
 			const delay = bridge?.nextBatchReadyDelayMs;
-			if (delay === undefined || (delay === 0 && !ctx.isIdle())) return;
+			if (delay === undefined) return;
 			quietTimer = setTimeout(() => { quietTimer = undefined; void serialized(async () => { await bridge?.sealReadyBatches(); await dispatchIfIdle(ctx); await postQueuedNotices(); scheduleQuietDispatch(ctx); }); }, delay);
 			quietTimer.unref?.();
 		};
