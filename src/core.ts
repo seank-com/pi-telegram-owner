@@ -958,7 +958,7 @@ export class TelegramOwnerBridge {
 		return [...this.records].reverse().find((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.jobId === jobId);
 	}
 
-	private async addTextToBatch(job: Job): Promise<void> {
+	private async addTextToBatch(job: Job): Promise<string> {
 		const now = this.now();
 		let open = this.latestOpenBatch();
 		if (open) {
@@ -974,15 +974,32 @@ export class TelegramOwnerBridge {
 		}
 		const readyAt = new Date(now + this.inboundQuietWindowMs).toISOString();
 		if (!open) {
-			await this.append({ type: "inbound_batch", schemaVersion: 1, batchId: randomUUID(), revision: 1, state: "open", openedAt: new Date(now).toISOString(), readyAt, memberJobIds: [job.jobId], messageIds: [job.messageId], segmentSha256: [sha256(job.text)], boundaries: [{ start: 0, end: job.text.length }], text: job.text, finalMessageId: job.messageId });
-			return;
+			const batchId = randomUUID();
+			await this.append({ type: "inbound_batch", schemaVersion: 1, batchId, revision: 1, state: "open", openedAt: new Date(now).toISOString(), readyAt, memberJobIds: [job.jobId], messageIds: [job.messageId], segmentSha256: [sha256(job.text)], boundaries: [{ start: 0, end: job.text.length }], text: job.text, finalMessageId: job.messageId });
+			return batchId;
 		}
 		const start = open.text.length + 2;
 		await this.append({ ...open, revision: open.revision + 1, readyAt, memberJobIds: [...open.memberJobIds, job.jobId], messageIds: [...open.messageIds, job.messageId], segmentSha256: [...open.segmentSha256, sha256(job.text)], boundaries: [...open.boundaries, { start, end: start + job.text.length }], text: `${open.text}\n\n${job.text}`, finalMessageId: job.messageId });
+		return open.batchId;
 	}
 
-	async ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number }> {
+	/** Moves the full quiet-window origin to now for batches this poll created or extended. Sealed history is left closed. */
+	async rearmQuietDeadline(batchIds: readonly string[]): Promise<void> {
+		if (this.inboundQuietWindowMs <= 0 || batchIds.length === 0) return;
+		const readyAt = new Date(this.now() + this.inboundQuietWindowMs).toISOString();
+		const seen = new Set<string>();
+		for (const batchId of batchIds) {
+			if (seen.has(batchId)) continue;
+			seen.add(batchId);
+			const latest = this.latestBatch(batchId);
+			if (!latest || latest.state !== "open" || latest.readyAt === readyAt) continue;
+			await this.append({ ...latest, revision: latest.revision + 1, readyAt });
+		}
+	}
+
+	async ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number; touchedBatchIds: string[] }> {
 		const seen = new Set(this.records.filter((r) => r.type === "update").map((r) => r.updateId));
+		const touchedBatchIds: string[] = [];
 		let acceptedModelInputCount = 0;
 		for (const update of updates) {
 			if (seen.has(update.update_id)) {
@@ -1025,12 +1042,12 @@ export class TelegramOwnerBridge {
 			if (accepted) {
 				const job: Job = { jobId: jobId!, updateId: update.update_id, messageId: message!.message_id, text, telegramDate: message!.date, images: image ? [image] : [], command };
 				if (!command) acceptedModelInputCount += 1;
-				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) await this.addTextToBatch(job);
+				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) touchedBatchIds.push(await this.addTextToBatch(job));
 				else await this.sealOpenBatch();
 			}
 			seen.add(update.update_id);
 		}
-		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount };
+		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount, touchedBatchIds };
 	}
 
 	private classifyGroup(update: TelegramUpdate): GroupUpdatePayload | undefined {

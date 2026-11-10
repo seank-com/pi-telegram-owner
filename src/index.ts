@@ -1126,6 +1126,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						await capturePendingInboundMedia();
 						await retryPendingReplies();
 						await processPendingCommands(ctx);
+						await bridge.rearmQuietDeadline(state.touchedBatchIds);
 						await dispatchIfIdle(ctx);
 						await postQueuedNotices();
 						scheduleQuietDispatch(ctx);

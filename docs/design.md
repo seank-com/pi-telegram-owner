@@ -46,10 +46,14 @@ for the others.
    authenticates/classifies updates and records them before the cursor advances.
 2. Local selectors and ordinary commands take their control paths. Accepted
    conversation input joins the owner's queue; text fragments are collected
-   through the configured quiet window. Expired batches are durably sealed even
-   while Pi is busy, including when journal admission outlasts the quiet window
-   before the timer is armed; dispatch still waits for idle. Photos are captured
-   before dispatch.
+   through the configured quiet window. A batch created or extended by a poll
+   receives that full window after the poll's awaited media, reply, and command
+   work, before the callback seals, dispatches, or returns for the next poll.
+   Empty polls and polls that do not create or extend the batch do not move an
+   existing deadline. Once that deadline has passed, the batch is durably sealed
+   even while Pi is busy; dispatch still waits for idle. Restart uses the latest
+   durable deadline. A crash before the post-maintenance revision leaves the
+   admission-time deadline. Photos are captured before dispatch.
 3. When Pi and delivery state permit, `dispatchNext()` records the work and sends
    its envelope/input to the existing Pi session. Lifecycle hooks start private
    activity, update it from tool intents and capture the model's outcome.
@@ -252,7 +256,8 @@ observability contract.
 
 | Restriction | Why (what failure does it prevent) |
 | --- | --- |
-| tests/core.test.ts quiet-timer fixture: 600,000ms outer test timeout across its admission-before/after-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
+| Private text quiet window: default 4,000ms, configurable integer 100 through 5,000ms (`inboundQuietWindowMs`). A batch created or extended by a poll receives that full configured window after awaited post-ingest maintenance and before seal, dispatch, or return. Empty and unrelated polls do not move it. Owner approval: issue #13, Sean authorized this origin move on 2026-11-10. The configured maximum is unchanged. | Stops this poll's own maintenance from consuming the collection window and splitting same-date fragments that were already available. It does not enlarge the window, overlap polls, or reopen a sealed batch. |
+| tests/core.test.ts quiet-timer fixture: 600,000ms outer test timeout across its busy-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
 
 ## Package boundary
 
