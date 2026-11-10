@@ -46,6 +46,7 @@ function createHarness(
 	const activityEvents: string[] = [];
 	let activitySends = 0;
 	let failActivity = false;
+	let failEdits = 0;
 	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
 	let activePollers = 0;
 	let maxActivePollers = 0;
@@ -99,6 +100,10 @@ function createHarness(
 			return `activity-${activitySends}`;
 		},
 		async editActivity(_id: string, text: string) {
+			if (failEdits > 0) {
+				failEdits -= 1;
+				throw new Error("activity edit down");
+			}
 			activityEvents.push(`edit:${text}`);
 		},
 		async deleteActivity(id: string) {
@@ -161,6 +166,7 @@ function createHarness(
 		get stops() { return stops; },
 		setIdle(value: boolean) { idle = value; },
 		failNextActivity() { failActivity = true; },
+		failNextEdits(count: number) { failEdits = count; },
 		async emit(name: string, event: any, context = ctx) {
 			let result: any;
 			for (const handler of handlers.get(name) ?? []) result = await handler(event, context);
@@ -412,6 +418,17 @@ test("session_before_compact shows Compacting before agent start and edits an ex
 	assert.deepEqual(automatic.activityEvents, ["send:Compacting"]);
 	await automatic.emit("session_compact", { reason: "threshold", willRetry: false });
 	assert.equal(automatic.activityEvents.at(-1), "delete:activity-1");
+});
+
+test("a failed compaction retitle is retried while the receipt is still the visible text", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(85, "/compact")]);
+	harness.failNextEdits(1);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.filter((event) => event.startsWith("edit:")).length, 0);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), ["edit:Compacting"]);
 });
 
 test("a failed activity send does not suppress compaction or its durable result", async () => {

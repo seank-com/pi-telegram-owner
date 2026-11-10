@@ -523,10 +523,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				return;
 			}
 			if (phaseNotice.text === text) return;
-			phaseNotice.text = text;
 			if (!phaseNotice.id || !runtimeDependencies?.editActivity) return;
 			try {
 				await runtimeDependencies.editActivity(phaseNotice.id, text, new AbortController().signal);
+				phaseNotice.text = text;
 			} catch (error) {
 				lastActivityError = `phase: ${sanitizeError(error)}`;
 				updateStatus();
