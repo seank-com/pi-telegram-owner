@@ -202,7 +202,7 @@ test("advertised selectors stay argument-free and private-owner only", async () 
 		assert.equal(await f.selectors.handle(update), false);
 	}
 	assert.equal(f.reads, 0); assert.equal(f.journal.records.length, 0);
-	assert.deepEqual(telegramOwnerMenuCommands().map(c => c.command), ["help", "status", "stop", "compact", "new", "model", "thinking"]);
+	assert.deepEqual(telegramOwnerMenuCommands().map(c => c.command), ["help", "status", "stop", "compact", "new", "save", "model", "thinking"]);
 	assert.ok(telegramOwnerHelpText().includes("/model - Choose the active model."));
 	assert.ok(telegramOwnerHelpText().includes("/thinking - Choose the thinking level."));
 });

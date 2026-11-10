@@ -1,4 +1,5 @@
 import { LocalSelectors, type SelectorTransport } from "./selectors.ts";
+import { saveProjectPreferences } from "./preferences.ts";
 import { resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -516,6 +517,22 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				case "status":
 					await completeCommand(job, ownerStatusText(ctx));
 					return "continue";
+				case "save": {
+					if (!ctx.model || typeof pi.getThinkingLevel !== "function") {
+						await completeCommand(job, "Current model/thinking is unavailable; nothing was saved.");
+						return "continue";
+					}
+					const preferences = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
+					let reply: string;
+					try {
+						const path = await saveProjectPreferences(projectRoot, CONFIG_DIR_NAME, preferences);
+						reply = `Saved project defaults to ${path}\nModel: ${preferences.provider}/${preferences.model}\nThinking: ${preferences.thinking}\nDefaults are read on the next Pi start; resuming still restores session choices.`;
+					} catch (error) {
+						reply = `Save failed: ${sanitizeError(error)}`;
+					}
+					await completeCommand(job, reply);
+					return "continue";
+				}
 				case "unknown":
 					await completeCommand(job, unsupportedTelegramCommandText());
 					return "continue";

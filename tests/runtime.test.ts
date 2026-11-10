@@ -90,7 +90,7 @@ async function writeGuardOwner(
 	return path;
 }
 
-test("Telegram owner menu reconciliation registers seven private-chat commands and clears the group fallback", async () => {
+test("Telegram owner menu reconciliation registers eight private-chat commands and clears the group fallback", async () => {
 	const calls: Array<{ url: string; init: RequestInit }> = [];
 	const api = new TelegramApiClient("menu-secret", CHAT, async (url, init) => {
 		calls.push({ url, init: init as RequestInit });
@@ -111,6 +111,7 @@ test("Telegram owner menu reconciliation registers seven private-chat commands a
 		{ command: "stop", description: "Stop the current run." },
 		{ command: "compact", description: "Compact the current session context." },
 		{ command: "new", description: "Start a fresh session." },
+		{ command: "save", description: "Save this project's model and thinking defaults." },
 		{ command: "model", description: "Choose the active model." },
 		{ command: "thinking", description: "Choose the thinking level." },
 	]);

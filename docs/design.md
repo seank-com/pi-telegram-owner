@@ -22,6 +22,7 @@ Pi lifecycle hooks. The major responsibilities are:
 | [`runtime.ts`](../src/runtime.ts) | Validates configuration, owns the poller lock, calls Telegram and manages polling, typing and ephemeral activity. |
 | [`core.ts`](../src/core.ts), [`work.ts`](../src/work.ts) | Classify updates, append/recover the private transport journal and track queues, tasks, dependencies and delivery outcomes. |
 | [`commands.ts`](../src/commands.ts), [`selectors.ts`](../src/selectors.ts) | Own shared menu/help metadata, parse ordinary commands and implement local model/thinking pickers without model turns. `index.ts` executes ordinary commands. |
+| [`preferences.ts`](../src/preferences.ts) | Merge the current model/thinking defaults into Pi's public project settings file and publish the replacement atomically. |
 | [`group-runtime.ts`](../src/group-runtime.ts), [`endpoint.ts`](../src/endpoint.ts), [`group-tools.ts`](../src/group-tools.ts) | Coordinate group membership, routing, elections and peer delivery; accept local work and expose group tools. |
 | [`group-journal.ts`](../src/group-journal.ts) | Own the shared group's locked event log and canonical Markdown projection. |
 | [`markdown-projector.ts`](../src/markdown-projector.ts), [`importer.ts`](../src/importer.ts), `src/cli/` | Publish and validate private conversation notes/media, read their timeline and import reviewed Telegram Desktop exports. |
@@ -108,7 +109,10 @@ The fingerprint includes effective available models, public model capabilities,
 session scope, current model/thinking level, session ID and local lifecycle epoch;
 only hashes of routing metadata are compared, never displayed or journaled.
 Model choices always come from the available registry objects, not callback
-strings. Limits are six model rows per page, a navigation row, 32 retained
+strings. Pi's built-in providers can become available from inherited environment
+credentials without a custom provider entry, for example GEMINI_API_KEY for the
+google provider. This is Pi's native availability decision, not a separate
+Telegram provider allowlist or evidence of a successful inference/entitlement test. Limits are six model rows per page, a navigation row, 32 retained
 pickers and a ten-minute TTL. Display text is bounded plain text; model labels
 use public `provider/model-id` identities rather than potentially shared friendly
 names.
@@ -142,6 +146,32 @@ completion/error callbacks; it does not cancel its own compaction admission.
 A cancelled external switch/fork/tree transition has no public cancellation
 notification and can leave selector admission blocked until `session_start` or
 a completed tree navigation. See [operator guidance](setup.md#local-model-and-thinking-selectors).
+
+## Project preference save
+
+`/save` is an authenticated, argument-free private owner command in the ordinary
+durable command lifecycle, not a model turn. `index.ts` snapshots the public
+current model and thinking getter, then delegates to `preferences.ts` using the
+transport's captured project root and Pi's CONFIG_DIR_NAME. The target is the
+receiving project's settings.json, never the shared platform profile or a
+message-specified path.
+
+The writer reads the existing JSON object and preserves unrelated fields. It
+sets defaultProvider/defaultModel/defaultThinkingLevel and merges only the current
+provider/model-id entry in modelThinkingLevels, because that entry overrides an
+ordinary thinking default. It retains existing permissions and publishes a synced
+temporary file by atomic rename. Invalid JSON, invalid override structure or I/O
+failure produces an ordinary command failure reply. Confirmation follows file
+publication; the existing durable command result/delivery path owns the reply.
+Incomplete commands retain their ordinary uncertain/interrupted recovery semantics
+rather than automatically repeating a filesystem write.
+
+Saving does not set a model, request inference, change another project's defaults
+or reload native settings. Pi's documented file configuration is the interface;
+no private settings-manager internals are used. A fresh Pi start reads the saved
+project defaults, subject to the native catalog, model scope and capabilities.
+Resuming an existing session instead restores its native session choices. Pi's
+already-loaded settings cache is not forcibly refreshed by this command.
 
 ## Canonical archive and import
 

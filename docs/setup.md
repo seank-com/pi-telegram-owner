@@ -310,14 +310,38 @@ so the hook cannot prevent that earlier abort. Avoid manual Pi compaction while
 accepted Telegram work is active; this remains a host limitation.
 
 The private-chat command menu and `/help` advertise `/model` and `/thinking`
-alongside `/help`, `/status`, `/stop`, `/compact` and `/new`. They can also be typed
+alongside `/help`, `/status`, `/stop`, `/compact`, `/new` and `/save`. They can also be typed
 directly. Startup reconciliation and the menu CLI publish the same command list;
 menu visibility does not change selector ownership or idle-admission checks.
+
+## Save project preferences
+
+In the configured owner's private chat, `/save` without arguments snapshots the
+current provider, model and effective thinking level into the receiving project's
+`.pi/settings.json`. This is the project root captured when the transport starts,
+not a path supplied in a message or a later working-directory change.
+
+The command merges `defaultProvider`, `defaultModel`, `defaultThinkingLevel` and
+only the current `provider/model-id` entry in `modelThinkingLevels`. The last
+entry makes the saved level take precedence over an inherited per-model override.
+Other settings and other models' overrides are retained. Existing file permissions
+are preserved; publication uses a synced temporary file and atomic rename.
+Malformed settings or filesystem errors are reported rather than replacing an
+unreadable configuration with defaults.
+
+This uses Pi's documented [project configuration](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/configuration.md),
+not its global-default setters. No shared agent-profile settings, other project,
+model turn or current model/thinking state is changed. Saving does not reload Pi's
+cached settings. The saved defaults are read on the next Pi start; resuming an
+existing session still restores its session-recorded choices. Startup continues
+to honor the native model catalog, scopes and capabilities. An interrupted ordinary
+command is not automatically replayed; inspect the file before retrying an
+uncertain save.
 
 ## CLIs
 
 `pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]` reconciles the
-seven-command owner menu for private chats using protected config. This contacts Telegram. Tests
+eight-command owner menu for private chats using protected config. This contacts Telegram. Tests
 intercept fetch with a synthetic fixture; no test contacts the service.
 
 ### Private archive import

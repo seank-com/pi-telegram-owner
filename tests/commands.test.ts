@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	initialThinkingText,
@@ -34,6 +37,7 @@ function update(updateId: number, text: string, userId = owner, chatId = private
 function createHarness(
 	journal = new MemoryJournal(),
 	identity: { agentLabel?: string; resolveAgentLabel?: () => Promise<string> } = {},
+	projectRoot = "/tmp/telegram-owner-command-test",
 ) {
 	const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
 	const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
@@ -56,6 +60,7 @@ function createHarness(
 			commands.set(name, definition.handler);
 		},
 		registerTool() {},
+		getThinkingLevel() { return ctx.thinkingLevel; },
 		sendUserMessage(content: any, options: any) {
 			sentMessages.push({ content, options });
 		},
@@ -124,7 +129,7 @@ function createHarness(
 		},
 	};
 
-	createTelegramOwnerExtension({ dependencies: dependencies as any, projectRoot: "/tmp/telegram-owner-command-test" })(api as any);
+	createTelegramOwnerExtension({ dependencies: dependencies as any, projectRoot })(api as any);
 
 	return {
 		journal,
@@ -151,8 +156,54 @@ function createHarness(
 	};
 }
 
+async function saveHarness(t: { after(fn: () => Promise<unknown>): void }, body = '{"sessionDir":"native-sessions"}') {
+	const root = await mkdtemp(join(tmpdir(), "telegram-save-command-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await mkdir(join(root, ".pi"));
+	const path = join(root, ".pi/settings.json"); await writeFile(path, body);
+	const h = createHarness(new MemoryJournal(), {}, root);
+	await h.emit("session_start", { reason: "startup" });
+	t.after(() => h.emit("session_shutdown", { reason: "test" }));
+	return { h, path, body, root };
+}
+
+test("save snapshots this project's current preferences without inference, even while the agent is busy", async t => {
+	const { h, path, root } = await saveHarness(t); h.setIdle(false); h.ctx.thinkingLevel = "off";
+	const other = join(root, "other"); await mkdir(join(other, ".pi"), { recursive: true });
+	const otherSettings = join(other, ".pi/settings.json"); await writeFile(otherSettings, '{"unchanged":true}'); h.ctx.cwd = other;
+	await h.poll([update(1, "/save")]);
+	const settings = JSON.parse(await readFile(path, "utf8"));
+	assert.equal(settings.defaultProvider, "test-provider"); assert.equal(settings.defaultModel, "test-model"); assert.equal(settings.defaultThinkingLevel, "off"); assert.equal(settings.sessionDir, "native-sessions");
+	assert.equal(settings.modelThinkingLevels["test-provider/test-model"], "off");
+	assert.equal(await readFile(otherSettings, "utf8"), '{"unchanged":true}');
+	assert.match(h.replies[0].text, /Saved project defaults/); assert.ok(h.replies[0].text.includes(path));
+	assert.equal(h.sentMessages.length, 0); assert.equal(h.journal.records.some(r => r.type === "dispatch_requested"), false);
+	await h.poll([update(1, "/save")]); assert.equal(h.replies.length, 1);
+});
+
+test("save rejects other senders, other chats and command arguments without changing settings", async t => {
+	const { h, path, body } = await saveHarness(t);
+	await h.poll([update(1, "/save", owner + 1), update(2, "/save", owner, privateChat + 1), update(3, "/save extra")]);
+	assert.equal(await readFile(path, "utf8"), body); assert.equal(h.sentMessages.length, 0);
+	assert.equal(h.replies.length, 1); assert.match(h.replies[0].text, /Unsupported command/);
+});
+
+test("save reports invalid project JSON without overwriting it or starting a model turn", async t => {
+	const { h, path, body } = await saveHarness(t, "{invalid");
+	await h.poll([update(1, "/save")]);
+	assert.equal(await readFile(path, "utf8"), body); assert.match(h.replies[0].text, /^Save failed:/); assert.equal(h.sentMessages.length, 0);
+});
+
+test("save with no current model leaves project settings untouched", async t => {
+	const { h, path, body } = await saveHarness(t); h.ctx.model = undefined;
+	await h.poll([update(1, "/save")]);
+	assert.equal(await readFile(path, "utf8"), body); assert.match(h.replies[0].text, /nothing was saved/); assert.equal(h.sentMessages.length, 0);
+});
+
 test("ordinary command parsing stays separate from advertised local selectors", () => {
-	assert.deepEqual(TELEGRAM_OWNER_COMMANDS.map(({ name }) => name), ["help", "status", "stop", "compact", "new"]);
+	assert.deepEqual(TELEGRAM_OWNER_COMMANDS.map(({ name }) => name), ["help", "status", "stop", "compact", "new", "save"]);
+	assert.deepEqual(parseTelegramOwnerCommand("/save"), { kind: "known", name: "save" });
+	assert.deepEqual(parseTelegramOwnerCommand("/save extra"), { kind: "unknown", token: "/save" });
 	assert.deepEqual(parseTelegramOwnerCommand(" /status "), { kind: "known", name: "status" });
 	assert.deepEqual(parseTelegramOwnerCommand("/status extra"), { kind: "unknown", token: "/status" });
 	assert.deepEqual(parseTelegramOwnerCommand("/session"), { kind: "unknown", token: "/session" });
@@ -166,6 +217,7 @@ test("ordinary command parsing stays separate from advertised local selectors", 
 		"/stop - Stop the current run.",
 		"/compact - Compact the current session context.",
 		"/new - Start a fresh session.",
+		"/save - Save this project's model and thinking defaults.",
 		"/model - Choose the active model.",
 		"/thinking - Choose the thinking level.",
 	].join("\n"));

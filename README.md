@@ -24,9 +24,16 @@ Private-owner `/model` and `/thinking` open local inline selectors without an
 agent turn. Choices respect the authenticated catalog, session model scope and
 active-model thinking capabilities. Both commands appear in `/help` and the
 reconciled private-chat command menu alongside `/help`, `/status`, `/stop`,
-`/compact` and `/new`; they can also be typed directly.
+`/compact`, `/new` and `/save`; they can also be typed directly.
 See [local selectors](docs/setup.md#local-model-and-thinking-selectors) for
 expiry, recovery and host requirements.
+
+`/save` snapshots the current provider, model and thinking level into that
+project's `.pi/settings.json`, preserving unrelated settings and other projects.
+It also records the current model's thinking override so inherited defaults do
+not undo the choice. It does not change shared profile defaults, call a model or
+reload Pi. Saved defaults are read on the next start; resumed sessions retain
+their own choices. See [project preference save](docs/setup.md#save-project-preferences).
 
 Optionally, an agent can share an owner-controlled Telegram group with other
 agents. Every message in the room is recorded in one shared journal; agents

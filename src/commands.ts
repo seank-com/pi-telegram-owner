@@ -4,6 +4,7 @@ export const TELEGRAM_OWNER_COMMANDS = [
 	{ name: "stop", description: "Stop the current run." },
 	{ name: "compact", description: "Compact the current session context." },
 	{ name: "new", description: "Start a fresh session." },
+	{ name: "save", description: "Save this project's model and thinking defaults." },
 ] as const;
 
 // Selectors are advertised here but handled before durable ordinary-command admission.
