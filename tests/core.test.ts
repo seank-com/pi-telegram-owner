@@ -973,6 +973,8 @@ test("6340ms of awaited poll maintenance does not split an already available sam
 	const date = base / 1000;
 	const pending = [textUpdate(1, "fragment one", OWNER, CHAT, date), textUpdate(2, "fragment two", OWNER, CHAT, date)];
 	let polls = 0;
+	let completeSecondBatch: () => void = () => undefined;
+	const secondBatchComplete = new Promise<void>((resolve) => { completeSecondBatch = resolve; });
 	let releasePoll: () => void = () => undefined;
 	const pollGate = new Promise<void>((resolve) => { releasePoll = resolve; });
 	const source = new LongPollSource({
@@ -990,14 +992,19 @@ test("6340ms of awaited poll maintenance does not split an already available sam
 	const handlers = new Map<string, Handler[]>();
 	const pi = { on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerCommand() {}, registerTool() {}, sendUserMessage() {} } as unknown as ExtensionAPI;
 	createTelegramOwnerExtension({ dependencies: {
-		journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: 4_000, source,
+		journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: 4_000,
+		source: { start: (onBatch, cursor) => source.start(async (updates) => {
+			const next = await onBatch(updates);
+			if (updates.some((update) => update.update_id === 2)) completeSecondBatch();
+			return next;
+		}, cursor) },
 		async sendReply() { return "sent"; },
 	} })(pi);
 	const ctx = { isIdle: () => true, sessionManager: { getSessionId: () => "session-6340" }, ui: { setStatus: () => undefined, notify: () => undefined } } as unknown as ExtensionContext;
 	t.after(async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown", reason: "test" }, ctx); });
 	for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
 	releasePoll();
-	for (let attempt = 0; attempt < 30 && pending.length > 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await secondBatchComplete;
 	assert.equal(pending.length, 0);
 	assert.ok(polls >= 2);
 	const latest = [...new Map(journal.records.filter((record) => record.type === "inbound_batch").map((record) => [record.batchId, record])).values()];
