@@ -253,12 +253,32 @@ observability contract.
 
 ## Restrictions register
 
-### Quiet-timer regression qualification
+Review this register in every PR against code, tests and dependencies. It records
+current constraints, not automatic approval. Missing evidence remains explicit;
+configuration owners are component/fixture maintainers unless a project setting
+is named. This is not an exhaustive inventory of every protocol/library bound.
+
+### Collection and qualification
 
 | Restriction | Why (what failure does it prevent) |
 | --- | --- |
-| Private text quiet window: default 4,000ms, configurable integer 100 through 5,000ms (`inboundQuietWindowMs`). A batch created or extended by a poll receives that full configured window after awaited media, reply, command, and queued-notice work, before return, and before seal or dispatch. Empty and unrelated polls do not move it. Owner approval: issue #13, Sean authorized this origin move on 2026-11-10. The configured maximum is unchanged. | Stops this poll's own maintenance from consuming the collection window and splitting same-date fragments that were already available. It does not enlarge the window, overlap polls, or reopen a sealed batch. |
+| Private text quiet window: default4000ms, runtime configuration100-5000ms (`inboundQuietWindowMs`); fixture bridge0 disables batching. Location: core/runtime configuration and poll callback. A touched open batch gets the full window after awaited maintenance, including notices, with a pre-dispatch revision; unrelated polls do not move it. | The origin move prevents internal processing from consuming the four-second collection budget. Explicit approval: issue#13, 2026-11-10. That narrow approval does not establish approval of the older numeric configuration range. Polls remain sequential and dispatched history stays closed. |
+| Private text fragments must also have exactly equal Telegram `message.date` values. Location: `src/core.ts:addTextToBatch`; fixed matcher. | Different whole-second timestamps immediately seal an open batch even inside the quiet window. This is a known cross-second paste limitation, not timestamp rewriting. The intended long-term rationale/approval for that restriction is not established; retaining the deadline improvement does not authorize a broader grouping rule. |
 | tests/core.test.ts quiet-timer fixture: 600,000ms outer test timeout across its busy-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
+
+### Other effective bounds and policies
+
+| Restriction | Why (what failure does it prevent) |
+| --- | --- |
+| HTTP request deadline35000ms; long-poll parameter25 seconds. Location: `src/runtime.ts:TelegramApiClient`. | Abort request waits under the existing transport envelope. Specific numeric necessity/approval is not established; a server poll parameter is not proof the whole request completes in that time. |
+| Reconnect backoff: base `min(30000,1000*2**min(failures,5))`, multiplier0.75-1.25, capped30000ms. Location: `src/runtime.ts:reconnectDelay`. | Current retry scheduling after poll failure. Approval for this policy/formula is not established by its age or tests. |
+| Election step2000ms and activity edit minimum1000ms by default. Location: group configuration/activity in `src/runtime.ts`. | These schedule election/activity work. The exact values and rate-policy approval need evidence; no change is made here. |
+| Selector page6, retained pickers32, TTL600000ms. Location: `src/selectors.ts`. | Limits button views/retention and rejects stale controls. Specific pagination/retention values' necessity and approval are not established. |
+| Label1-64 single-line safe characters, configured username and safe-ID regexes. Location: `src/runtime.ts`. | Current configuration/identity validation can reject otherwise supplied identifiers. Exact exclusion/length-policy approval is not established; do not invent a broader content filter. |
+| Image10MiB and JPEG/PNG/WebP validation. Location: `src/core.ts`, `src/runtime.ts`; fixed component handling. | Bounds accepted media and formats. Distinguish our exact binary size/validation choices from Telegram protocol constraints; their owner-approval references are not established by this inventory. |
+| Markdown256KiB, AST10000 nodes/depth32, rendered HTML512KiB, chunk4000 units and maximum128 chunks. Location: `src/format.ts`. | Bounds rendering/transport output and can reject/truncate content. Specific numeric values are not approved merely because Telegram has separate protocol limits. |
+| Recall1-10 results,50KiB/2000-line display envelope and default15-minute consumer deadline. Location: tools/datastore client consumption. | Current retrieval/display limits and cancellation envelope, owned by this consumer rather than implied by datastore implementation. Approval of numeric choices remains unestablished. |
+| README publication rules; existing-branch main-only exclusion and unchanged new-branch remote exclusion; scanner Git capture256MiB. Location: `.githooks/`, scanner script. | Main exclusion approved in PR#15's guard correction; feature message/added-line checks remain. Separate capture-limit rationale/approval is not established; registry paths remain configurable. |
 
 ## Package boundary
 
