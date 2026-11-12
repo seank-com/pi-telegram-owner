@@ -45,6 +45,11 @@ export class IntegrationError extends Error {
 	readonly code: "CAPABILITY_UNAVAILABLE" | "TIMEOUT" | "CANCELLED" | "BACKEND_OUTPUT_INVALID";
 	constructor(code: IntegrationError["code"]) { super(code); this.code = code; }
 }
+export async function refreshPublishedPaths(client: Pick<MarkdownDatastoreServiceV1, "refresh">, store: string, paths: readonly string[] | undefined, signal?: AbortSignal, available = true): Promise<void> {
+	if (!available) return;
+	if (paths?.length) await client.refresh({ action: "start", store, mode: "metadata", paths: [...paths] }, signal);
+	await client.refresh({ action: "start", store, mode: "lexical" }, signal);
+}
 export function createDatastoreIntegration(bus: Bus, getPolicy: () => DatastorePolicy, timeoutMs = 900_000) {
 	if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900_000) throw new RangeError("datastore timeout must be 1..900000 ms");
 	let active = false; let lifetime = new AbortController();

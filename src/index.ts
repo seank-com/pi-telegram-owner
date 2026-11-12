@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { createDatastoreIntegration, parseDatastorePolicy, type DatastorePolicy } from "./datastore.ts";
+import { createDatastoreIntegration, parseDatastorePolicy, refreshPublishedPaths, type DatastorePolicy } from "./datastore.ts";
 import { formatTelegramToolActivity } from "./activity.ts";
 import { TelegramMarkdownProjector } from "./markdown-projector.ts";
 import {
@@ -765,10 +765,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				if (!groupIntegration.available()) return;
 				const noted = [...pendingGroupPaths];
 				pendingGroupPaths.clear();
-				const refresh = noted.length
-					? groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "metadata", paths: noted }).then(() => groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" }))
-					: groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" });
-				void refresh.catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
+				void refreshPublishedPaths(groupIntegration.service, groupPolicy.store, noted, undefined, true).catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
 			}, projectionRefreshDebounceMs);
 			groupRefreshTimer.unref?.();
 		};
@@ -872,7 +869,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				...(config.groupChat && groupApi ? { groupChat: { config: config.groupChat, api: groupApi } } : {}),
 				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
 				mediaProjector,
-				requestLexicalRefresh: async (signal, paths) => { if (!integration.available()) return; if (paths?.length) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "metadata", paths: [...paths] }, signal); await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
+				requestLexicalRefresh: (signal, paths) => refreshPublishedPaths(datastoreClient, datastorePolicy.store, integration.available() ? paths : undefined, signal, integration.available()),
 				resolveAgentLabel: config.agentLabel === undefined
 					? (signal) => api.getBotFirstName(signal ?? requests.signal)
 					: undefined,

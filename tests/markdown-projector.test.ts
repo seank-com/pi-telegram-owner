@@ -3,8 +3,8 @@ function expectProjection(actual: { projected: number; unchanged: number; deferr
 	assert.equal(actual.projected, expected.projected);
 	assert.equal(actual.unchanged, expected.unchanged);
 	assert.equal(actual.deferred, expected.deferred);
-	assert.ok(Array.isArray(actual.paths));
-	if (expected.paths?.length) assert.deepEqual(actual.paths, expected.paths);
+	assert.equal(actual.paths?.length, actual.projected);
+	if (expected.paths) assert.deepEqual(actual.paths, expected.paths);
 }
 import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
