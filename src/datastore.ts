@@ -39,7 +39,7 @@ export interface SearchResult {
 }
 export interface MarkdownDatastoreServiceV1 {
 	search(input: { store: string; query: string; mode: "hybrid"; limit: number; includeContent: true }, signal?: AbortSignal): Promise<SearchResult>;
-	refresh(input: { action: "start"; store: string; mode: "lexical" }, signal?: AbortSignal): Promise<unknown>;
+	refresh(input: { action: "start"; store: string; mode: "lexical" | "metadata"; paths?: string[] }, signal?: AbortSignal): Promise<unknown>;
 }
 export class IntegrationError extends Error {
 	readonly code: "CAPABILITY_UNAVAILABLE" | "TIMEOUT" | "CANCELLED" | "BACKEND_OUTPUT_INVALID";

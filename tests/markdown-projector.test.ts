@@ -1,4 +1,11 @@
 import assert from "node:assert/strict";
+function expectProjection(actual: { projected: number; unchanged: number; deferred: number; paths?: string[] }, expected: { projected: number; unchanged: number; deferred: number; paths?: string[] }) {
+	assert.equal(actual.projected, expected.projected);
+	assert.equal(actual.unchanged, expected.unchanged);
+	assert.equal(actual.deferred, expected.deferred);
+	assert.ok(Array.isArray(actual.paths));
+	if (expected.paths?.length) assert.deepEqual(actual.paths, expected.paths);
+}
 import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -84,9 +91,9 @@ for (const lifecycle of [false,true]) test(`interruption notices survive project
 	if(lifecycle)journal.push({type:'task_output',taskId:'job-1',jobId:'job-1',mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.000Z'});
 	journal.push({ type: "reply_ready", jobId: "job-1", text: "Stopped by /stop." }, { type: "reply_sent", jobId: "job-1", messageIds: ["11"] });
 	const append = async (record: JournalRecord) => { journal.push(record); };
-	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 0, deferred: 0 });
+	expectProjection(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 0, deferred: 0 });
 	const restarted = createProjector(archiveRoot, sessionRoot);
-	assert.deepEqual(await restarted.reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 2, deferred: 0 });
+	expectProjection(await restarted.reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 2, deferred: 0 });
 	const recent = await restarted.timeline({ operation: "recent", limit: 2 });
 	const notice = recent.messages!.find((item) => item.content === "Stopped by /stop.")!;
 	assert.equal(notice.messageId, "tgmsg:v1:telegram-job:job-1:local-response");
@@ -94,9 +101,9 @@ for (const lifecycle of [false,true]) test(`interruption notices survive project
 	entries.push(message("user0002", "asst0001", "user", "[telegram-job:job-2]\nhello", "2026-09-22T02:00:01.000Z"), message("asst0002", "user0002", "assistant", "**world**", "2026-09-22T02:00:02.000Z"));
 	await persistSession(sessionRoot, entries);
 	journal.push(...records().map((record) => ({ ...record, ...("jobId" in record ? { jobId: "job-2" } : {}), ...(record.type === "update" ? { updateId: 2, messageId: 12 } : {}) })));
-	assert.deepEqual(await restarted.reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 2, deferred: 0 });
+	expectProjection(await restarted.reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 2, deferred: 0 });
 	const replayed = createProjector(archiveRoot, sessionRoot);
-	assert.deepEqual(await replayed.reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 4, deferred: 0 });
+	expectProjection(await replayed.reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 4, deferred: 0 });
 	assert.equal((await replayed.timeline({ operation: "recent", limit: 1 })).messages![0].messageId, "tgmsg:v1:pi:session-1:asst0002");
 	// An interruption alone must not exempt an earlier assistant reply from validation.
 	const invalid = records();
@@ -115,14 +122,14 @@ for (const failure of [false,true]) test(`generated work-item notice recovers la
  const terminal:JournalRecord=failure?{type:'turn_failed',jobId:item.itemId,code:'MODEL_ERROR',timestamp:'2026-09-22T01:00:03.000Z'}:{type:'interrupted',jobId:item.itemId,reason:'Stopped by Telegram owner command'};
  await persistSession(sessions,entries);const journal:JournalRecord[]=[{type:'work_item',schemaVersion:1,...item},{type:'dispatched',jobId:item.itemId,sessionId:'session-1'},terminal,{type:'task_output',taskId:item.itemId,jobId:item.itemId,mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.000Z'},{type:'reply_ready',jobId:item.itemId,text:notice},{type:'reply_sent',jobId:item.itemId,messageIds:['11']}];
  const append=async(r:JournalRecord)=>{journal.push(r);};
- assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:1,unchanged:0,deferred:0});
+ expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:1,unchanged:0,deferred:0});
  const first=await createProjector(root,sessions).timeline({operation:'recent',limit:5});assert.equal(first.messages!.length,1);assert.equal(first.messages![0].messageId,`tgmsg:v1:telegram-job:${item.itemId}:local-response`);assert.equal(first.messages![0].content,notice);
  const originalNote=await readFile(join(root,first.messages![0].path));
  entries.push(message('u2','a1','user','[telegram-job:job-1]\nhello','2026-09-22T02:00:01.000Z'),message('a2','u2','assistant','**world**','2026-09-22T02:00:02.000Z'));await persistSession(sessions,entries);journal.push(...records());
  const source=await readFile(join(sessions,'session.jsonl')),prefix=JSON.stringify(journal);
- assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:2,unchanged:1,deferred:0});
+ expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:2,unchanged:1,deferred:0});
  assert.deepEqual(await readFile(join(root,first.messages![0].path)),originalNote);assert.deepEqual(await readFile(join(sessions,'session.jsonl')),source);assert.equal(JSON.stringify(journal.slice(0,JSON.parse(prefix).length)),prefix);
- assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:0,unchanged:3,deferred:0});
+ expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:0,unchanged:3,deferred:0});
  const all=await createProjector(root,sessions).timeline({operation:'recent',limit:5});assert.equal(all.messages!.length,3);assert.equal(all.messages!.some(m=>m.messageId==='tgmsg:v1:pi:session-1:a1'),false);
 });
 
@@ -144,15 +151,15 @@ for (const code of ['LENGTH','ABORTED','MODEL_ERROR','NO_REPLY'] as TurnFailureC
  if(lifecycle)journal.push({type:'task_output',taskId:'job-1',jobId:'job-1',mode:'terminal',disposition:'failed',timestamp:'2026-09-22T01:00:03.001Z'});
  journal.push({type:'reply_ready',jobId:'job-1',text:turnFailureNotice(code)},{type:'reply_sent',jobId:'job-1',messageIds:['11']});
  const append=async(r:JournalRecord)=>{journal.push(r);};
- assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:2,unchanged:0,deferred:0});
+ expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:2,unchanged:0,deferred:0});
  const first=await createProjector(root,sessions).timeline({operation:'recent',limit:5});const notice=first.messages!.find(m=>m.direction==='out')!;
  assert.equal(notice.messageId,'tgmsg:v1:telegram-job:job-1:local-response');assert.equal(notice.content,turnFailureNotice(code));const note=await readFile(join(root,notice.path));
  entries.push(message('u2','a1','user','[telegram-job:job-2]\nhello','2026-09-22T02:00:01.000Z'),message('a2','u2','assistant','**world**','2026-09-22T02:00:02.000Z'));await persistSession(sessions,entries);
  journal.push(...records().map(r=>({...r,...('jobId'in r?{jobId:'job-2'}:{}),...(r.type==='update'?{updateId:2,messageId:12}:{})})));
  const source=await readFile(join(sessions,'session.jsonl')),prefix=JSON.stringify(journal);
- assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:2,unchanged:2,deferred:0});
+ expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:2,unchanged:2,deferred:0});
  assert.deepEqual(await readFile(join(root,notice.path)),note);assert.deepEqual(await readFile(join(sessions,'session.jsonl')),source);assert.equal(JSON.stringify(journal.slice(0,JSON.parse(prefix).length)),prefix);
- assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:0,unchanged:4,deferred:0});
+ expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:0,unchanged:4,deferred:0});
 });
 for (const variant of ['changed-notice','earlier-failure','later-failure'] as const) test(`failure metadata does not excuse canonical changes: ${variant}`,async t=>{
  const base=await mkdtemp(join(tmpdir(),'telegram-failure-integrity-'));t.after(()=>rm(base,{recursive:true,force:true}));const root=join(base,'archive'),sessions=join(base,'sessions');
@@ -178,7 +185,7 @@ test("projector writes Pi-entry notes atomically and converges metadata idempote
 	const journal = records();
 	const append = async (record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>) => { journal.push(record); };
 	const projector = createProjector(archiveRoot, sessionRoot);
-	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 0, deferred: 0 });
+	expectProjection(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 2, unchanged: 0, deferred: 0 });
 	const year = join(archiveRoot, "messages", "2026", "09");
 	const files = await readdir(year);
 	assert.equal(files.length, 2);
@@ -198,7 +205,7 @@ test("projector writes Pi-entry notes atomically and converges metadata idempote
 	assert.match(outgoing, new RegExp(`Previous: \\[\\[${incomingName}\\]\\]`));
 
 	const second = await projector.reconcile(journal, session(sessionRoot, entries), append);
-	assert.deepEqual(second, { projected: 0, unchanged: 2, deferred: 0 });
+	expectProjection(second, { projected: 0, unchanged: 2, deferred: 0 });
 	assert.equal((await readdir(year)).length, 2);
 
 	const recent = await projector.timeline({ operation: "recent", unit: "messages", limit: 1 });
@@ -345,7 +352,7 @@ test("durable receipts converge metadata only and remain idempotent", async (t) 
 	const afterText = await readFile(outgoingPath, "utf8"); const after = frontmatter(afterText); const afterBody = noteBody(afterText);
 	assert.equal(afterBody, beforeBody); assert.equal(after.contentRevision, 1); assert.equal(after.contentSha256, before.contentSha256);
 	assert.equal(after.metadataRevision, before.metadataRevision + 1); assert.equal(after.chunk.transportCompleteness, "complete"); assert.deepEqual(after.telegramMessageIds, ["11"]);
-	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 2, deferred: 0 });
+	expectProjection(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 2, deferred: 0 });
 });
 
 test("import publication resumes after manifest commit precedes checkpoint progress", async (t) => {
@@ -388,7 +395,7 @@ test("live projection reconciles imported Pi identity without replacing import p
 	const projector = createProjector(root, sessionRoot);
 	await projector.publishImport([item], { sourceSetId: "set", sourceSetManifestSha256: "b".repeat(64), speakerMapRevision: 1, boundaryManifestSha256: "c".repeat(64) });
 	const journal = records().filter((record) => !["reply_ready", "reply_plan", "reply_chunk_sent", "reply_sent"].includes(record.type));
-	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 1, unchanged: 0, deferred: 0 });
+	expectProjection(await projector.reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 1, unchanged: 0, deferred: 0 });
 	const manifest = JSON.parse(await readFile(join(root, "messages", ".telegram-archive", "manifest.json"), "utf8"));
 	const manifestEntry = manifest.messages[item.messageId];
 	assert.equal(manifestEntry.import.source, "telegram-desktop-html-pi");
@@ -479,7 +486,7 @@ test("live inbound and outbound photo journal records project stable attachment 
 	assert.deepEqual((await projector.readMediaEvents()).map((event) => event.provenance.kind), ["live-inbound"], "an outbound plan is not a delivered occurrence");
 	journal.splice(journal.length - 2, 0, { type: "photo_sent", schemaVersion: 1, photoId: "tool-photo-1", jobId: "job-1", messageId: "11", timestamp: "2026-09-22T01:00:03.000Z" });
 	assert.equal(await projector.reconcileMediaEvents(journal), 1, "restart reconciliation backfills the durable receipt");
-	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 3, unchanged: 0, deferred: 0 });
+	expectProjection(await projector.reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 3, unchanged: 0, deferred: 0 });
 	const mediaEvents = await projector.readMediaEvents();
 	assert.equal(mediaEvents.length, 2, "pre-event live journal records must backfill into one shared stream");
 	assert.deepEqual(mediaEvents.map((event) => event.provenance.kind).sort(), ["live-inbound", "live-outbound"]);
@@ -494,7 +501,7 @@ test("live inbound and outbound photo journal records project stable attachment 
 	assert.deepEqual(frontmatter(photoNote).telegramMessageIds, ["11"]);
 	assert.deepEqual(frontmatter(photoNote).import, { source: "live", confidence: "exact-live-telegram" });
 	assert.equal(noteBody(photoNote).includes(`![[${outbound.sha256}.png|512]]`), true);
-	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 0, unchanged: 3, deferred: 0 });
+	expectProjection(await projector.reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 0, unchanged: 3, deferred: 0 });
 });
 
 test("shared media-event reader rejects malformed provenance and identity mutation", async (t) => {
@@ -591,12 +598,12 @@ for (const [channel,sender] of [['endpoint','fixture'],['endpoint','fixture\nsec
 	entries.push(message('u2','a1','user',`[telegram-item:${item.itemId}]\n${legacy}`,'2026-09-22T01:30:01.000Z'),message('a2','u2','assistant','Fixture reviewed.','2026-09-22T01:30:02.000Z'),message('u3','a2','user','[telegram-job:later]\nNew private message.','2026-09-22T01:40:01.000Z'),message('a3','u3','assistant','New private answer.','2026-09-22T01:40:02.000Z'));
 	journal.push({type:'work_item',schemaVersion:1,...item},{type:'dispatched',jobId:item.itemId,sessionId:'session-1'},{type:'reply_ready',jobId:item.itemId,text:'Fixture reviewed.',timestamp:'2026-09-22T01:30:03.000Z'},{type:'reply_sent',jobId:item.itemId,messageIds:['13'],timestamp:'2026-09-22T01:30:03.000Z'},{type:'update',schemaVersion:2,updateId:2,disposition:'accepted',timestamp:'2026-09-22T01:40:00.000Z',jobId:'later',messageId:14,text:'New private message.',rawText:'New private message.',chatId:70,userId:7},{type:'dispatched',jobId:'later',sessionId:'session-1'},{type:'reply_ready',jobId:'later',text:'New private answer.',timestamp:'2026-09-22T01:40:03.000Z'},{type:'reply_sent',jobId:'later',messageIds:['15'],timestamp:'2026-09-22T01:40:03.000Z'});
 	await persistSession(sessions,entries);const source=await readFile(join(sessions,'session.jsonl')),journalPrefix=JSON.stringify(journal);
-	assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:3,unchanged:2,deferred:0});
+	expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:3,unchanged:2,deferred:0});
 	assert.deepEqual(await readFile(join(sessions,'session.jsonl')),source);assert.equal(JSON.stringify(journal.slice(0,JSON.parse(journalPrefix).length)),journalPrefix);
 	for(const note of oldNotes)assert.deepEqual(await readFile(join(root,note.path)),note.bytes);
 	const recovered=await createProjector(root,sessions).timeline({operation:'recent',limit:10});assert.equal(recovered.messages!.length,5);assert.deepEqual(recovered.messages!.slice(0,3).map(m=>m.content),['New private answer.','New private message.','Fixture reviewed.']);
 	const manifest=await readFile(join(root,'messages/.telegram-archive/manifest.json'));
-	assert.deepEqual(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append),{projected:0,unchanged:5,deferred:0});
+	expectProjection(await createProjector(root,sessions).reconcile(journal,session(sessions,entries),append), {projected:0,unchanged:5,deferred:0});
 	assert.deepEqual(await readFile(join(root,'messages/.telegram-archive/manifest.json')),manifest);
 	assert.deepEqual(await readFile(join(sessions,'session.jsonl')),source);
 });
@@ -641,13 +648,13 @@ test("private-chat replies to work items are archived as outbound messages; grou
 	];
 	const append = async (record: JournalRecord) => { journal.push(record); };
 	const projector = createProjector(archiveRoot, sessionRoot);
-	assert.deepEqual(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 3, unchanged: 0, deferred: 0 });
+	expectProjection(await projector.reconcile(journal, session(sessionRoot, entries), append), { projected: 3, unchanged: 0, deferred: 0 });
 	const recent = await projector.timeline({ operation: "recent", limit: 3 });
 	assert.deepEqual(recent.messages!.map((item) => item.content), ["You have an 8:00 meeting; set an early alarm.", "**world**", "hello"]);
 	assert.equal(recent.messages![0].direction, "out");
 	assert.equal(recent.messages![0].messageId, "tgmsg:v1:pi:session-1:asst0002");
 	assert.equal(journal.some((record) => record.type === "projection_deferred"), false);
-	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 3, deferred: 0 });
+	expectProjection(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), append), { projected: 0, unchanged: 3, deferred: 0 });
 });
 
 test("a reply that posted nothing is not archived", async (t) => {
@@ -663,5 +670,5 @@ test("a reply that posted nothing is not archived", async (t) => {
 		{ type: "reply_ready", jobId: "job-1", text: "Asked again in the group.", timestamp: "2026-09-22T01:00:02.000Z" },
 		{ type: "reply_sent", jobId: "job-1", messageIds: [], timestamp: "2026-09-22T01:00:02.000Z" },
 	];
-	assert.deepEqual(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 1, unchanged: 0, deferred: 0 });
+	expectProjection(await createProjector(archiveRoot, sessionRoot).reconcile(journal, session(sessionRoot, entries), async (record) => { journal.push(record); }), { projected: 1, unchanged: 0, deferred: 0 });
 });

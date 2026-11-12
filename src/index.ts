@@ -72,7 +72,7 @@ export interface PrototypeDependencies {
 	/** Mandatory media-event stream writer, including when note projection is disabled. */
 	mediaProjector?: TelegramMarkdownProjector;
 	/** Enqueues coalesced lexical maintenance after durable Markdown publication. */
-	requestLexicalRefresh?(signal?: AbortSignal): Promise<void>;
+	requestLexicalRefresh?(signal?: AbortSignal, paths?: readonly string[]): Promise<void>;
 	source: PrototypeSource;
 	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
 	selectorTransport?: SelectorTransport;
@@ -432,8 +432,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			quietTimer.unref?.();
 		};
 
-		const scheduleProjectionRefresh = (ownGeneration: number): void => {
+		const pendingProjectionPaths = new Set<string>();
+		const scheduleProjectionRefresh = (ownGeneration: number, paths: readonly string[] = []): void => {
 			if (datastorePolicy.mode === "off" || (!integration.available() && !options.dependencies?.requestLexicalRefresh)) return;
+			for (const path of paths) pendingProjectionPaths.add(path);
 			projectionRefreshPending = true;
 			if (projectionRefreshTimer || projectionRefreshInFlight || !runtimeDependencies?.requestLexicalRefresh) return;
 			projectionRefreshTimer = setTimeout(() => {
@@ -442,7 +444,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				projectionRefreshPending = false;
 				const request = runtimeDependencies.requestLexicalRefresh;
 				const signal = projectionRefreshController?.signal;
-				projectionRefreshInFlight = request(signal).then(() => {
+				const noted = [...pendingProjectionPaths];
+				pendingProjectionPaths.clear();
+				projectionRefreshInFlight = request(signal, noted).then(() => {
 					lastIndexError = undefined;
 				}, (error) => {
 					if (!signal?.aborted) lastIndexError = sanitizeError(error);
@@ -464,7 +468,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					(record) => bridge!.appendArchiveRecord(record),
 					ctx.signal,
 				);
-				if (result.projected > 0) scheduleProjectionRefresh(generation);
+				if (result.projected > 0) scheduleProjectionRefresh(generation, result.paths);
 			} catch (error) {
 				noteError(error);
 			}
@@ -751,12 +755,20 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		let groupRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 		/** Coalesces lexical refreshes of the group store; never queued against an absent integration. */
-		const scheduleGroupRefresh = (): void => {
-			if (groupRefreshTimer || groupPolicy.mode === "off" || !groupIntegration.available()) return;
+		const pendingGroupPaths = new Set<string>();
+		const scheduleGroupRefresh = (paths?: readonly string[]): void => {
+			if (groupPolicy.mode === "off" || !groupIntegration.available()) return;
+			for (const path of paths ?? []) pendingGroupPaths.add(path);
+			if (groupRefreshTimer) return;
 			groupRefreshTimer = setTimeout(() => {
 				groupRefreshTimer = undefined;
 				if (!groupIntegration.available()) return;
-				void groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" }).catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
+				const noted = [...pendingGroupPaths];
+				pendingGroupPaths.clear();
+				const refresh = noted.length
+					? groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "metadata", paths: noted }).then(() => groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" }))
+					: groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" });
+				void refresh.catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
 			}, projectionRefreshDebounceMs);
 			groupRefreshTimer.unref?.();
 		};
@@ -860,7 +872,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				...(config.groupChat && groupApi ? { groupChat: { config: config.groupChat, api: groupApi } } : {}),
 				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
 				mediaProjector,
-				requestLexicalRefresh: async (signal) => { if (integration.available()) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
+				requestLexicalRefresh: async (signal, paths) => { if (!integration.available()) return; if (paths?.length) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "metadata", paths: [...paths] }, signal); await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
 				resolveAgentLabel: config.agentLabel === undefined
 					? (signal) => api.getBotFirstName(signal ?? requests.signal)
 					: undefined,
