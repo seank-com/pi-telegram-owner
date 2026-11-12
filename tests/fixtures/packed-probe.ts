@@ -129,8 +129,10 @@ if(process.env.TEST_COMPANIONS){
    assert.equal((await client.search({store:"telegram",query:"Workspace-only boundary marker",mode:"lexical"})).data.returned,0);
    assert.equal((await client.search({store:"telegram",query:"Shared group source",mode:"lexical"})).data.returned,0);
    const liveTimeline=await state.session.getToolDefinition("telegram_timeline").execute("root-timeline",{operation:"recent",limit:50});assert.ok(JSON.parse(liveTimeline.content[0].text).messages.some((message:any)=>message.path===first.path));
-   const integration=local.createDatastoreIntegration(api.events,()=>({mode:"auto",store:"telegram"}),1000);integration.start();assert.equal((await integration.service.refresh({action:"start",store:"telegram",mode:"lexical"})).operation,"refresh");integration.stop();
+   const integration=local.createDatastoreIntegration(api.events,()=>({mode:"auto",store:"telegram"}),1000);integration.start();await local.refreshPrivatePublishedPaths(integration.service,"telegram",[first.path,second.path]);integration.stop();
    do{status=await client.status({store:"telegram"});if(status.data.stores[0].sourceReconciliation.state==="succeeded")break;await new Promise(resolve=>setTimeout(resolve,10));}while(status.data.stores[0].sourceReconciliation.state!=="succeeded");assert.equal(status.data.stores[0].sourceReconciliation.state,"succeeded");
+   assert.deepEqual(status.data.stores[0].capabilities.metadata.progress.job.paths,[messagePath,relative(messageRoot,join(project,second.path))].sort(),"publication paths belong to the narrowed message store, not the projection parent");
+   const relationships=await client.read({note:{store:"telegram",path:relative(messageRoot,join(project,second.path))},view:"links"});assert.ok(relationships.data.edges.some((edge:any)=>edge.target===messagePath&&edge.targetKind==="note"),"real published predecessor resolves through the packed metadata index");
    // Actual owner persists the intent before Telegram consumes it.
    const owner=state.loader.getExtensions().extensions.find((extension:any)=>extension.path===obsEntry);const branch:any[]=[];const ctx={sessionManager:{getBranch:()=>branch}};
    const loaded=state.loader.getExtensions();const original=loaded.runtime.appendEntry;loaded.runtime.appendEntry=(customType:string,data:any)=>branch.push({type:"custom",customType,data});

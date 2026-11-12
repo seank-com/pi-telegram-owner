@@ -50,6 +50,16 @@ export async function refreshPublishedPaths(client: Pick<MarkdownDatastoreServic
 	if (paths?.length) await client.refresh({ action: "start", store, mode: "metadata", paths: [...paths] }, signal);
 	await client.refresh({ action: "start", store, mode: "lexical" }, signal);
 }
+export async function refreshPrivatePublishedPaths(client: Pick<MarkdownDatastoreServiceV1, "refresh">, store: string, paths: readonly string[] | undefined, signal?: AbortSignal, available = true): Promise<void> {
+	if (!available) return;
+	// Canonical private archive paths include messages/; the datastore root is that directory.
+	const prefix = "messages/";
+	const relative = paths?.map((path) => {
+		if (!path.startsWith(prefix) || path.length === prefix.length) throw new IntegrationError("BACKEND_OUTPUT_INVALID");
+		return path.slice(prefix.length);
+	});
+	await refreshPublishedPaths(client, store, relative, signal);
+}
 export function createDatastoreIntegration(bus: Bus, getPolicy: () => DatastorePolicy, timeoutMs = 900_000) {
 	if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900_000) throw new RangeError("datastore timeout must be 1..900000 ms");
 	let active = false; let lifetime = new AbortController();

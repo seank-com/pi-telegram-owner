@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { createDatastoreIntegration, parseDatastorePolicy, refreshPublishedPaths, type DatastorePolicy } from "./datastore.ts";
+import { createDatastoreIntegration, parseDatastorePolicy, refreshPublishedPaths, refreshPrivatePublishedPaths, type DatastorePolicy } from "./datastore.ts";
 import { formatTelegramToolActivity } from "./activity.ts";
 import { TelegramMarkdownProjector } from "./markdown-projector.ts";
 import {
@@ -869,7 +869,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				...(config.groupChat && groupApi ? { groupChat: { config: config.groupChat, api: groupApi } } : {}),
 				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
 				mediaProjector,
-				requestLexicalRefresh: (signal, paths) => refreshPublishedPaths(datastoreClient, datastorePolicy.store, integration.available() ? paths : undefined, signal, integration.available()),
+				requestLexicalRefresh: (signal, paths) => refreshPrivatePublishedPaths(datastoreClient, datastorePolicy.store, paths, signal, integration.available()),
 				resolveAgentLabel: config.agentLabel === undefined
 					? (signal) => api.getBotFirstName(signal ?? requests.signal)
 					: undefined,

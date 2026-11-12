@@ -229,7 +229,7 @@ and send a parent-owned AbortSignal plus deadline through the RPC envelope.
 Timeout and shutdown abort owned backend work, reject the caller, and discard
 late replies. The datastore still owns search/index validation and atomic refresh.
 
-After successful Markdown publication, the written relative paths are sent as a metadata refresh and then a lexical refresh. Requests are coalesced. They are sent only while the exact optional integration is active, never queued against an absent service. An absent datastore does not block transport or the timeline. Accepted datastore semantic-refresh scheduling remains
+After successful Markdown publication, the written relative paths are sent as a metadata refresh and then a lexical refresh. Private projector paths remain relative to the projection parent, including `messages/`; the private consumer removes that prefix because its datastore root is the messages directory itself. Group publication paths are already relative to their dedicated store root. This translation changes notification scope, not canonical notes, manifest paths or citations. Requests are coalesced. They are sent only while the exact optional integration is active, never queued against an absent service. An absent datastore does not block transport or the timeline. Accepted datastore semantic-refresh scheduling remains
 owned by datastore; Telegram does not add workers, model downloads or semantic
 refresh loops.
 
