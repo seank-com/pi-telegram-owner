@@ -57,7 +57,10 @@ for the others.
    admission-time deadline. Photos are captured before dispatch.
 3. When Pi and delivery state permit, `dispatchNext()` records the work and sends
    its envelope/input to the existing Pi session. Lifecycle hooks start private
-   activity, update it from tool intents and capture the model's outcome.
+   activity, update it from tool intents and capture the model's outcome. A
+   `before_agent_start` event with no prompt property is not owner work and is
+   ignored. A user or queued `sendUserMessage` run still carries a prompt and
+   remains claimable.
 4. At `agent_settled`, `settle()` records and delivers the task's output to its
    pinned destination, or records its waiting/informational disposition. Activity
    cleanup follows the durable outcome. Projection reconciles the journal and

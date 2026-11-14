@@ -1191,6 +1191,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		});
 
 		pi.on("before_agent_start", async (event, ctx) => {
+			// Custom triggerTurn runs have no prompt property. They are not queued owner work.
+			if (!("prompt" in event)) return;
 			updateRecall();
 			await serialized(async () => {
 				if (!bridge) return;

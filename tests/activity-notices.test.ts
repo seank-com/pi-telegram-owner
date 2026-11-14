@@ -191,3 +191,17 @@ test("an activity message still being sent when a fast turn ends is recorded and
 	assert.ok(replyIndex >= 0);
 	assert.ok(host.calls.indexOf("delete:777") > replyIndex, "the late activity message is deleted after the reply");
 });
+
+test("a prompt-less custom run does not throw or claim an active job whose input was observed", async () => {
+	const host = harness();
+	await host.emit("session_start", { type: "session_start", reason: "startup" });
+	await host.batch([ownerText(1, 100, "first")]);
+	const prompt = host.prompts.at(-1)!;
+	await host.emit("input", { type: "input", source: "extension", text: prompt });
+	await host.emit("before_agent_start", { type: "before_agent_start", messageType: "custom", message: { role: "custom", customType: "other-extension", content: "wake up", timestamp: 0, display: false } });
+	assert.equal(host.calls.filter((call) => call.startsWith("activity:")).length, 0);
+	assert.equal(host.journal.records.some((record) => record.type === "dispatched"), false);
+	await host.emit("before_agent_start", { type: "before_agent_start", messageType: "user", prompt });
+	await waitFor(() => host.calls.some((call) => call.startsWith("activity:")));
+	assert.equal(host.journal.records.some((record) => record.type === "dispatched"), true);
+});
