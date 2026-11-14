@@ -1,3 +1,4 @@
+import type { InlineKeyboard } from "./selectors.ts";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, readFileSync } from "node:fs";
@@ -363,7 +364,7 @@ export class TelegramApiClient {
 		chatId: number,
 		fetchImpl: FetchLike = fetch as unknown as FetchLike,
 		requestDeadlineMs = 35_000,
-		allowedUpdates: readonly string[] = ["message"],
+		allowedUpdates: readonly string[] = ["message", "callback_query"],
 	) {
 		this.#token = token;
 		this.chatId = chatId;
@@ -564,7 +565,7 @@ export class TelegramApiClient {
 		}
 	}
 
-	async editMessageText(messageId: string, text: string, signal?: AbortSignal): Promise<void> {
+	async editMessageText(messageId: string, text: string, signal?: AbortSignal, keyboard?: InlineKeyboard): Promise<void> {
 		const numericMessageId = Number(messageId);
 		if (!Number.isSafeInteger(numericMessageId) || numericMessageId <= 0) throw new Error("Invalid Telegram message ID");
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
@@ -572,7 +573,7 @@ export class TelegramApiClient {
 			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/editMessageText`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ chat_id: this.chatId, message_id: numericMessageId, text }),
+				body: JSON.stringify({ chat_id: this.chatId, message_id: numericMessageId, text, reply_markup: keyboard }),
 				signal: deadline.signal,
 			});
 			const payload = (await response.json()) as { ok?: boolean };
@@ -584,6 +585,21 @@ export class TelegramApiClient {
 		} finally {
 			deadline.close();
 		}
+	}
+
+	async answerCallbackQuery(callbackQueryId: string, signal?: AbortSignal, text?: string): Promise<void> {
+		if (typeof callbackQueryId !== "string" || callbackQueryId.length === 0 || callbackQueryId.length > 256) throw new Error("Invalid Telegram callback query ID");
+		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
+		try {
+			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/answerCallbackQuery`, {
+				method: "POST", headers: { "content-type": "application/json" },
+				body: JSON.stringify({ callback_query_id: callbackQueryId, text: text?.slice(0, 200) }), signal: deadline.signal,
+			});
+			const payload = await response.json() as { ok?: boolean };
+			if (!response.ok || payload.ok !== true) throw new Error(`Telegram answerCallbackQuery failed (HTTP ${response.status ?? "unknown"})`);
+		} catch (error) {
+			throw new Error(sanitizeError(error, this.#token));
+		} finally { deadline.close(); }
 	}
 
 	async deleteMessage(messageId: string, signal?: AbortSignal): Promise<void> {
@@ -608,7 +624,7 @@ export class TelegramApiClient {
 		}
 	}
 
-	async sendMessage(text: string, replyToMessageId?: number, signal?: AbortSignal, format: "HTML" | "plain" = "plain"): Promise<string> {
+	async sendMessage(text: string, replyToMessageId?: number, signal?: AbortSignal, format: "HTML" | "plain" = "plain", keyboard?: InlineKeyboard): Promise<string> {
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
 		try {
 			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/sendMessage`, {
@@ -618,6 +634,7 @@ export class TelegramApiClient {
 					chat_id: this.chatId,
 					text,
 					reply_to_message_id: replyToMessageId,
+					reply_markup: keyboard,
 					parse_mode: format === "HTML" ? "HTML" : undefined,
 				}),
 				signal: deadline.signal,

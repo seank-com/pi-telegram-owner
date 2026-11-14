@@ -4,11 +4,19 @@ export const TELEGRAM_OWNER_COMMANDS = [
 	{ name: "stop", description: "Stop the current run." },
 	{ name: "compact", description: "Compact the current session context." },
 	{ name: "new", description: "Start a fresh session." },
+	{ name: "save", description: "Save this project's model and thinking defaults." },
+] as const;
+
+// Selectors are advertised here but handled before durable ordinary-command admission.
+const advertisedCommands = [
+	...TELEGRAM_OWNER_COMMANDS,
+	{ name: "model", description: "Choose the active model." },
+	{ name: "thinking", description: "Choose the thinking level." },
 ] as const;
 
 export type TelegramOwnerCommandName = (typeof TELEGRAM_OWNER_COMMANDS)[number]["name"];
 export interface TelegramBotCommand {
-	command: TelegramOwnerCommandName;
+	command: (typeof advertisedCommands)[number]["name"];
 	description: string;
 }
 export type ParsedTelegramOwnerCommand =
@@ -19,7 +27,7 @@ const commandNames = new Set<string>(TELEGRAM_OWNER_COMMANDS.map((command) => co
 
 /** Exact payload source for idempotent server-side menu reconciliation. */
 export function telegramOwnerMenuCommands(): TelegramBotCommand[] {
-	return TELEGRAM_OWNER_COMMANDS.map(({ name, description }) => ({ command: name, description }));
+	return advertisedCommands.map(({ name, description }) => ({ command: name, description }));
 }
 
 /** Parses only exact, argument-free private-chat commands. */
@@ -37,7 +45,7 @@ export function parseTelegramOwnerCommand(text: string): ParsedTelegramOwnerComm
 export function telegramOwnerHelpText(): string {
 	return [
 		"Available commands:",
-		...TELEGRAM_OWNER_COMMANDS.map((command) => `/${command.name} - ${command.description}`),
+		...advertisedCommands.map((command) => `/${command.name} - ${command.description}`),
 	].join("\n");
 }
 

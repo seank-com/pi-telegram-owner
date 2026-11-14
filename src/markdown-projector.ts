@@ -25,6 +25,7 @@ export interface ProjectionResult {
 	projected: number;
 	unchanged: number;
 	deferred: number;
+	paths: string[];
 }
 
 export interface MarkdownImportItem {
@@ -915,7 +916,7 @@ export class TelegramMarkdownProjector {
 		try { lock = await PollerLock.acquire(lockPath, process.pid, this.#pidState, this.#bootIdentity); }
 		catch (error) { throw new ArchiveLockedError((error as Error).message); }
 		const pendingCommits: Extract<JournalRecord, { type: "projection_committed" }>[] = [];
-		const result: ProjectionResult = { projected: 0, unchanged: 0, deferred: built.deferred.length };
+		const result: ProjectionResult = { projected: 0, unchanged: 0, deferred: built.deferred.length, paths: [] };
 		try {
 			await removeStaleManifestTemps(stateRoot);
 			const manifestPath = join(stateRoot, "manifest.json");
@@ -959,6 +960,7 @@ export class TelegramMarkdownProjector {
 				await atomicWrite(manifestPath, `${canonical(manifest)}\n`);
 				pendingCommits.push({ type: "projection_committed", jobId: candidate.jobId, direction: candidate.direction, messageId: candidate.messageId, contentRevision, contentSha256: rendered.contentSha256, metadataRevision, metadataSha256: rendered.metadataSha256, timestamp: new Date().toISOString() });
 				result.projected += 1;
+				result.paths.push(relativePath);
 			}
 		} finally {
 			await lock.release();

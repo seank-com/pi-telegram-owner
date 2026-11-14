@@ -3,10 +3,11 @@ import { mkdir, open, readFile, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
+import type { SelectorRecord } from "./selectors.ts";
 import { parseTelegramOwnerCommand, type TelegramOwnerCommandName } from "./commands.ts";
 import { createTelegramTransportPlan, MAX_TELEGRAM_CHUNKS, TELEGRAM_HTML_LIMIT, type TelegramTransportPlan } from "./format.ts";
 
-export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported" | "group";
+export type UpdateDisposition = "accepted" | "unauthorized" | "unsupported" | "group" | "local";
 
 export interface TelegramImageRef {
 	fileId: string;
@@ -66,9 +67,17 @@ export interface TelegramChatMemberUpdate {
 	new_chat_member: { status: string; user: TelegramUser };
 }
 
+export interface TelegramCallbackQuery {
+	id: string;
+	from: { id: number };
+	message?: { message_id: number; chat: { id: number; type: string } };
+	data?: string;
+}
+
 export interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
 	chat_member?: TelegramChatMemberUpdate;
 	my_chat_member?: TelegramChatMemberUpdate;
 }
@@ -216,6 +225,7 @@ export interface TurnOutcome {
 
 export type JournalRecord =
 	| TaskRecord
+	| SelectorRecord
 	| ({ type: "work_item"; schemaVersion: 1 } & WorkItem)
 	| { type: "turn_failed"; jobId: string; code: TurnFailureCode; detail?: string; timestamp: string }
 	/** The turn responded with a telegram_group_send request replying to its own message; its final reply is not posted. */
@@ -901,6 +911,10 @@ export class TelegramOwnerBridge {
 		return this.records;
 	}
 
+	appendSelectorRecord(record: SelectorRecord): Promise<void> {
+		return this.append(record);
+	}
+
 	appendArchiveRecord(record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>): Promise<void> {
 		return this.append(record);
 	}
@@ -944,7 +958,7 @@ export class TelegramOwnerBridge {
 		return [...this.records].reverse().find((record): record is Extract<JournalRecord, { type: "update" }> => record.type === "update" && record.jobId === jobId);
 	}
 
-	private async addTextToBatch(job: Job): Promise<void> {
+	private async addTextToBatch(job: Job): Promise<string> {
 		const now = this.now();
 		let open = this.latestOpenBatch();
 		if (open) {
@@ -960,18 +974,44 @@ export class TelegramOwnerBridge {
 		}
 		const readyAt = new Date(now + this.inboundQuietWindowMs).toISOString();
 		if (!open) {
-			await this.append({ type: "inbound_batch", schemaVersion: 1, batchId: randomUUID(), revision: 1, state: "open", openedAt: new Date(now).toISOString(), readyAt, memberJobIds: [job.jobId], messageIds: [job.messageId], segmentSha256: [sha256(job.text)], boundaries: [{ start: 0, end: job.text.length }], text: job.text, finalMessageId: job.messageId });
-			return;
+			const batchId = randomUUID();
+			await this.append({ type: "inbound_batch", schemaVersion: 1, batchId, revision: 1, state: "open", openedAt: new Date(now).toISOString(), readyAt, memberJobIds: [job.jobId], messageIds: [job.messageId], segmentSha256: [sha256(job.text)], boundaries: [{ start: 0, end: job.text.length }], text: job.text, finalMessageId: job.messageId });
+			return batchId;
 		}
 		const start = open.text.length + 2;
 		await this.append({ ...open, revision: open.revision + 1, readyAt, memberJobIds: [...open.memberJobIds, job.jobId], messageIds: [...open.messageIds, job.messageId], segmentSha256: [...open.segmentSha256, sha256(job.text)], boundaries: [...open.boundaries, { start, end: start + job.text.length }], text: `${open.text}\n\n${job.text}`, finalMessageId: job.messageId });
+		return open.batchId;
 	}
 
-	async ingestBatch(updates: TelegramUpdate[]): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number }> {
+	/** Moves the full quiet-window origin to now for batches this poll created or extended. Sealed history is left closed. */
+	async rearmQuietDeadline(batchIds: readonly string[]): Promise<void> {
+		if (this.inboundQuietWindowMs <= 0 || batchIds.length === 0) return;
+		const readyAt = new Date(this.now() + this.inboundQuietWindowMs).toISOString();
+		const seen = new Set<string>();
+		for (const batchId of batchIds) {
+			if (seen.has(batchId)) continue;
+			seen.add(batchId);
+			const latest = this.latestBatch(batchId);
+			if (!latest || latest.state !== "open" || latest.readyAt === readyAt) continue;
+			await this.append({ ...latest, revision: latest.revision + 1, readyAt });
+		}
+	}
+
+	async ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number; touchedBatchIds: string[] }> {
 		const seen = new Set(this.records.filter((r) => r.type === "update").map((r) => r.updateId));
+		const touchedBatchIds: string[] = [];
 		let acceptedModelInputCount = 0;
 		for (const update of updates) {
-			if (seen.has(update.update_id)) continue;
+			if (seen.has(update.update_id)) {
+				// Even redelivered callback queries need an answer to clear the spinner.
+				if (update.callback_query) await local?.(update);
+				continue;
+			}
+			if (await local?.(update)) {
+				await this.append({ type: "update", schemaVersion: 2, updateId: update.update_id, disposition: "local", timestamp: new Date(this.now()).toISOString() });
+				seen.add(update.update_id);
+				continue;
+			}
 			const message = update.message;
 			let disposition: UpdateDisposition;
 			let image: TelegramImageRef | undefined;
@@ -1002,12 +1042,12 @@ export class TelegramOwnerBridge {
 			if (accepted) {
 				const job: Job = { jobId: jobId!, updateId: update.update_id, messageId: message!.message_id, text, telegramDate: message!.date, images: image ? [image] : [], command };
 				if (!command) acceptedModelInputCount += 1;
-				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) await this.addTextToBatch(job);
+				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) touchedBatchIds.push(await this.addTextToBatch(job));
 				else await this.sealOpenBatch();
 			}
 			seen.add(update.update_id);
 		}
-		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount };
+		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount, touchedBatchIds };
 	}
 
 	private classifyGroup(update: TelegramUpdate): GroupUpdatePayload | undefined {
@@ -1124,6 +1164,12 @@ export class TelegramOwnerBridge {
 
 	async recordActivityCleared(jobId: string, messageId: string, destination?: 'private' | 'group'): Promise<void> {
 		await this.append({ type: "activity_cleared", jobId, messageId, ...(destination?{destination}:{}) });
+	}
+
+	/** Marks a phase notice finished so existing activity cleanup can delete and recover it. */
+	async appendPhaseRelease(jobId: string): Promise<void> {
+		if (this.records.some((record) => (record.type === "reply_sent" || record.type === "interrupted" || record.type === "turn_finished") && record.jobId === jobId)) return;
+		await this.append({ type: "interrupted", jobId, reason: "Ephemeral phase notice finished" });
 	}
 
 	private openActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {

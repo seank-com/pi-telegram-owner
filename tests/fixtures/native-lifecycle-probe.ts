@@ -31,11 +31,10 @@ const usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 async function until(predicate: () => boolean) {
-	const deadline = Date.now() + 10000;
 	while (!predicate()) {
 		assert.ok(
-			Date.now() < deadline,
-			"native lifecycle did not settle: " +
+			[...fixtures.values()].every((f) => f.errors.length === 0),
+			"native lifecycle reported a fixture failure: " +
 				JSON.stringify(
 					[...fixtures.values()].map((f) => ({
 						key: f.key,

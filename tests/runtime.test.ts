@@ -56,13 +56,20 @@ function accepted(jobId: string, updateId: number): JournalRecord {
 	};
 }
 
-async function waitFor(predicate: () => boolean, timeout = 1_000): Promise<void> {
-	const deadline = Date.now() + timeout;
+async function waitFor(predicate: () => boolean): Promise<void> {
 	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error("condition timed out");
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
 }
+
+test("fixture readiness waits for completion despite a wall-clock jump", async (t) => {
+	let clock = 0;
+	t.mock.method(Date, "now", () => clock += 86_400_000);
+	let ready = false;
+	setImmediate(() => { ready = true; });
+	await waitFor(() => ready);
+	assert.equal(ready, true);
+});
 
 const TEST_BOOT: BootIdentity = { id: "test-boot-current", startedAtMs: 1 };
 const testBoot = () => TEST_BOOT;
@@ -83,7 +90,7 @@ async function writeGuardOwner(
 	return path;
 }
 
-test("Telegram owner menu reconciliation registers five private-chat commands and clears the group fallback", async () => {
+test("Telegram owner menu reconciliation registers eight private-chat commands and clears the group fallback", async () => {
 	const calls: Array<{ url: string; init: RequestInit }> = [];
 	const api = new TelegramApiClient("menu-secret", CHAT, async (url, init) => {
 		calls.push({ url, init: init as RequestInit });
@@ -104,6 +111,9 @@ test("Telegram owner menu reconciliation registers five private-chat commands an
 		{ command: "stop", description: "Stop the current run." },
 		{ command: "compact", description: "Compact the current session context." },
 		{ command: "new", description: "Start a fresh session." },
+		{ command: "save", description: "Save this project's model and thinking defaults." },
+		{ command: "model", description: "Choose the active model." },
+		{ command: "thinking", description: "Choose the thinking level." },
 	]);
 });
 
@@ -238,7 +248,7 @@ test("Telegram API uses long-poll, typing, and sanitized sendMessage payloads", 
 		return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: messageId } }; } };
 	});
 	await api.getUpdates(90);
-	assert.deepEqual(requests[0]?.body, { offset: 91, timeout: 25, allowed_updates: ["message"] });
+	assert.deepEqual(requests[0]?.body, { offset: 91, timeout: 25, allowed_updates: ["message", "callback_query"] });
 	assert.ok(requests[0]?.signal);
 	await api.sendChatAction();
 	assert.equal(requests[1]?.url.endsWith("/sendChatAction"), true);
@@ -1512,7 +1522,7 @@ test("the durable reply precedes activity cleanup and delete failure is best eff
 		toolName: "bash",
 		args: { command: "do-not-leak --token hidden" },
 	});
-	await waitFor(() => calls.includes("edit:Inspect the persisted state safely"), 1_500);
+	await waitFor(() => calls.includes("edit:Inspect the persisted state safely"));
 	assert.equal(calls.some((call) => call.includes("do-not-leak") || call.includes("hidden")), false);
 	await emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: "done" }] });
 	await emit("agent_settled", { type: "agent_settled" });

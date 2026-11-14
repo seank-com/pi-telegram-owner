@@ -52,7 +52,7 @@ export interface GroupRuntimeOptions {
 	onError(error: unknown): void;
 	onStatus?(): void;
 	/** The shared journal gained entries; group search indexes may need a refresh. */
-	onJournalChanged?(): void;
+	onJournalChanged?(paths?: readonly string[]): void;
 	/** True when nothing is running, queued, being collected or awaiting delivery. */
 	isIdle?(): boolean;
 	/** Posts a coordination message to a peer; undefined when it cannot be reached. */
@@ -797,7 +797,7 @@ export class GroupRuntime {
 		}
 		const recorded=await this.options.journal.recordMessage(message, this.self!.username);
 		if(recorded.outcome==='conflict')throw new Error('Conflicting accepted group publication');
-		this.options.onJournalChanged?.();
+		this.options.onJournalChanged?.(recorded.paths);
 		if(post.work?.kind==='reply') await bridge?.completeObligation(post.work.requestId,post.work.recipientBotId,post.work.disposition);
 		const peers = new Set<GroupAgentConfig>();
 		if(post.work){

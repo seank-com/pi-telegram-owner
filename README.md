@@ -1,12 +1,10 @@
 # pi-telegram-owner
-A simple extension for Pi that allows and agent to chat with it's owner over Telegram
-
 A standalone Pi extension for one verified Telegram owner in a private chat:
 transport, commands, protected canonical Markdown archive, photos and chronological
 `telegram_timeline`. Datastore and observability are optional integrations.
 
 Build with Node 24.14.1+, `npm ci`, then `npm run build`. The manifest loads only
-`dist/index.js`. Pi and TypeBox are host peers; the package does not install a
+`dist/index.js`. Pi, pi-ai and TypeBox are host peers; the package does not install a
 second Pi runtime. Stock Pi 0.87.1 and the explicitly tested existing patched
 0.87.1 artifact are the acceptance targets; other versions are unverified.
 
@@ -22,6 +20,21 @@ bot token environment variable. Never commit a token. Configuration absence
 registers tools/commands but starts no poller and writes no state.
 See [setup](docs/setup.md) for configuration and CLI arguments.
 
+Private-owner `/model` and `/thinking` open local inline selectors without an
+agent turn. Choices respect the authenticated catalog, session model scope and
+active-model thinking capabilities. Both commands appear in `/help` and the
+reconciled private-chat command menu alongside `/help`, `/status`, `/stop`,
+`/compact`, `/new` and `/save`; they can also be typed directly.
+See [local selectors](docs/setup.md#local-model-and-thinking-selectors) for
+expiry, recovery and host requirements.
+
+`/save` snapshots the current provider, model and thinking level into that
+project's `.pi/settings.json`, preserving unrelated settings and other projects.
+It also records the current model's thinking override so inherited defaults do
+not undo the choice. It does not change shared profile defaults, call a model or
+reload Pi. Saved defaults are read on the next start; resumed sessions retain
+their own choices. See [project preference save](docs/setup.md#save-project-preferences).
+
 Optionally, an agent can share an owner-controlled Telegram group with other
 agents. Every message in the room is recorded in one shared journal; agents
 send explicit Request, Reply and Notify messages. Requests name explicit
@@ -32,7 +45,9 @@ Ephemeral queued/thinking/tool status appears only in each agent's private owner
 chat, including for group work; actual group replies remain in the group.
 An unaddressed owner message is claimed by whichever agent is free. A local queue endpoint on `127.0.0.1` lets
 automation running under the same account queue owner-authority instructions.
-See [design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
+See [group design](docs/design.md#group-chat) and [setup](docs/setup.md#group-chat).
+For the implementation map and normal/control request paths, start with
+[Module map](docs/design.md#module-map) and [Main flows](docs/design.md#main-flows).
 
 The optional `datastore` object selects `mode: "auto"` (default), `"off"`, or
 `"required"`, and an exact `store` (default `"telegram"`). Auto enables recall
@@ -69,7 +84,10 @@ native Node programs without loading Pi. Pure helpers are exported as `/format`,
 
 Validation commands: `npm run check`, `npm test`, `npm run build`,
 `npm pack --dry-run`, `npm run test:package`. Default tests need no companion or
-real Telegram. Explicit composition checks use actual candidate tarballs:
+real Telegram. Qualification waits for completion, cancellation or expected
+fixture state, without a wall-clock pass/fail deadline on tests or child commands.
+Runtime/protocol timing contracts are exercised separately. Explicit composition
+checks use actual candidate tarballs:
 
 ```bash
 DATASTORE_TARBALL=/path/to/datastore.tgz OBSERVABILITY_TARBALL=/path/to/observability.tgz \
@@ -86,10 +104,13 @@ unchanged. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
 files. `npm run check:private -- --all` checks every staged file, including
 unchanged ones.
 
+Existing-branch pre-push scans exclude history already in the local `origin/main`
+tracking ref. Feature commit messages and added lines outside that baseline remain
+checked. New-branch scans still exclude all known remote history.
+
 Public README/MIT history and extracted implementation attribution are preserved.
 Only compiled code/declarations, generic docs, README, LICENSE and metadata ship.
 
 Archive/control schemas use `pi-telegram-owner/<kind>/v1`. The boundary requires
-an explicit session list and matching mode. This unpublished contract has no
-legacy aliases; reuse existing Telegram exports with fresh import controls and
-a separate output archive as described in [setup](docs/setup.md).
+an explicit session list and matching mode. See [setup](docs/setup.md) for source
+controls, dry-run review and publication.

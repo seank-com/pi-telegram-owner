@@ -21,6 +21,7 @@ import {
 	type TelegramUpdate,
 } from "../src/core.ts";
 import { createTelegramOwnerExtension } from "../src/index.ts";
+import { LongPollSource } from "../src/runtime.ts";
 
 const OWNER = 7;
 const CHAT = 70;
@@ -606,29 +607,43 @@ test("extension lifecycle stops the mock source and blocks session replacement d
 	assert.equal(commands.has("telegram-status"), true);
 });
 
-test("quiet timer durably seals once during a busy turn and idle settlement dispatches later", async () => {
-	type Handler = (event: any, ctx: ExtensionContext) => unknown;
-	const handlers = new Map<string, Handler[]>(); let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined; let injected = ""; let idle = false;
-	const pi = { on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerCommand() {}, registerTool() {}, sendUserMessage(text: string) { injected = text; } } as unknown as ExtensionAPI;
-	const journal = new MemoryJournal();
-	createTelegramOwnerExtension({ dependencies: { journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: 100, source: { async start(handler) { onBatch = handler; return async () => undefined; } }, async sendReply() { return "1"; } } })(pi);
-	const ctx = { isIdle: () => idle, sessionManager: { getSessionId: () => "session-busy" }, ui: { setStatus: () => undefined, notify: () => undefined } } as unknown as ExtensionContext;
-	const emit = async (name: string, event: object) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
-	await emit("session_start", { type: "session_start", reason: "startup" });
-	await onBatch?.([textUpdate(50, "wait for idle")]);
-	await new Promise((resolve) => setTimeout(resolve, 140));
-	const batches = journal.records.filter((record) => record.type === "inbound_batch");
-	assert.equal(batches.at(-1)?.state, "sealed");
-	assert.equal(batches.length, 2);
-	assert.equal(journal.records.some((record) => record.type === "dispatch_requested"), false);
-	const recordCount = journal.records.length;
-	await new Promise((resolve) => setTimeout(resolve, 40));
-	assert.equal(journal.records.length, recordCount, "expired busy timer must not spin or append repeatedly");
-	idle = true;
-	await emit("agent_settled", { type: "agent_settled" });
-	assert.match(injected, /^\[telegram-batch:[0-9a-f-]{36}\]\nwait for idle$/);
-	assert.equal(journal.records.filter((record) => record.type === "inbound_batch").at(-1)?.state, "dispatching");
-	await emit("session_shutdown", { type: "session_shutdown", reason: "test" });
+// Owner-approved safety cap for this fixture only; not a production deadline.
+test("quiet timer durably seals once during a busy turn and idle settlement dispatches later", { timeout: 600_000 }, async t => {
+	for (const expiredBeforeArm of [false, true]) {
+		await t.test(expiredBeforeArm ? "window expires during journal admission" : "window expires after timer admission", async sub => {
+			sub.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_700_000_000_000 });
+			const quietWindow = 100;
+			type Handler = (event: any, ctx: ExtensionContext) => unknown;
+			const handlers = new Map<string, Handler[]>(); let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined; let injected = ""; let idle = false;
+			const pi = { on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerCommand() {}, registerTool() {}, sendUserMessage(text: string) { injected = text; } } as unknown as ExtensionAPI;
+			const journal = new MemoryJournal(), append = journal.append.bind(journal);
+			journal.append = async record => {
+				await append(record);
+				if (expiredBeforeArm && record.type === "inbound_batch" && record.state === "open") sub.mock.timers.tick(quietWindow);
+			};
+			createTelegramOwnerExtension({ dependencies: { journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: quietWindow, source: { async start(handler) { onBatch = handler; return async () => undefined; } }, async sendReply() { return "1"; } } })(pi);
+			const ctx = { isIdle: () => idle, sessionManager: { getSessionId: () => "session-busy" }, ui: { setStatus: () => undefined, notify: () => undefined } } as unknown as ExtensionContext;
+			const emit = async (name: string, event: object) => { sub.signal.throwIfAborted(); for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
+			sub.after(async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown", reason: "test" }, ctx); });
+			await emit("session_start", { type: "session_start", reason: "startup" });
+			await onBatch?.([textUpdate(50, "wait for idle")]);
+			if (expiredBeforeArm) assert.equal(journal.records.filter(record => record.type === "inbound_batch").at(-1)?.state, "open", "admission delay does not consume the post-maintenance deadline");
+			sub.mock.timers.tick(quietWindow);
+			// The timer enqueues resolved in-memory journal work. Drain its microtasks,
+			// not a wall-clock polling window or a loop waiting indefinitely for success.
+			await new Promise(resolve => setImmediate(resolve)); sub.signal.throwIfAborted();
+			const batches = journal.records.filter(record => record.type === "inbound_batch");
+			assert.equal(batches.at(-1)?.state, "sealed");
+			assert.equal(journal.records.some(record => record.type === "dispatch_requested"), false);
+			const recordCount = journal.records.length;
+			sub.mock.timers.tick(quietWindow);
+			await new Promise(resolve => setImmediate(resolve)); sub.signal.throwIfAborted();
+			assert.equal(journal.records.length, recordCount, "expired busy timer must not spin or append repeatedly");
+			idle = true; await emit("agent_settled", { type: "agent_settled" });
+			assert.match(injected, /^\[telegram-batch:[0-9a-f-]{36}\]\nwait for idle$/);
+			assert.equal(journal.records.filter(record => record.type === "inbound_batch").at(-1)?.state, "dispatching");
+		});
+	}
 });
 
 test("explicit plain delivery preserves exact legacy journal behavior", async () => {
@@ -894,6 +909,138 @@ test("different-date arrival immediately closes the prior batch and queues a new
 	assert.equal(bridge.nextBatchReadyDelayMs, 4_000);
 	const created = journal.records.filter((record) => record.type === "inbound_batch" && record.revision === 1);
 	assert.deepEqual(created.map((record) => record.text), ["first", "separate"]);
+});
+
+test("post-maintenance rearm gives the full window and an unrelated call does not move it", async () => {
+	let now = 1_000;
+	const journal = new MemoryJournal();
+	const bridge = new TelegramOwnerBridge(journal, OWNER, CHAT, { now: () => now });
+	await bridge.initialize();
+	const created = await bridge.ingestBatch([textUpdate(1, "first", OWNER, CHAT, 100)]);
+	now = 3_640;
+	await bridge.rearmQuietDeadline(created.touchedBatchIds);
+	assert.equal(bridge.nextBatchReadyDelayMs, 4_000);
+	const readyAt = journal.records.filter((record) => record.type === "inbound_batch").at(-1);
+	assert.equal(readyAt && "readyAt" in readyAt ? readyAt.readyAt : undefined, new Date(7_640).toISOString());
+	await bridge.rearmQuietDeadline([]);
+	now = 4_000;
+	await bridge.ingestBatch([textUpdate(2, "intruder", 8, CHAT, 100)]);
+	await bridge.rearmQuietDeadline([]);
+	assert.equal(bridge.nextBatchReadyDelayMs, 3_640);
+	now = 7_640;
+	assert.equal((await bridge.dispatchNext("session", () => undefined))?.text, "first");
+	const dispatched = journal.records.filter((record) => record.type === "inbound_batch").at(-1)?.batchId;
+	await bridge.rearmQuietDeadline(dispatched ? [dispatched] : []);
+	assert.equal(journal.records.filter((record) => record.type === "inbound_batch").at(-1)?.state, "dispatching");
+});
+
+test("a restarted bridge honors the revised deadline and does not reopen dispatched history", async () => {
+	let now = 1_000;
+	const journal = new MemoryJournal();
+	const first = new TelegramOwnerBridge(journal, OWNER, CHAT, { now: () => now });
+	await first.initialize();
+	const created = await first.ingestBatch([textUpdate(1, "first", OWNER, CHAT, 100)]);
+	now = 2_000;
+	await first.rearmQuietDeadline(created.touchedBatchIds);
+	const restarted = new TelegramOwnerBridge(journal, OWNER, CHAT, { now: () => now });
+	await restarted.initialize();
+	assert.equal(restarted.nextBatchReadyDelayMs, 4_000);
+	now = 5_999;
+	assert.equal(await restarted.dispatchNext("session", () => undefined), undefined);
+	now = 6_000;
+	const job = await restarted.dispatchNext("session", () => undefined);
+	assert.equal(job?.text, "first");
+	const again = new TelegramOwnerBridge(journal, OWNER, CHAT, { now: () => now });
+	await again.initialize();
+	assert.equal(again.queueDepth, 0);
+	const latest = [...new Map(journal.records.filter((record) => record.type === "inbound_batch").map((record) => [record.batchId, record])).values()];
+	assert.equal(latest.some((record) => record.state === "open"), false);
+});
+
+test("6340ms of awaited poll maintenance does not split an already available same-date fragment", async (t) => {
+	const base = Date.parse("2026-01-01T12:00:00.000Z");
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: base });
+	const journal = new MemoryJournal();
+	const append = journal.append.bind(journal);
+	let delayed = false;
+	journal.append = async (record) => {
+		await append(record);
+		if (!delayed && record.type === "inbound_batch" && record.state === "open") {
+			delayed = true;
+			t.mock.timers.tick(6_340);
+		}
+	};
+	const date = base / 1000;
+	const pending = [textUpdate(1, "fragment one", OWNER, CHAT, date), textUpdate(2, "fragment two", OWNER, CHAT, date)];
+	let polls = 0;
+	let completeSecondBatch: () => void = () => undefined;
+	const secondBatchComplete = new Promise<void>((resolve) => { completeSecondBatch = resolve; });
+	let releasePoll: () => void = () => undefined;
+	const pollGate = new Promise<void>((resolve) => { releasePoll = resolve; });
+	const source = new LongPollSource({
+		async getUpdates(_cursor: number | undefined, signal: AbortSignal) {
+			polls += 1;
+			if (polls === 1) await pollGate;
+			if (pending.length) return [pending.shift()!];
+			return await new Promise<TelegramUpdate[]>((_resolve, reject) => {
+				if (signal.aborted) reject(signal.reason);
+				else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+			});
+		},
+	}, () => undefined);
+	type Handler = (event: any, ctx: ExtensionContext) => unknown;
+	const handlers = new Map<string, Handler[]>();
+	const pi = { on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerCommand() {}, registerTool() {}, sendUserMessage() {} } as unknown as ExtensionAPI;
+	createTelegramOwnerExtension({ dependencies: {
+		journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: 4_000,
+		source: { start: (onBatch, cursor) => source.start(async (updates) => {
+			const next = await onBatch(updates);
+			if (updates.some((update) => update.update_id === 2)) completeSecondBatch();
+			return next;
+		}, cursor) },
+		async sendReply() { return "sent"; },
+	} })(pi);
+	const ctx = { isIdle: () => true, sessionManager: { getSessionId: () => "session-6340" }, ui: { setStatus: () => undefined, notify: () => undefined } } as unknown as ExtensionContext;
+	t.after(async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown", reason: "test" }, ctx); });
+	for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+	releasePoll();
+	await secondBatchComplete;
+	assert.equal(pending.length, 0);
+	assert.ok(polls >= 2);
+	const latest = [...new Map(journal.records.filter((record) => record.type === "inbound_batch").map((record) => [record.batchId, record])).values()];
+	assert.equal(latest.length, 1);
+	assert.deepEqual(latest[0]?.messageIds, [10, 20]);
+	assert.equal(latest[0]?.state, "open");
+	assert.equal(Date.parse(latest[0]?.readyAt ?? ""), base + 6_340 + 4_000);
+});
+
+test("a queued-notice send does not consume the quiet window before the next poll", async (t) => {
+	const base = 1_700_000_000_000;
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: base });
+	const journal = new MemoryJournal([updateRecord("waiting", 1)]);
+	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
+	let activitySends = 0;
+	type Handler = (event: any, ctx: ExtensionContext) => unknown;
+	const handlers = new Map<string, Handler[]>();
+	const pi = { on(name: string, handler: Handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerCommand() {}, registerTool() {}, sendUserMessage() {} } as unknown as ExtensionAPI;
+	createTelegramOwnerExtension({ dependencies: {
+		journal, ownerUserId: OWNER, privateChatId: CHAT, inboundQuietWindowMs: 4_000,
+		source: { async start(handler) { onBatch = handler; return async () => undefined; } },
+		async sendReply() { return "1"; },
+		async sendActivity() {
+			activitySends += 1;
+			if (activitySends === 1) throw new Error("startup notice down");
+			t.mock.timers.tick(5_000);
+			return "notice-1";
+		},
+	} })(pi);
+	const ctx = { isIdle: () => false, sessionManager: { getSessionId: () => "session-notice" }, ui: { setStatus: () => undefined, notify: () => undefined } } as unknown as ExtensionContext;
+	t.after(async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown", reason: "test" }, ctx); });
+	for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+	await onBatch?.([textUpdate(2, "fragment", OWNER, CHAT, 100)]);
+	const latest = journal.records.filter((record) => record.type === "inbound_batch").at(-1);
+	assert.equal(latest?.state, "open");
+	assert.equal(Date.parse(latest && "readyAt" in latest ? latest.readyAt : ""), base + 5_000 + 4_000);
 });
 
 test("quiet scheduling ignores historical open revisions after a batch is sealed", async () => {

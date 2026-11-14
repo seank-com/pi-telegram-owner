@@ -256,10 +256,92 @@ missing from the shared journal are added, so repeating an import changes
 nothing. The importer takes the shared journal lock, so running agents need not
 be stopped.
 
+## Local model and thinking selectors
+
+In the configured owner's private chat, type exactly `/model` or `/thinking`
+without arguments. `/model` shows the current model and six choices per page.
+Model labels use `provider/model-id` so matching friendly names from different
+providers or aliases remain distinguishable. Choices are the intersection of
+Pi's session scope and authenticated available
+catalog; an empty session scope uses the available catalog. `/thinking` offers
+only levels supported by the active model, including `off` for non-reasoning
+models. If the active model is unavailable in scope, no levels are selectable.
+Current choices have a check mark. A selection edits that message with the
+confirmed result, host-adjusted thinking level, or a safe failure explanation.
+The callback acknowledgment only clears Telegram's spinner; it does not confirm
+a model/thinking change. Its network completion does not hold up `/stop` or later
+updates. Use the edited result or `/status` to check the outcome.
+
+Mutations are admitted only while idle, without an active Telegram job, queued
+host messages, compaction or session transition. Busy selections are rejected,
+not queued. Open a fresh picker after the agent settles. Pickers expire after
+ten minutes; only the latest 32 are retained. Pagination replaces the previous
+page's buttons. Model, thinking, scope, catalog or session changes invalidate
+existing selections. Restart also invalidates every button. Expired or rejected
+callbacks are answered, but never invoke a setter.
+
+The selectors use public Pi 0.87.1 `ExtensionContext.scopedModels`,
+`modelRegistry.getAvailable()`, `ExtensionAPI.setModel()`, `getThinkingLevel()`
+and `setThinkingLevel()`, plus pi-ai's `getSupportedThinkingLevels(model)`.
+The host's pi-ai peer must provide that helper (0.87.1+). Other host versions are
+unverified; missing context capabilities fail closed rather than guessing a
+catalog or pretending a change succeeded. Custom dependency injections must
+supply `selectorTransport` for keyboard send/edit and callback answers.
+
+Requests, selected display labels/model identity hashes, mutation starts and
+terminal outcomes are local transport-journal records, not jobs or model
+messages. An interrupted request is recorded as uncertain at startup and never
+replayed. Inspect `/status` and open a new picker before retrying. Failed or
+uncertain selector sends/edits are not automatically resent; the journal retains
+the outcome and delivery failure. Existing ordinary command replies keep their
+durable delivery/retry behavior.
+
+A cancelled external session switch/fork/tree navigation can leave selector
+mutations blocked because Pi has no public transition-cancelled notification.
+A fresh session start or a completed tree navigation clears that guard. Use
+`/new` only when replacing the conversation is intended; otherwise use the
+normal operator-approved session recovery procedure. The selector guard does
+not itself block ordinary commands or queues. The public host setter is not a
+global lock against independent local UI actions; admission is revalidated
+immediately before calling it. Avoid local
+model operations while a Telegram selection is in flight. Pi manual
+compaction aborts an active turn before its public `session_before_compact` hook,
+so the hook cannot prevent that earlier abort. Avoid manual Pi compaction while
+accepted Telegram work is active; this remains a host limitation.
+
+The private-chat command menu and `/help` advertise `/model` and `/thinking`
+alongside `/help`, `/status`, `/stop`, `/compact`, `/new` and `/save`. They can also be typed
+directly. Startup reconciliation and the menu CLI publish the same command list;
+menu visibility does not change selector ownership or idle-admission checks.
+
+## Save project preferences
+
+In the configured owner's private chat, `/save` without arguments snapshots the
+current provider, model and effective thinking level into the receiving project's
+`.pi/settings.json`. This is the project root captured when the transport starts,
+not a path supplied in a message or a later working-directory change.
+
+The command merges `defaultProvider`, `defaultModel`, `defaultThinkingLevel` and
+only the current `provider/model-id` entry in `modelThinkingLevels`. The last
+entry makes the saved level take precedence over an inherited per-model override.
+Other settings and other models' overrides are retained. Existing file permissions
+are preserved; publication uses a synced temporary file and atomic rename.
+Malformed settings or filesystem errors are reported rather than replacing an
+unreadable configuration with defaults.
+
+This uses Pi's documented [project configuration](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/configuration.md),
+not its global-default setters. No shared agent-profile settings, other project,
+model turn or current model/thinking state is changed. Saving does not reload Pi's
+cached settings. The saved defaults are read on the next Pi start; resuming an
+existing session still restores its session-recorded choices. Startup continues
+to honor the native model catalog, scopes and capabilities. An interrupted ordinary
+command is not automatically replayed; inspect the file before retrying an
+uncertain save.
+
 ## CLIs
 
 `pi-telegram-register-menu PROJECT_ROOT [--config-dir DIRECTORY]` reconciles the
-five-command owner menu for private chats using protected config. This contacts Telegram. Tests
+eight-command owner menu for private chats using protected config. This contacts Telegram. Tests
 intercept fetch with a synthetic fixture; no test contacts the service.
 
 ### Private archive import
@@ -355,13 +437,13 @@ All archive/control schemas use `pi-telegram-owner/<kind>/v1`: `source-set`,
 `archive-manifest`, `media-event`, `message`, `private-import-prepare`, and
 `boundary-candidates`; for the shared group root, `group-event` (journal entries),
 `group-message` (notes), `group-speaker-map`, `group-import-prepare`, and
-`group-import-report`. Earlier names and boundary shapes have no aliases in this unpublished package. Existing Telegram Desktop
-HTML and media exports can be reused. Regenerate the source manifest, speaker
-map and explicit boundary, then create a fresh dry-run checkpoint and publish
-to a fresh output directory. Keep the existing archive available for verification.
-Do not relabel old checkpoints or rewrite existing notes in place: their hashes
-bind the original metadata and plan. Preserve original Pi sessions and transport
-journals. These development changes do not migrate or activate live state.
+`group-import-report`. To import an existing Telegram Desktop HTML/media export
+into a separate archive, prepare controls in a new directory, review its source
+manifest, speaker map and explicit boundary, then create a matching dry-run
+checkpoint before committing to the chosen output directory. Keep any existing
+archive available for comparison. Checkpoints bind their original metadata and
+plan; do not relabel them or rewrite existing notes to make changed inputs pass.
+Preserve original Pi sessions and transport journals.
 
 Importer output reports counts and publication results. Repeating an accepted
 commit is idempotent; changed inputs require a new reviewed dry-run. Do not repair
