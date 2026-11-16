@@ -42,6 +42,7 @@ function createHarness(
 	const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
 	const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
 	const replies: Array<{ text: string; replyTo?: number }> = [];
+	const replyWaiters: Array<{ count: number; resolve: () => void }> = [];
 	const sentMessages: Array<{ content: any; options: any }> = [];
 	const activityEvents: string[] = [];
 	let activitySends = 0;
@@ -95,6 +96,7 @@ function createHarness(
 		},
 		async sendReply(text: string, replyTo?: number) {
 			replies.push({ text, replyTo });
+			for (const waiter of replyWaiters) if (replies.length >= waiter.count) waiter.resolve();
 			return String(replies.length);
 		},
 		async sendActivity(text: string, signal: AbortSignal = new AbortController().signal) {
@@ -167,6 +169,9 @@ function createHarness(
 		journal,
 		commands,
 		replies,
+		whenReplies(count: number): Promise<void> {
+			return replies.length >= count ? Promise.resolve() : new Promise((resolve) => { replyWaiters.push({ count, resolve }); });
+		},
 		sentMessages,
 		activityEvents,
 		ctx,
@@ -190,7 +195,10 @@ function createHarness(
 		},
 		async poll(updates: TelegramUpdate[]) {
 			assert.ok(onBatch, "source callback is installed");
-			return onBatch(updates);
+			const cursor = await onBatch(updates);
+			// Polling confirms admission; command execution now runs on the separate work pump.
+			await new Promise((resolve) => setImmediate(resolve));
+			return cursor;
 		},
 	};
 }
@@ -210,7 +218,7 @@ test("save snapshots this project's current preferences without inference, even 
 	const { h, path, root } = await saveHarness(t); h.setIdle(false); h.ctx.thinkingLevel = "off";
 	const other = join(root, "other"); await mkdir(join(other, ".pi"), { recursive: true });
 	const otherSettings = join(other, ".pi/settings.json"); await writeFile(otherSettings, '{"unchanged":true}'); h.ctx.cwd = other;
-	await h.poll([update(1, "/save")]);
+	await h.poll([update(1, "/save")]); await h.whenReplies(1);
 	const settings = JSON.parse(await readFile(path, "utf8"));
 	assert.equal(settings.defaultProvider, "test-provider"); assert.equal(settings.defaultModel, "test-model"); assert.equal(settings.defaultThinkingLevel, "off"); assert.equal(settings.sessionDir, "native-sessions");
 	assert.equal(settings.modelThinkingLevels["test-provider/test-model"], "off");
@@ -222,20 +230,20 @@ test("save snapshots this project's current preferences without inference, even 
 
 test("save rejects other senders, other chats and command arguments without changing settings", async t => {
 	const { h, path, body } = await saveHarness(t);
-	await h.poll([update(1, "/save", owner + 1), update(2, "/save", owner, privateChat + 1), update(3, "/save extra")]);
+	await h.poll([update(1, "/save", owner + 1), update(2, "/save", owner, privateChat + 1), update(3, "/save extra")]); await h.whenReplies(1);
 	assert.equal(await readFile(path, "utf8"), body); assert.equal(h.sentMessages.length, 0);
 	assert.equal(h.replies.length, 1); assert.match(h.replies[0].text, /Unsupported command/);
 });
 
 test("save reports invalid project JSON without overwriting it or starting a model turn", async t => {
 	const { h, path, body } = await saveHarness(t, "{invalid");
-	await h.poll([update(1, "/save")]);
+	await h.poll([update(1, "/save")]); await h.whenReplies(1);
 	assert.equal(await readFile(path, "utf8"), body); assert.match(h.replies[0].text, /^Save failed:/); assert.equal(h.sentMessages.length, 0);
 });
 
 test("save with no current model leaves project settings untouched", async t => {
 	const { h, path, body } = await saveHarness(t); h.ctx.model = undefined;
-	await h.poll([update(1, "/save")]);
+	await h.poll([update(1, "/save")]); await h.whenReplies(1);
 	assert.equal(await readFile(path, "utf8"), body); assert.match(h.replies[0].text, /nothing was saved/); assert.equal(h.sentMessages.length, 0);
 });
 
@@ -374,7 +382,7 @@ test("compact is idle-only, coalesces overlap, and completes through its callbac
 	assert.equal(harness.sentMessages.length, 1);
 });
 
-test("accepted /compact and /new emit working activity before the held host call, and a refusal does not", async () => {
+test("commands receive feedback before host work, while refused commands never claim an actionable phase", async () => {
 	const order: string[] = [];
 	const compacting = createHarness();
 	const recordCompact = compacting.ctx.compact;
@@ -384,15 +392,12 @@ test("accepted /compact and /new emit working activity before the held host call
 	};
 	await compacting.emit("session_start", { reason: "startup" });
 	await compacting.poll([update(70, "/compact")]);
-	assert.deepEqual(order, [
-		"send:Received /compact. Working on it. This is not proof compaction has started.",
-		"compact",
-	]);
+	assert.deepEqual(order, ["send:Received.", "edit:Compaction requested...", "compact"]);
 	assert.ok(compacting.compactOptions);
 	compacting.setIdle(false);
 	const beforeRefusal = compacting.activityEvents.length;
 	await compacting.poll([update(71, "/compact")]);
-	assert.equal(compacting.activityEvents.length, beforeRefusal);
+	assert.deepEqual(compacting.activityEvents.slice(beforeRefusal), ["send:Received.", "delete:activity-2"]);
 	assert.equal(compacting.replies.at(-1)?.text, "The agent is busy; /compact was not started.");
 
 	const replacing = createHarness();
@@ -400,12 +405,12 @@ test("accepted /compact and /new emit working activity before the held host call
 	const started = new Promise<{ cancelled: boolean }>((resolve) => { releaseNew = resolve; });
 	await replacing.emit("session_start", { reason: "startup" });
 	await replacing.poll([update(72, "/new")]);
-	assert.equal(replacing.activityEvents[0], "send:Received /new. Working on it. This is not proof a new session has started.");
+	assert.deepEqual(replacing.activityEvents.slice(0, 2), ["send:Received.", "edit:Starting new session..."]);
 	const jobId = String(replacing.sentMessages[0].content).split(":")[1];
 	const pending = replacing.commands.get("telegram-status")?.(`__new-session__:${jobId}`, {
 		...replacing.ctx,
 		newSession: () => {
-			assert.ok(replacing.activityEvents.some((event) => event.startsWith("send:Received /new")));
+			assert.ok(replacing.activityEvents.includes("edit:Starting new session..."));
 			return started;
 		},
 	});
@@ -440,7 +445,7 @@ test("command receipt age resets when Compacting is displayed and session replac
 	await harness.emit("session_start", { reason: "startup" });
 	await harness.poll([update(79, "/compact")]);
 	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
-	assert.match(harness.activityEvents.at(-1)!, /Working on it.* \[00:00:30\]$/);
+	assert.equal(harness.activityEvents.at(-1), "edit:Compaction requested... [00:00:30]");
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
 	assert.equal(harness.activityEvents.at(-1), "edit:Compacting");
 	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
@@ -464,10 +469,23 @@ test("a newer Compacting phase skips queued old timer edits behind an in-flight 
 	t.mock.timers.tick(90_000); await new Promise((resolve) => setImmediate(resolve));
 	release(); await retitling; await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), [
-		"edit:Received /compact. Working on it. This is not proof compaction has started. [00:00:30]", "edit:Compacting",
+		"edit:Compaction requested...", "edit:Compaction requested... [00:00:30]", "edit:Compacting",
 	]);
 	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+});
+
+test("a repeated displayed Compacting event does not wait for an elapsed-only edit", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness(); let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	t.after(async () => { release(); await harness.emit("session_shutdown", { reason: "test" }); });
+	await harness.emit("session_start", { reason: "startup" }); await harness.poll([update(810, "/compact")]);
+	await harness.emit("session_before_compact", { reason: "manual" });
+	harness.holdNextEdit(async () => { await held; }); t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	let finished = false; const duplicate = harness.emit("session_before_compact", { reason: "manual" }).then(() => { finished = true; });
+	await new Promise((resolve) => setImmediate(resolve)); assert.equal(finished, true);
+	release(); await duplicate;
 });
 
 test("finishing an automatic phase cancels its in-flight timer edit before deletion", async (t) => {
@@ -520,7 +538,7 @@ test("a failed compaction retitle keeps aging the actual visible receipt", async
 	harness.failNextEdits(1);
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
 	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(harness.activityEvents.at(-1), "edit:Received /compact. Working on it. This is not proof compaction has started. [00:01:00]");
+	assert.equal(harness.activityEvents.at(-1), "edit:Compaction requested... [00:01:00]");
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
 	assert.equal(harness.activityEvents.at(-1), "edit:Compacting");
 	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
@@ -531,14 +549,11 @@ test("session_before_compact shows Compacting before agent start and edits an ex
 	const harness = createHarness();
 	await harness.emit("session_start", { reason: "startup" });
 	await harness.poll([update(80, "/compact")]);
-	assert.equal(harness.activityEvents.length, 1);
+	assert.deepEqual(harness.activityEvents, ["send:Received.", "edit:Compaction requested..."]);
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
-	assert.deepEqual(harness.activityEvents, [
-		"send:Received /compact. Working on it. This is not proof compaction has started.",
-		"edit:Compacting",
-	]);
+	assert.deepEqual(harness.activityEvents, ["send:Received.", "edit:Compaction requested...", "edit:Compacting"]);
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
-	assert.equal(harness.activityEvents.length, 2, "a repeated start does not send a second indicator");
+	assert.equal(harness.activityEvents.length, 3, "a repeated start does not send a second indicator");
 
 	const automatic = createHarness();
 	await automatic.emit("session_start", { reason: "startup" });
@@ -600,7 +615,8 @@ test("a reused extension accepts compact and automatic compaction after shutdown
 	await harness.emit("session_start", { reason: "new" });
 	await harness.poll([update(89, "/compact")]);
 	assert.equal(harness.compactCalls, callsBeforeReuse + 1);
-	assert.ok(harness.activityEvents.filter((event) => event.startsWith("send:Received /compact")).length >= 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "send:Received.").length, 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "edit:Compaction requested...").length, 2);
 	harness.compactOptions.onComplete({});
 	await harness.emit("session_before_compact", { reason: "threshold", willRetry: false });
 	assert.ok(harness.activityEvents.some((event) => event === "send:Compacting" || event === "edit:Compacting"));
@@ -618,7 +634,8 @@ test("a preceding generation's receipt does not block the next session", async (
 	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")), "preceding receipt is cleaned from the journal");
 	await harness.poll([update(91, "/compact")]);
 	assert.equal(harness.compactCalls, 2);
-	assert.ok(harness.activityEvents.filter((event) => event.startsWith("send:Received /compact")).length >= 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "send:Received.").length, 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "edit:Compaction requested...").length, 2);
 });
 
 test("a failed compaction retitle is retried while the receipt is still the visible text", async () => {
@@ -627,9 +644,9 @@ test("a failed compaction retitle is retried while the receipt is still the visi
 	await harness.poll([update(85, "/compact")]);
 	harness.failNextEdits(1);
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
-	assert.equal(harness.activityEvents.filter((event) => event.startsWith("edit:")).length, 0);
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), ["edit:Compaction requested..."]);
 	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
-	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), ["edit:Compacting"]);
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), ["edit:Compaction requested...", "edit:Compacting"]);
 });
 
 test("a failed activity send does not suppress compaction or its durable result", async () => {

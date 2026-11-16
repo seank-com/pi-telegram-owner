@@ -795,7 +795,7 @@ export interface TelegramActivityMessageOptions {
 	prefix?: string;
 }
 
-/** Owns the single ephemeral activity message for one confirmed Telegram job. */
+/** Owns the single ephemeral activity message for one durably admitted Telegram job. */
 export class TelegramActivityMessage {
 	private readonly jobId: string;
 	private readonly options: TelegramActivityMessageOptions;
@@ -803,6 +803,7 @@ export class TelegramActivityMessage {
 	private readonly controller = new AbortController();
 	private worker?: Promise<void>;
 	private messageId?: string;
+	private startRecorded = false;
 	private desired: string;
 	private step: string;
 	private renderStep: string;
@@ -820,6 +821,7 @@ export class TelegramActivityMessage {
 		this.step = this.initialText;
 		this.renderStep = this.initialText;
 		this.messageId = options.existingMessageId;
+		this.startRecorded = this.messageId !== undefined;
 		this.stepClock = new TelegramStepClock((suffix) => {
 			if (!this.acceptingUpdates || this.displayedStep === undefined || (this.worker && this.step !== this.displayedStep)) return;
 			this.renderStep = this.displayedStep;
@@ -836,14 +838,23 @@ export class TelegramActivityMessage {
 		return this.options.prefix ? `${this.options.prefix}\n${text}` : text;
 	}
 
-	update(text: string): void {
+	update(text: string, retryFailed = false): void {
 		if (!this.acceptingUpdates || !text) return;
 		const desired = this.withPrefix(text);
-		if (desired === this.step) return;
+		if (desired === this.step) {
+			if (!retryFailed || desired === this.displayedStep || (this.worker && this.renderStep === desired)) return;
+			if (!this.worker) this.attempted = "";
+		}
 		this.step = desired;
 		this.renderStep = desired;
 		this.desired = desired;
 		this.ensureWorker();
+	}
+
+	/** Waits for this substantive step's display attempt, not unrelated elapsed-only edits. */
+	async flush(): Promise<void> {
+		const step = this.step;
+		while (this.worker && this.step === step && (this.displayedStep !== step || !this.startRecorded)) await this.worker;
 	}
 
 	/** Stops further updates and leaves the message in place. Returns its ID, if one was sent. */
@@ -890,19 +901,21 @@ export class TelegramActivityMessage {
 		this.worker = worker;
 		void worker.finally(() => {
 			if (this.worker === worker) this.worker = undefined;
-			if (this.acceptingUpdates && this.messageId && this.desired !== this.attempted) this.ensureWorker();
+			if (this.acceptingUpdates && this.desired !== this.attempted) this.ensureWorker();
 		}).catch(() => undefined);
 	}
 
 	private async run(): Promise<void> {
 		if (!this.messageId) {
-			this.attempted = this.initialText;
+			const text = this.desired, step = this.renderStep;
+			this.attempted = text;
 			try {
-				// Never abort the first send: once Telegram may have posted it, its ID is needed to delete it later.
-				this.messageId = await this.options.send(this.initialText, new AbortController().signal);
+				// Ordinary first sends retain their IDs for cleanup; command sends use their phase signal.
+				this.messageId = await this.options.send(text, new AbortController().signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
-				this.markDisplayed(this.initialText);
+				this.markDisplayed(step);
 				await this.options.onStarted(this.jobId, this.messageId);
+				this.startRecorded = true;
 			} catch (error) {
 				this.fail(this.messageId ? "journal" : "send", error);
 				return;

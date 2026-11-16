@@ -702,6 +702,7 @@ export class TelegramOwnerBridge {
 	private turnOutcome?: TurnOutcome;
 	private stopped = false;
 	private appendTail: Promise<void> = Promise.resolve();
+	private batchTail: Promise<void> = Promise.resolve();
 
 	private readonly journal: Journal;
 	private readonly ownerUserId: number;
@@ -929,6 +930,13 @@ export class TelegramOwnerBridge {
 		return result;
 	}
 
+	/** Serialize batch revisions independently of slow reply/model operations. */
+	private batchWork<T>(work: () => Promise<T>): Promise<T> {
+		const result = this.batchTail.then(work);
+		this.batchTail = result.then(() => undefined, () => undefined);
+		return result;
+	}
+
 	private latestBatchRecords(): Map<string, Extract<JournalRecord, { type: "inbound_batch" }>> {
 		const latest = new Map<string, Extract<JournalRecord, { type: "inbound_batch" }>>();
 		for (const record of this.records) if (record.type === "inbound_batch") latest.set(record.batchId, record);
@@ -948,7 +956,11 @@ export class TelegramOwnerBridge {
 		if (open) await this.append({ ...open, revision: open.revision + 1, state: "sealed" });
 	}
 
-	async sealReadyBatches(): Promise<number> {
+	sealReadyBatches(): Promise<number> {
+		return this.batchWork(() => this.sealReadyBatchesNow());
+	}
+
+	private async sealReadyBatchesNow(): Promise<number> {
 		const ready = [...this.latestBatchRecords().values()].filter((batch) => batch.state === "open" && new Date(batch.readyAt).valueOf() <= this.now()).sort((a, b) => new Date(a.readyAt).valueOf() - new Date(b.readyAt).valueOf());
 		for (const batch of ready) await this.append({ ...batch, revision: batch.revision + 1, state: "sealed" });
 		return ready.length;
@@ -984,7 +996,11 @@ export class TelegramOwnerBridge {
 	}
 
 	/** Moves the full quiet-window origin to now for batches this poll created or extended. Sealed history is left closed. */
-	async rearmQuietDeadline(batchIds: readonly string[]): Promise<void> {
+	rearmQuietDeadline(batchIds: readonly string[]): Promise<void> {
+		return this.batchWork(() => this.rearmQuietDeadlineNow(batchIds));
+	}
+
+	private async rearmQuietDeadlineNow(batchIds: readonly string[]): Promise<void> {
 		if (this.inboundQuietWindowMs <= 0 || batchIds.length === 0) return;
 		const readyAt = new Date(this.now() + this.inboundQuietWindowMs).toISOString();
 		const seen = new Set<string>();
@@ -997,7 +1013,11 @@ export class TelegramOwnerBridge {
 		}
 	}
 
-	async ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number; touchedBatchIds: string[] }> {
+	ingestBatch(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>, onAccepted?: (job: Job) => void): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number; touchedBatchIds: string[] }> {
+		return this.batchWork(() => this.ingestBatchNow(updates, local, onAccepted));
+	}
+
+	private async ingestBatchNow(updates: TelegramUpdate[], local?: (update: TelegramUpdate) => Promise<boolean>, onAccepted?: (job: Job) => void): Promise<Recovery & { acceptedModelInput: boolean; acceptedModelInputCount: number; touchedBatchIds: string[] }> {
 		const seen = new Set(this.records.filter((r) => r.type === "update").map((r) => r.updateId));
 		const touchedBatchIds: string[] = [];
 		let acceptedModelInputCount = 0;
@@ -1042,11 +1062,17 @@ export class TelegramOwnerBridge {
 			if (accepted) {
 				const job: Job = { jobId: jobId!, updateId: update.update_id, messageId: message!.message_id, text, telegramDate: message!.date, images: image ? [image] : [], command };
 				if (!command) acceptedModelInputCount += 1;
-				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) touchedBatchIds.push(await this.addTextToBatch(job));
-				else await this.sealOpenBatch();
+				let batchId: string | undefined;
+				if (!command && !image && Boolean(message?.text?.trim()) && this.inboundQuietWindowMs > 0) {
+					batchId = await this.addTextToBatch(job);
+					touchedBatchIds.push(batchId);
+				} else await this.sealOpenBatch();
+				onAccepted?.(batchId ? { ...job, jobId: batchId, batchId } : job);
 			}
 			seen.add(update.update_id);
 		}
+		// Publish the post-admission deadline before another batch operation can seal.
+		await this.rearmQuietDeadlineNow(touchedBatchIds);
 		return { ...recover(this.records, this.now()), acceptedModelInput: acceptedModelInputCount > 0, acceptedModelInputCount, touchedBatchIds };
 	}
 
@@ -1229,17 +1255,23 @@ export class TelegramOwnerBridge {
 		return this.openActivities().find((activity) => activity.jobId === jobId && (destination === undefined || activity.destination === destination))?.messageId;
 	}
 
+	/** Includes receipts whose send failed, so transient feedback ownership can still be released. */
+	finishedFeedbackJobs(jobIds: Iterable<string>): Set<string> {
+		const terminal = new Set<string>();
+		for (const record of this.records) {
+			if (record.type === "reply_sent" || record.type === "interrupted" || record.type === "turn_finished") terminal.add(record.jobId);
+		}
+		return new Set([...jobIds].filter((id) => terminal.has(id) || this.taskState(this.itemFor(id)?.taskId ?? id)?.state === "completed"));
+	}
+
 	/** Open activities whose job no longer needs them: its reply was sent, or it ended without one. */
 	finishedActivities(): Array<{ jobId: string; messageId: string; destination: 'private' | 'group' }> {
-		const sent = new Set<string>();
-		const interrupted = new Set<string>();
-		for (const record of this.records) {
-			if (record.type === "reply_sent") sent.add(record.jobId);
-			else if (record.type === "interrupted" || record.type === 'turn_finished') interrupted.add(record.jobId);
-		}
-		// Interrupted execution has stopped even when its pinned failure notice awaits delivery.
-		return this.openActivities().filter((activity) => sent.has(activity.jobId) || interrupted.has(activity.jobId)||this.taskState(this.itemFor(activity.jobId)?.taskId??activity.jobId)?.state==='completed');
+		const activities = this.openActivities();
+		const finished = this.finishedFeedbackJobs(activities.map((activity) => activity.jobId));
+		return activities.filter((activity) => finished.has(activity.jobId));
 	}
+
+	get queuedJobs(): Job[] { return recover(this.records, this.now()).queued; }
 
 	/** Queued jobs waiting behind other work that have no queued notice yet, with their queue position. */
 	jobsAwaitingQueuedNotice(): Array<{ job: Job; position: number }> {

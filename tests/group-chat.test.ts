@@ -1040,7 +1040,7 @@ test('unknown lifecycle support pauses group work while private transport remain
  const {agent}=await oneAgent(t,{coordinate:async(_peer,body:any)=>({status:200,body:{roster:body.roster,match:true}})});
  await waitFor(()=>agent.status().includes('group=unverified'));assert.match(agent.privateReplies.at(-1)!,/protocol/);
  await assert.rejects(workSend(agent,'incompatible',{kind:'request',recipients:['@example_agent_b_bot'],text:'Do not send'}),/not available/);
- await agent.batch([ownerPrivate('a',905,'/status')]);assert.ok(agent.privateReplies.some(text=>text.includes('State:')));
+ await agent.batch([ownerPrivate('a',905,'/status')]);await waitFor(()=>agent.privateReplies.some(text=>text.includes('State:')));assert.ok(agent.privateReplies.some(text=>text.includes('State:')));
 });
 
 test('an accepted tool Reply followed by model failure is diagnosed locally without a second terminal publication',async(t)=>{

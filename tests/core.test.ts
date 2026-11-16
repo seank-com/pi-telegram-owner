@@ -593,6 +593,7 @@ test("extension lifecycle stops the mock source and blocks session replacement d
 	};
 	await emit("session_start", { type: "session_start", reason: "startup" });
 	await onBatch?.([textUpdate(8, "active")]);
+	await new Promise((resolve) => setImmediate(resolve));
 	assert.ok(injectedPrompt.includes("telegram-job:"));
 	await emit("input", { type: "input", source: "extension", text: injectedPrompt });
 	await emit("before_agent_start", { type: "before_agent_start", prompt: injectedPrompt });
@@ -627,6 +628,8 @@ test("quiet timer durably seals once during a busy turn and idle settlement disp
 			sub.after(async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown", reason: "test" }, ctx); });
 			await emit("session_start", { type: "session_start", reason: "startup" });
 			await onBatch?.([textUpdate(50, "wait for idle")]);
+			// Poll completion is durable admission, not completion of the deferred work pump.
+			await new Promise(resolve => setImmediate(resolve));
 			if (expiredBeforeArm) assert.equal(journal.records.filter(record => record.type === "inbound_batch").at(-1)?.state, "open", "admission delay does not consume the post-maintenance deadline");
 			sub.mock.timers.tick(quietWindow);
 			// The timer enqueues resolved in-memory journal work. Drain its microtasks,

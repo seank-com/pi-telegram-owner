@@ -10,7 +10,9 @@ const entry = process.env.TELEGRAM_TEST_ENTRY ?? new URL("../../src/index.ts", i
 const root = await mkdtemp(join(tmpdir(), "telegram-save-host-")), profile = join(root, "profile");
 const provider = "save-fixture", records: any[] = [], sends: any[] = [], replies: string[] = [];
 let batch: any, calls = 0, session: any, runtime: any;
-const fixture = { records, sends, replies, install(callback: unknown) { batch = callback; } };
+let savedReply!: () => void;
+const replyDelivered = new Promise<void>((resolve) => { savedReply = resolve; });
+const fixture = { records, sends, replies, install(callback: unknown) { batch = callback; }, reply(text: string) { replies.push(text); savedReply(); } };
 (globalThis as any).preferencesHostFixture = fixture;
 try {
 	await mkdir(profile, { mode: 0o700 }); await mkdir(join(root, ".pi"));
@@ -20,7 +22,7 @@ try {
 	await writeFile(projectPath, JSON.stringify({ sessionDir: "retained-sessions", enableAnalytics: false, modelThinkingLevels: { "other/model": "low" } }), { mode: 0o600 });
 	const wrapper = join(root, "save-extension.ts");
 	await writeFile(wrapper, `import {createTelegramOwnerExtension} from ${JSON.stringify(entry)};
-export default function(pi){const f=globalThis.preferencesHostFixture;createTelegramOwnerExtension({projectRoot:${JSON.stringify(root)},datastore:{mode:'off'},dependencies:{ownerUserId:7,privateChatId:70,journal:{async load(){return [...f.records]},async append(r){f.records.push(structuredClone(r))}},selectorTransport:{async send(text,keyboard){f.sends.push({text,keyboard});return String(100+f.sends.length)},async edit(){},async answer(){}},source:{async start(cb){f.install(cb);return async()=>{}}},async sendReply(text){f.replies.push(text);return '42'}}})(pi);}`);
+export default function(pi){const f=globalThis.preferencesHostFixture;createTelegramOwnerExtension({projectRoot:${JSON.stringify(root)},datastore:{mode:'off'},dependencies:{ownerUserId:7,privateChatId:70,journal:{async load(){return [...f.records]},async append(r){f.records.push(structuredClone(r))}},selectorTransport:{async send(text,keyboard){f.sends.push({text,keyboard});return String(100+f.sends.length)},async edit(){},async answer(){}},source:{async start(cb){f.install(cb);return async()=>{}}},async sendReply(text){f.reply(text);return '42'}}})(pi);}`);
 	const model = (id: string) => ({ id, name: id, provider, api: "openai-completions", baseUrl: "https://fixture.invalid", reasoning: true, input: ["text"], contextWindow: 8192, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { minimal: null, xhigh: null, max: null } });
 	const a = model("a"), b = model("b");
 	runtime = await sdk.ModelRuntime.create({ authPath: join(profile, "auth.json"), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
@@ -39,7 +41,9 @@ export default function(pi){const f=globalThis.preferencesHostFixture;createTele
 	await command("/model"); await pick(sends.at(-1).keyboard.inline_keyboard.flat().find((x: any) => x.text.endsWith("/b")).callback_data);
 	assert.equal(session.model.id, "b"); assert.equal(session.thinkingLevel, "high");
 	await command("/thinking"); await pick(sends.at(-1).keyboard.inline_keyboard.flat().find((x: any) => x.text.replace("✓ ", "") === "off").callback_data);
-	await command("/save"); assert.match(replies.at(-1)!, /Saved project defaults/);
+	await command("/save"); await replyDelivered;
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(replies.at(-1)!, /Saved project defaults/);
 	const saved = JSON.parse(await readFile(projectPath, "utf8"));
 	assert.equal(saved.defaultModel, "b"); assert.equal(saved.defaultProvider, provider); assert.equal(saved.defaultThinkingLevel, "off");
 	assert.deepEqual(saved.modelThinkingLevels, { "other/model": "low", [`${provider}/b`]: "off" });

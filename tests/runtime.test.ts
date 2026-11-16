@@ -1180,6 +1180,7 @@ test("typing failure is locally visible and does not block or duplicate the dura
 		message: { message_id: 90, text: "hello", chat: { id: CHAT, type: "private" }, from: { id: OWNER } },
 	}]);
 	assert.equal(typingCalls, 1);
+	await waitFor(() => injectedPrompt.length > 0);
 	await waitFor(() => statusMessage.includes("typingError=mock typing unavailable"));
 	await emit("input", { type: "input", source: "extension", text: injectedPrompt });
 	await emit("before_agent_start", { type: "before_agent_start", prompt: injectedPrompt });
@@ -1292,7 +1293,7 @@ test("legacy uncaptured images do not block startup but forward-required capture
 		createTelegramOwnerExtension({ dependencies: { journal, ownerUserId: OWNER, privateChatId: CHAT, source: { async start(handler) { sourceStarts += 1; onBatch = handler; return async () => {}; } }, async sendReply() { return "unused"; }, async resolveImages() { resolverCalls += 1; if (fail) throw new Error("capture unavailable"); return [{ image: { data: "archived", mimeType: "image/jpeg" }, attachment: archived }]; } } })(pi);
 		const ctx = { isIdle: () => idle, sessionManager: { getSessionId: () => "capture-boundary" }, ui: { setStatus() {}, notify() {} } } as unknown as ExtensionContext;
 		const emit = async (name: string, event: object) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
-		return { emit, setAvailable() { fail = false; }, get sourceStarts() { return sourceStarts; }, get resolverCalls() { return resolverCalls; }, get onBatch() { return onBatch; } };
+		return { emit, setAvailable() { fail = false; }, get sourceStarts() { return sourceStarts; }, get resolverCalls() { return resolverCalls; }, get onBatch() { return async (updates: TelegramUpdate[]) => { const cursor = await onBatch!(updates); await new Promise(resolve => setImmediate(resolve)); return cursor; }; } };
 	};
 
 	const legacy = new MemoryJournal([{ type: "update", schemaVersion: 2, updateId: 19, disposition: "accepted", timestamp: "2026-09-30T00:00:00.000Z", jobId: "legacy", messageId: 190, text: "legacy", images: [image] }]);
@@ -1316,7 +1317,7 @@ test("legacy uncaptured images do not block startup but forward-required capture
 	const admittedHarness = startHarness(admitted);
 	await admittedHarness.emit("session_start", { type: "session_start", reason: "startup" });
 	const update: TelegramUpdate = { update_id: 30, message: { message_id: 300, caption: "new", photo: [{ file_id: "telegram-file", file_size: 20 }], chat: { id: CHAT, type: "private" }, from: { id: OWNER } } };
-	await assert.rejects(() => admittedHarness.onBatch!([update]), /capture unavailable/);
+	assert.equal(await admittedHarness.onBatch!([update]), 30, "durable admission is not rejected by deferred capture failure");
 	assert.equal(admitted.records.find((record) => record.type === "update")?.schemaVersion, 3);
 	assert.equal(admitted.records.some((record) => record.type === "media_captured"), false);
 	admittedHarness.setAvailable();
@@ -1395,10 +1396,12 @@ test("projection-disabled extension durably receives and sends photos within a c
 		},
 	}]);
 	assert.equal(injected, undefined, "busy Pi must queue the image turn");
-	assert.equal(imageDownloads, 1, "poll completion must durably capture image bytes");
+	await waitFor(() => journal.records.some((record) => record.type === "media_captured" && record.direction === "in"));
+	assert.equal(imageDownloads, 1, "deferred capture must preserve image bytes before dispatch");
 	assert.equal(journal.records.filter((record) => record.type === "media_captured" && record.direction === "in").length, 1);
 	idle = true;
 	await onBatch?.([]);
+	await waitFor(() => injected !== undefined);
 	assert.equal(imageDownloads, 1, "dispatch must not download already captured bytes");
 	assert.equal(archivedReads, 1);
 	assert.deepEqual(injected.slice(1), [{ type: "image", data: "image-data", mimeType: "image/jpeg" }]);
@@ -1426,6 +1429,7 @@ test("equivalent outbound photo is not resent under a new tool ID after send tim
 	const ctx = { cwd: PROJECT_ROOT, isIdle: () => true, sessionManager: { getSessionId: () => "photo-timeout" }, ui: { setStatus() {}, notify() {} } } as unknown as ExtensionContext;
 	const emit = async (name: string, event: object) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
 	await emit("session_start", { type: "session_start", reason: "startup" }); await onBatch?.([{ update_id: 49, message: { message_id: 490, text: "send it", chat: { id: CHAT, type: "private" }, from: { id: OWNER } } }]);
+	await waitFor(() => Boolean(injected));
 	await emit("input", { type: "input", source: "extension", text: injected }); await emit("before_agent_start", { type: "before_agent_start", prompt: injected });
 	await assert.rejects(() => tool.execute("timeout-first", { path: "out.png", caption: "same" }, undefined, undefined, ctx), /send timeout/);
 	await assert.rejects(() => tool.execute("timeout-second", { path: "out.png", caption: "same" }, undefined, undefined, ctx), /Equivalent outbound photo delivery is uncertain/);
@@ -1451,6 +1455,7 @@ test("equivalent outbound photo is not resent under a new tool ID after receipt 
 	const emit = async (name: string, event: object) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
 	await emit("session_start", { type: "session_start", reason: "startup" });
 	await onBatch?.([{ update_id: 50, message: { message_id: 500, text: "send it", chat: { id: CHAT, type: "private" }, from: { id: OWNER } } }]);
+	await waitFor(() => Boolean(injected));
 	await emit("input", { type: "input", source: "extension", text: injected }); await emit("before_agent_start", { type: "before_agent_start", prompt: injected });
 	await assert.rejects(() => tool.execute("first-tool", { path: "out.png", caption: "same" }, undefined, undefined, ctx), /receipt fsync failed/);
 	await assert.rejects(() => tool.execute("second-tool", { path: "out.png", caption: "same" }, undefined, undefined, ctx), /Equivalent outbound photo delivery is uncertain/);
@@ -1511,10 +1516,11 @@ test("the durable reply precedes activity cleanup and delete failure is best eff
 		update_id: 40,
 		message: { message_id: 400, text: "work", chat: { id: CHAT, type: "private" }, from: { id: OWNER } },
 	}]);
+	await waitFor(() => injectedPrompt.length > 0);
 	await emit("input", { type: "input", source: "extension", text: injectedPrompt });
 	await emit("before_agent_start", { type: "before_agent_start", prompt: injectedPrompt });
-	await waitFor(() => calls.includes("activity:Thinking (42%)"));
-	assert.equal(calls[0], "activity:Thinking (42%)");
+	await waitFor(() => calls.includes("edit:Thinking (42%)"));
+	assert.equal(calls[0], "activity:Received.");
 	assert.equal((journal.records.find((record) => record.type === "activity_started") as any)?.messageId, "60");
 	await emit("tool_execution_start", {
 		type: "tool_execution_start",
@@ -1561,6 +1567,7 @@ test("activity send failure cannot suppress or duplicate the final reply", async
 	};
 	await emit("session_start", { type: "session_start", reason: "startup" });
 	await onBatch?.([{ update_id: 41, message: { message_id: 410, text: "work", chat: { id: CHAT, type: "private" }, from: { id: OWNER } } }]);
+	await waitFor(() => prompt.length > 0);
 	await emit("input", { type: "input", source: "extension", text: prompt });
 	await emit("before_agent_start", { type: "before_agent_start", prompt });
 	await waitFor(() => status.includes("activityError=send: mock status send failed"));
@@ -1596,6 +1603,7 @@ test("shutdown deletes a known activity and restart cleans a journaled orphan", 
 	};
 	await emit("session_start", { type: "session_start", reason: "startup" });
 	await onBatch?.([{ update_id: 42, message: { message_id: 420, text: "work", chat: { id: CHAT, type: "private" }, from: { id: OWNER } } }]);
+	await waitFor(() => prompt.length > 0);
 	await emit("input", { type: "input", source: "extension", text: prompt });
 	await emit("before_agent_start", { type: "before_agent_start", prompt });
 	await waitFor(() => journal.records.some((record) => record.type === "activity_started"));

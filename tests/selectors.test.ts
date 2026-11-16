@@ -217,7 +217,11 @@ function extensionFixture(options: { inboundQuietWindowMs?: number; sendReply?: 
 	const pi: any = { ...f.pi, on(name: string, handler: any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, registerTool() {}, registerCommand() {}, sendUserMessage(text: unknown) { turns.push(text); } };
 	createTelegramOwnerExtension({ datastore: { mode: "off" }, dependencies: { journal, ownerUserId: 7, privateChatId: 70, source: { async start(cb) { batch = cb; return async () => {}; } }, selectorTransport: f.transport, inboundQuietWindowMs: options.inboundQuietWindowMs, sendReply: options.sendReply ?? (async () => "42") } })(pi);
 	const emit = async (name: string, event: any = {}) => { let result; for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx); return result; };
-	return { f, journal, turns, ctx, emit, get compactOptions() { return compactOptions; }, poll: (updates: TelegramUpdate[]) => batch(updates) };
+	return { f, journal, turns, ctx, emit, get compactOptions() { return compactOptions; }, poll: async (updates: TelegramUpdate[]) => {
+		const cursor = await batch(updates);
+		await new Promise((resolve) => setImmediate(resolve));
+		return cursor;
+	} };
 }
 
 test("extension routes selector commands and callbacks locally, preserving cursor and queue without jobs", async () => {

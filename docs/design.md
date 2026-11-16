@@ -41,15 +41,29 @@ for the others.
 
 ### Private owner request
 
-1. `LongPollSource` receives updates through `TelegramApiClient`. `index.ts`
-   enters its serialized operation chain, and `TelegramOwnerBridge.ingestBatch()`
-   authenticates/classifies updates and records them before the cursor advances.
+1. `LongPollSource` receives updates through `TelegramApiClient`.
+   `TelegramOwnerBridge.ingestBatch()` authenticates/classifies updates on its
+   dedicated batch-operation tail and records them before the cursor advances.
+   Its non-awaiting accepted-input hook starts receipt typing and one private
+   feedback worker after the update and any text batch are durable. The worker
+   is keyed by the canonical batch/job id, so fragments reuse its in-flight send
+   and message rather than creating more receipts. Initial text is `Collecting...`
+   for text collection, `Received.` for commands and unbatched input, or the
+   queued status for conversation input when already busy. Context percentage is
+   not calculated on this receipt path. Commands retain truthful eligibility
+   checks: their receipt acknowledges durable input, not permission to run.
 2. Local selectors and ordinary commands take their control paths. Accepted
    conversation input joins the owner's queue; text fragments are collected
    through the configured quiet window. A batch created or extended by a poll
-   receives that full window after the poll's awaited media, reply, command, and
-   queued-notice work, before the callback returns for the next poll. It is also
-   established before seal or dispatch, so admission time cannot close it.
+   receives that full window after deferred media, reply, command, and
+   queued-notice work. The poll callback returns the durable cursor without
+   awaiting that work or feedback HTTP. Local model/thinking selectors retain
+   their separate durable control path and picker feedback. A coalesced serial
+   work pump owns ordinary command and conversation work;
+   pending touched batches are rearmed before seal/dispatch and after the pump's
+   notices, so housekeeping cannot consume the collection budget. Admission's
+   initial deadline and rearm are one batch operation, preventing another lane
+   from sealing an intermediate revision.
    Empty polls and polls that do not create or extend the batch do not move an
    existing deadline. Once that deadline has passed, the batch is durably sealed
    even while Pi is busy; dispatch still waits for idle. Restart uses the latest
@@ -57,15 +71,21 @@ for the others.
    admission-time deadline. Photos are captured before dispatch.
 3. When Pi and delivery state permit, `dispatchNext()` records the work and sends
    its envelope/input to the existing Pi session. Lifecycle hooks start private
-   activity, update it from tool intents and capture the model's outcome. A
+   activity, promote the existing receipt to `Thinking (NN%)`, update it from
+   tool intents and capture the model's outcome. Context is calculated only at
+   this later start, never before first receipt feedback. A
    `before_agent_start` event with no prompt property is not owner work and is
    ignored. A user or queued `sendUserMessage` run still carries a prompt and
    remains claimable.
 4. At `agent_settled`, `settle()` records and delivers the task's output to its
    pinned destination, or records its waiting/informational disposition. Activity
    cleanup follows the durable outcome. Projection reconciles the journal and
-   session evidence into canonical Markdown; successful publication can request
-   a coalesced datastore refresh.
+   session evidence into canonical Markdown on a separate coalesced worker;
+   successful publication can request a coalesced datastore refresh. That worker
+   snapshots the owning bridge's records and appends projection receipts through
+   its existing journal tail. It does not block new admission, receipt feedback
+   or the next poll. Replacement/shutdown cancel and drain its work; the initial
+   startup reconciliation still finishes before polling starts.
 
 A failed or uncertain send retains its evidence instead of being treated as an
 accepted reply. Restart reconciliation distinguishes accepted, unsent and
@@ -263,7 +283,7 @@ is named. This is not an exhaustive inventory of every protocol/library bound.
 
 | Restriction | Why (what failure does it prevent) |
 | --- | --- |
-| Private text quiet window: default 4,000 ms, runtime configuration 100-5,000 ms (`inboundQuietWindowMs`); fixture bridge 0 disables batching. Location: core/runtime configuration and poll callback. A touched open batch gets the full window after awaited maintenance, including notices, with a pre-dispatch revision; unrelated polls do not move it. | The origin move prevents internal processing from consuming the four-second collection budget. Explicit approval: issue #13, 2026-11-10. That narrow approval does not establish approval of the older numeric configuration range. Polls remain sequential and dispatched history stays closed. |
+| Private text quiet window: default 4,000 ms, runtime configuration 100-5,000 ms (`inboundQuietWindowMs`); fixture bridge 0 disables batching. Location: core/runtime configuration and the admission/work-pump paths. A touched open batch gets the full window after deferred maintenance, including notices, with a pre-dispatch revision; unrelated polls do not move it. | The origin move prevents internal processing from consuming the four-second collection budget. Explicit approval: issue #13, 2026-11-10. That narrow approval does not establish approval of the older numeric configuration range. Polls remain sequential and dispatched history stays closed. Sean's 2026-11-16 feedback change separates their durable-admission return from deferred housekeeping, without changing the collection value. |
 | Private text fragments must also have exactly equal Telegram `message.date` values. Location: `src/core.ts:addTextToBatch`; fixed matcher. | Different whole-second timestamps immediately seal an open batch even inside the quiet window. This is a known cross-second paste limitation, not timestamp rewriting. The intended long-term rationale/approval for that restriction is not established; retaining the deadline improvement does not authorize a broader grouping rule. |
 | tests/core.test.ts quiet-timer fixture: 600,000 ms outer test timeout across its busy-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
 
@@ -274,7 +294,7 @@ is named. This is not an exhaustive inventory of every protocol/library bound.
 | HTTP request deadline 35,000 ms; long-poll parameter 25 seconds. Location: `src/runtime.ts:TelegramApiClient`. | Abort request waits under the existing transport envelope. Specific numeric necessity/approval is not established; a server poll parameter is not proof the whole request completes in that time. |
 | Reconnect backoff: base `min(30000,1000*2**min(failures,5))`, multiplier 0.75-1.25, capped 30,000 ms. Location: `src/runtime.ts:reconnectDelay`. | Current retry scheduling after poll failure. Approval for this policy/formula is not established by its age or tests. |
 | Active-step elapsed display: first suffix at 30,000 ms, updated every 30,000 ms. Locations: `TelegramStepClock` / activity worker in `src/runtime.ts` and command phases in `src/index.ts`; fixed by component maintainers. Approved by Sean on 2026-11-16 for visibility of time on an unchanged displayed step. | Shows `[HH:MM:SS]` without a deadline, whole-turn timer, automatic cancellation or new retry policy. Successful substantive status changes reset the clock; timer edits and duplicate statuses do not. Stops with the activity/phase lifecycle. |
-| Election step 2,000 ms and activity edit minimum 1,000 ms by default. Location: group configuration/activity in `src/runtime.ts`. | These schedule election/activity work. The exact values and rate-policy approval need evidence; no change is made here. |
+| Election step 2,000 ms and activity edit minimum 1,000 ms by default. Location: group configuration/activity in `src/runtime.ts`. Command workers in `src/index.ts` use 0 ms to retain the existing unthrottled command-phase edits. | These schedule election/activity work. The exact default values and rate-policy approval need evidence; their values are unchanged. Reusing the admission receipt does not add a command-phase throttle. |
 | Selector page 6 entries, retained pickers 32, TTL 600,000 ms. Location: `src/selectors.ts`. | Limits button views/retention and rejects stale controls. Specific pagination/retention values' necessity and approval are not established. |
 | Label 1-64 single-line safe characters, configured username and safe-ID regexes. Location: `src/runtime.ts`. | Current configuration/identity validation can reject otherwise supplied identifiers. Exact exclusion/length-policy approval is not established; do not invent a broader content filter. |
 | Image 10 MiB and JPEG/PNG/WebP validation. Location: `src/core.ts`, `src/runtime.ts`; fixed component handling. | Bounds accepted media and formats. Distinguish our exact binary size/validation choices from Telegram protocol constraints; their owner-approval references are not established by this inventory. |
@@ -360,10 +380,15 @@ claims, so nothing else can start between the claim and the turn.
 
 ## Activity and queued notices
 
-When an item is accepted while the agent is busy, the agent immediately sends
-a short queued notice in that agent's private owner chat. When the item starts,
-the same private message is edited into the activity display (`Thinking (NN%)`
-and tool intents). This private-only destination also applies to work whose
+Authenticated private model input and ordinary command jobs get an ephemeral receipt immediately after
+minimal durable admission, before quiet-window dispatch or slow housekeeping.
+The same single-flight message progresses through collection/queued status,
+`Thinking (NN%)`, and tool intents. A failed receipt send does not reject input,
+block dispatch, or create an activity journal entry for an unknown message id.
+An unchanged queued poll does not retry a failed send. A later substantive phase
+may attempt its current text, including when that phase arrived while the earlier
+send was pending. No feedback retry timer is added. Non-private queued items retain their private
+owner-chat notice, also reused as their activity when they start. This private-only destination also applies to work whose
 final reply goes to the group, and to queue endpoint work with a reply target.
 Items with no reply target do not create activity. Typing remains private.
 
@@ -375,9 +400,9 @@ their intended destinations; only ephemeral status is private. Queued notices
 and activity are transient: they are not recorded in either archive and never
 wake another agent.
 
-Active Thinking/tool activity and command/compaction phases show a per-step age suffix after 30 seconds without a substantive displayed status change, for example `Read: notes.md [00:15:00]`. The suffix advances in 30-second increments as `[HH:MM:SS]`; hours do not wrap at a day. A successful send or substantive edit starts a fresh step clock and removes the previous suffix. Repeated identical statuses and the clock's own edits do not reset it. Queued notices are not executing steps and do not start this clock until promoted to activity. Elapsed edits use the activity's existing edit worker or an ordered phase edit chain, so an old timer update cannot overwrite a newer status. Completion, halt, session replacement and shutdown stop the clock and cancel pending elapsed work before cleanup. This is display-only observation, not evidence of a hang, a whole-turn timer or permission to cancel work. Receipt timing, collection windows and typing cadence are unchanged.
+Active Thinking/tool activity and command/compaction phases show a per-step age suffix after 30 seconds without a substantive displayed status change, for example `Read: notes.md [00:15:00]`. The suffix advances in 30-second increments as `[HH:MM:SS]`; hours do not wrap at a day. A successful send or substantive edit starts a fresh step clock and removes the previous suffix. Repeated identical statuses and the clock's own edits do not reset it. Receipt, collection and queued phases also measure only their current displayed step; moving to Thinking or a tool resets the clock, rather than carrying the queue age into execution. Elapsed edits use the activity's existing edit worker or an ordered phase edit chain, so an old timer update cannot overwrite a newer status. Completion, halt, session replacement and shutdown stop the clock and cancel pending elapsed work before cleanup. This is display-only observation, not evidence of a hang, a whole-turn timer or permission to cancel work. The collection-window value and repeating typing cadence are unchanged; receipt typing and feedback start after durable admission without waiting for housekeeping or model dispatch.
 
-Authenticated actionable `/new` and `/compact` send an ephemeral receipt before the slow host call. That receipt means the command was accepted and is being handled. It is not proof that compaction has started or that a new session exists. A busy or unauthorized refusal does not send it. When Pi emits public `session_before_compact`, before summary completion and before `before_agent_start`, the same notice is edited to `Compacting` if one is already visible; otherwise a separate `Compacting` notice is sent. Automatic threshold and overflow compaction use that same public start event. `session_compact` and `session_compact_failed` remove an automatic notice. A command-owned notice stays until the durable command result is recorded, then the existing activity cleanup deletes it. The send is recorded as `activity_started` before the local pointer is treated as durable. A failed delete leaves that record, so the next startup retries the delete instead of forgetting the message. The receipt send uses the session's phase signal. Shutdown aborts that signal before waiting for in-flight command work, and a host call is not started after teardown has begun. The next `session_start` replaces that signal, drops the previous in-memory notice pointer, and clears the previous generation's compact and switch flags. The journal, not that pointer, remains the recovery path for a notice the previous generation did not clear. A failed activity send, edit, or delete during a live session does not cancel the command, suppress its durable reply, or change an automatic compaction outcome.
+Authenticated ordinary commands receive `Received.` after durable admission, before deferred housekeeping. Actionable `/new` and `/compact` promote that same worker/message to `Starting new session...` or `Compaction requested...` before the slow host call. These phases are not proof that a new session exists or that compaction has started. A busy refusal retains only the generic receipt until its durable reply; an unauthorized request gets no receipt. When Pi emits public `session_before_compact`, before summary completion and before `before_agent_start`, the same command or active-input receipt becomes `Compacting`; when no request owns a receipt, a standalone notice is sent. Automatic threshold and overflow compaction use that same public start event. `session_compact` and `session_compact_failed` remove a standalone automatic notice; a shared input receipt remains available for Thinking. A command-owned worker stays until the durable command result is delivered, then existing activity cleanup deletes it. A successful send is recorded as `activity_started`; that journal receipt owns restart cleanup. A failed delete leaves that record, so the next startup retries the delete instead of forgetting the message. The receipt send uses the session's phase signal. Shutdown aborts that signal before waiting for in-flight command work, and a host call is not started after teardown has begun. The next `session_start` replaces that signal, drops the previous in-memory notice pointer, and clears the previous generation's compact and switch flags. The journal, not that pointer, remains the recovery path for a notice the previous generation did not clear. A failed activity send, edit, or delete during a live session does not cancel the command, suppress its durable reply, or change an automatic compaction outcome.
 
 Activity receipts include their destination, so cleanup does not confuse equal
 message IDs in different chats. Retained unscoped activity receipts resolve to
