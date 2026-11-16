@@ -744,6 +744,41 @@ export class TelegramTypingActivity {
 	}
 }
 
+/** Display-only age of one visible step; never a deadline or a whole-turn timer. */
+export class TelegramStepClock {
+	private timer?: ReturnType<typeof setTimeout>;
+	private startedAt?: number;
+	private readonly onTick: (suffix: string) => void;
+	private readonly now: () => number;
+	constructor(onTick: (suffix: string) => void, now: () => number = () => Date.now()) {
+		this.onTick = onTick;
+		this.now = now;
+	}
+	reset(): void {
+		this.stop();
+		this.startedAt = this.now();
+		this.arm();
+	}
+	stop(): void {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		this.startedAt = undefined;
+	}
+	private arm(): void {
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			if (this.startedAt === undefined) return;
+			const seconds = Math.floor(Math.max(0, this.now() - this.startedAt) / 30_000) * 30;
+			const hours = String(Math.floor(seconds / 3_600)).padStart(2, "0");
+			const minutes = String(Math.floor(seconds / 60) % 60).padStart(2, "0");
+			const remainder = String(seconds % 60).padStart(2, "0");
+			this.onTick(` [${hours}:${minutes}:${remainder}]`);
+			if (this.startedAt !== undefined) this.arm();
+		}, 30_000);
+		this.timer.unref?.();
+	}
+}
+
 export interface TelegramActivityMessageOptions {
 	send(text: string, signal: AbortSignal): Promise<string>;
 	edit(messageId: string, text: string, signal: AbortSignal): Promise<void>;
@@ -769,6 +804,10 @@ export class TelegramActivityMessage {
 	private worker?: Promise<void>;
 	private messageId?: string;
 	private desired: string;
+	private step: string;
+	private renderStep: string;
+	private displayedStep?: string;
+	private readonly stepClock: TelegramStepClock;
 	private attempted = "";
 	private lastChangeAt = 0;
 	private acceptingUpdates = true;
@@ -778,7 +817,15 @@ export class TelegramActivityMessage {
 		this.options = options;
 		this.initialText = this.withPrefix(initialText);
 		this.desired = this.initialText;
+		this.step = this.initialText;
+		this.renderStep = this.initialText;
 		this.messageId = options.existingMessageId;
+		this.stepClock = new TelegramStepClock((suffix) => {
+			if (!this.acceptingUpdates || this.displayedStep === undefined || (this.worker && this.step !== this.displayedStep)) return;
+			this.renderStep = this.displayedStep;
+			this.desired = this.displayedStep + suffix;
+			this.ensureWorker();
+		}, () => (this.options.now ?? Date.now)());
 	}
 
 	start(): void {
@@ -792,7 +839,9 @@ export class TelegramActivityMessage {
 	update(text: string): void {
 		if (!this.acceptingUpdates || !text) return;
 		const desired = this.withPrefix(text);
-		if (desired === this.desired) return;
+		if (desired === this.step) return;
+		this.step = desired;
+		this.renderStep = desired;
 		this.desired = desired;
 		this.ensureWorker();
 	}
@@ -800,6 +849,7 @@ export class TelegramActivityMessage {
 	/** Stops further updates and leaves the message in place. Returns its ID, if one was sent. */
 	async halt(): Promise<string | undefined> {
 		this.acceptingUpdates = false;
+		this.stepClock.stop();
 		this.controller.abort(new Error("Telegram activity stopped"));
 		await this.worker?.catch(() => undefined);
 		this.worker = undefined;
@@ -851,6 +901,7 @@ export class TelegramActivityMessage {
 				// Never abort the first send: once Telegram may have posted it, its ID is needed to delete it later.
 				this.messageId = await this.options.send(this.initialText, new AbortController().signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
+				this.markDisplayed(this.initialText);
 				await this.options.onStarted(this.jobId, this.messageId);
 			} catch (error) {
 				this.fail(this.messageId ? "journal" : "send", error);
@@ -869,14 +920,22 @@ export class TelegramActivityMessage {
 			}
 			if (!this.acceptingUpdates) return;
 			const text = this.desired;
+			const step = this.renderStep;
 			this.attempted = text;
 			try {
 				await this.options.edit(this.messageId, text, this.controller.signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
+				this.markDisplayed(step);
 			} catch (error) {
 				if (!this.controller.signal.aborted) this.fail("edit", error);
 			}
 		}
+	}
+
+	private markDisplayed(step: string): void {
+		if (!this.acceptingUpdates || this.displayedStep === step) return;
+		this.displayedStep = step;
+		this.stepClock.reset();
 	}
 
 	private fail(operation: "send" | "edit" | "delete" | "journal", error: unknown): void {

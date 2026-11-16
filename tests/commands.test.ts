@@ -49,6 +49,7 @@ function createHarness(
 	let failEdits = 0;
 	let failDeletes = 0;
 	let holdSend: ((text: string, signal: AbortSignal) => Promise<string>) | undefined;
+	let holdEdit: ((text: string, signal: AbortSignal) => Promise<void>) | undefined;
 	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
 	let activePollers = 0;
 	let maxActivePollers = 0;
@@ -103,7 +104,8 @@ function createHarness(
 			activityEvents.push(`send:${text}`);
 			return `activity-${activitySends}`;
 		},
-		async editActivity(_id: string, text: string) {
+		async editActivity(_id: string, text: string, signal: AbortSignal) {
+			if (holdEdit) { const held = holdEdit; holdEdit = undefined; await held(text, signal); }
 			if (failEdits > 0) {
 				failEdits -= 1;
 				throw new Error("activity edit down");
@@ -180,6 +182,7 @@ function createHarness(
 		failNextEdits(count: number) { failEdits = count; },
 		failNextDeletes(count: number) { failDeletes = count; },
 		holdNextSend(wait: (text: string, signal: AbortSignal) => Promise<string>) { holdSend = wait; },
+		holdNextEdit(wait: (text: string, signal: AbortSignal) => Promise<void>) { holdEdit = wait; },
 		async emit(name: string, event: any, context = ctx) {
 			let result: any;
 			for (const handler of handlers.get(name) ?? []) result = await handler(event, context);
@@ -410,6 +413,118 @@ test("accepted /compact and /new emit working activity before the held host call
 	assert.equal(replacing.replies.length, 0, "receipt is not the durable new-session result");
 	releaseNew?.({ cancelled: false });
 	await pending;
+});
+
+test("automatic compaction ages one displayed step and stops editing after completion", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: true });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: true });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:01:00]");
+	await harness.emit("session_compact", {});
+	const edits = harness.activityEvents.filter((event) => event.startsWith("edit:")).length;
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.filter((event) => event.startsWith("edit:")).length, edits);
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")));
+});
+
+test("command receipt age resets when Compacting is displayed and session replacement stops its clock", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(79, "/compact")]);
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.match(harness.activityEvents.at(-1)!, /Working on it.* \[00:00:30\]$/);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting");
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+	await harness.emit("session_start", { reason: "switch" });
+	const edits = harness.activityEvents.filter((event) => event.startsWith("edit:")).length;
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.filter((event) => event.startsWith("edit:")).length, edits);
+});
+
+test("a newer Compacting phase skips queued old timer edits behind an in-flight edit", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	let release!: () => void; const held = new Promise<void>((resolve) => { release = resolve; });
+	t.after(async () => { release(); await harness.emit("session_shutdown", { reason: "test" }); });
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(81, "/compact")]);
+	harness.holdNextEdit(async () => { await held; });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	const retitling = harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	t.mock.timers.tick(90_000); await new Promise((resolve) => setImmediate(resolve));
+	release(); await retitling; await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), [
+		"edit:Received /compact. Working on it. This is not proof compaction has started. [00:00:30]", "edit:Compacting",
+	]);
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+});
+
+test("finishing an automatic phase cancels its in-flight timer edit before deletion", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: true });
+	let aborted = false;
+	harness.holdNextEdit(async (_text, signal) => { await new Promise<void>((_resolve, reject) => {
+		const stop = () => { aborted = true; reject(signal.reason); };
+		if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true });
+	}); });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	await harness.emit("session_compact", {});
+	assert.equal(aborted, true);
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")));
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), []);
+});
+
+test("a completed compact command drains its timer edit before generic activity cleanup", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(82, "/compact")]);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	let aborted = false;
+	harness.holdNextEdit(async (_text, signal) => {
+		await new Promise<void>((_resolve, reject) => { signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true }); });
+	});
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	harness.compactOptions.onComplete({ tokensBefore: 100 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(aborted, true);
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")));
+	const count = harness.activityEvents.length;
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.length, count);
+});
+
+test("a failed compaction retitle keeps aging the actual visible receipt", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(83, "/compact")]);
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	harness.failNextEdits(1);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Received /compact. Working on it. This is not proof compaction has started. [00:01:00]");
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting");
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
 });
 
 test("session_before_compact shows Compacting before agent start and edits an existing command receipt once", async () => {

@@ -47,6 +47,7 @@ import {
 	sanitizeError,
 	TelegramActivityMessage,
 	TelegramReplyAnchorError,
+	TelegramStepClock,
 	TelegramTypingActivity,
 	type GroupChatConfig,
 } from "./runtime.ts";
@@ -199,8 +200,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			new: "Received /new. Working on it. This is not proof a new session has started.",
 		} as const;
 		let phaseController = new AbortController();
-		let phaseNotice: { id?: string; jobId: string; commandOwned: boolean; text: string } | undefined;
+		type PhaseNotice = { id: string; jobId: string; commandOwned: boolean; text: string; requestedText: string; suffix?: string; clock: TelegramStepClock; controller: AbortController };
+		let phaseNotice: PhaseNotice | undefined;
+		let phaseEditTail: Promise<void> = Promise.resolve();
 		const stopPhaseSends = (): void => {
+			phaseNotice?.clock.stop();
 			phaseController.abort(new Error("Telegram owner bridge stopped"));
 		};
 		let agentLabel = GENERIC_AGENT_LABEL;
@@ -348,6 +352,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				const transport = finished.destination === 'group' ? groupRuntime?.transport : transportFor(bridge.itemFor(finished.jobId));
 				const deletionKey = `${finished.destination}:${finished.messageId}`;
 				if (!transport || failedActivityDeletes.has(deletionKey)) continue;
+				if (finished.destination !== 'group' && phaseNotice?.jobId === finished.jobId && phaseNotice.id === finished.messageId) {
+					phaseNotice.clock.stop();
+					phaseNotice.controller.abort(new Error("Telegram phase finished"));
+					await phaseEditTail;
+				}
 				try {
 					await transport.deleteActivity(finished.messageId, new AbortController().signal);
 				} catch (error) {
@@ -522,36 +531,54 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			try {
 				const id = await send(text, signal);
 				await bridge.recordActivityStarted(jobId, id, "private");
-				phaseNotice = { id, jobId, commandOwned, text };
+				phaseNotice?.clock.stop();
+				const notice: PhaseNotice = { id, jobId, commandOwned, text, requestedText: text, controller: new AbortController(),
+					clock: new TelegramStepClock((suffix) => { notice.suffix = suffix; void editPhase(notice, notice.text, suffix); }) };
+				phaseNotice = notice;
+				if (!signal.aborted) notice.clock.reset();
 			} catch (error) {
 				if (signal.aborted) return;
 				lastActivityError = `phase: ${sanitizeError(error)}`;
 				updateStatus();
 			}
 		};
+		// Phase edits have their own short operation chain; stale timer work cannot retitle a newer phase.
+		const editPhase = (notice: PhaseNotice, text: string, suffix?: string): Promise<void> => {
+			if (suffix === undefined) notice.requestedText = text;
+			const edit = phaseEditTail.then(async () => {
+				if (phaseNotice !== notice || !runtimeDependencies?.editActivity) return;
+				const signal = AbortSignal.any([phaseController.signal, notice.controller.signal]);
+				if (signal.aborted || notice.requestedText !== text || (suffix !== undefined ? notice.text !== text || notice.suffix !== suffix : notice.text === text)) return;
+				try {
+					await runtimeDependencies.editActivity(notice.id, text + (suffix ?? ""), signal);
+					if (suffix === undefined && phaseNotice === notice && !signal.aborted) {
+						notice.text = text;
+						notice.suffix = undefined;
+						notice.clock.reset();
+					}
+				} catch (error) {
+					if (signal.aborted) return;
+					if (suffix === undefined && notice.requestedText === text) notice.requestedText = notice.text;
+					lastActivityError = `phase: ${sanitizeError(error)}`;
+					updateStatus();
+				}
+			});
+			phaseEditTail = edit.catch(() => undefined);
+			return phaseEditTail;
+		};
 		const retitlePhase = async (text: string): Promise<void> => {
-			if (!phaseNotice) {
-				await showPhase(randomUUID(), text, false);
-				return;
-			}
-			if (phaseNotice.text === text) return;
-			if (!phaseNotice.id || !runtimeDependencies?.editActivity || phaseController.signal.aborted) return;
-			try {
-				await runtimeDependencies.editActivity(phaseNotice.id, text, phaseController.signal);
-				phaseNotice.text = text;
-			} catch (error) {
-				if (phaseController.signal.aborted) return;
-				lastActivityError = `phase: ${sanitizeError(error)}`;
-				updateStatus();
-			}
+			if (!phaseNotice) { await showPhase(randomUUID(), text, false); return; }
+			await editPhase(phaseNotice, text);
 		};
 		const clearPhase = async (): Promise<void> => {
-			if (!phaseNotice || !bridge) return;
-			if (!phaseNotice.commandOwned) {
-				await bridge.appendPhaseRelease(phaseNotice.jobId);
-			}
+			const notice = phaseNotice;
+			if (!notice || !bridge) return;
+			notice.clock.stop();
+			notice.controller.abort(new Error("Telegram phase finished"));
+			await phaseEditTail;
+			if (!notice.commandOwned) await bridge.appendPhaseRelease(notice.jobId);
 			await cleanupFinishedActivities();
-			if (!bridge.openActivity(phaseNotice.jobId, "private")) phaseNotice = undefined;
+			if (phaseNotice === notice && !bridge.openActivity(notice.jobId, "private")) phaseNotice = undefined;
 		};
 		const phaseStillOwned = (owned: number): boolean => owned === generation && connection.phase !== "stopping" && !phaseController.signal.aborted;
 
@@ -1034,6 +1061,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			integration.start();
 			updateRecall();
 			generation += 1;
+			phaseNotice?.clock.stop();
 			phaseController.abort(new Error("Telegram owner session replaced"));
 			phaseController = new AbortController();
 			phaseNotice = undefined;
