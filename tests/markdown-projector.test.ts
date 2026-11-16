@@ -78,6 +78,36 @@ function noteBody(note: string): string {
 	return match[1]!;
 }
 
+for (const next of ["media", "projection"] as const) test(`same-instance ${next} publication waits behind an active archive writer`, async (t) => {
+	const base = await mkdtemp(join(tmpdir(), "telegram-owned-archive-writers-"));
+	const root = join(base, "archive"), sessions = join(base, "sessions");
+	const entries = [message("user0001", null, "user", "[telegram-job:job-1]\nhello", "2026-09-22T01:00:01.000Z"), message("asst0001", "user0001", "assistant", "**world**", "2026-09-22T01:00:02.000Z")];
+	await persistSession(sessions, entries); const journal = records(), projector = createProjector(root, sessions);
+	let release!: () => void, entered!: () => void; const held = new Promise<void>((resolve) => { release = resolve; }), ready = new Promise<void>((resolve) => { entered = resolve; });
+	t.after(async () => { release(); await rm(base, { recursive: true, force: true }); });
+	let first = true; const append = async (record: JournalRecord) => { journal.push(record); if (first && record.type === "projection_needed") { first = false; entered(); await held; } };
+	const initial = projector.reconcile(journal, session(sessions, entries), append); await ready;
+	const following = (next === "media" ? projector.reconcileMediaEvents(journal) : projector.reconcile(journal, session(sessions, entries), append)).then((value) => ({ value }), (error: unknown) => ({ error }));
+	release(); expectProjection(await initial, { projected: 2, unchanged: 0, deferred: 0 });
+	const outcome = await following; assert.equal("error" in outcome, false, "cooperating writers must not fail on their own archive lock");
+	assert.equal((await projector.timeline({ operation: "recent" })).count, 2);
+});
+
+test("a cancelled queued archive writer has no effects and does not poison subsequent publication", async (t) => {
+	const base = await mkdtemp(join(tmpdir(), "telegram-cancelled-archive-writer-"));
+	const root = join(base, "archive"), sessions = join(base, "sessions");
+	const entries = [message("user0001", null, "user", "[telegram-job:job-1]\nhello", "2026-09-22T01:00:01.000Z"), message("asst0001", "user0001", "assistant", "**world**", "2026-09-22T01:00:02.000Z")];
+	await persistSession(sessions, entries); const journal = records(), projector = createProjector(root, sessions);
+	let release!: () => void, entered!: () => void; const held = new Promise<void>((resolve) => { release = resolve; }), ready = new Promise<void>((resolve) => { entered = resolve; });
+	t.after(async () => { release(); await rm(base, { recursive: true, force: true }); });
+	let first = true; const append = async (record: JournalRecord) => { journal.push(record); if (first && record.type === "projection_needed") { first = false; entered(); await held; } };
+	const initial = projector.reconcile(journal, session(sessions, entries), append); await ready;
+	const controller = new AbortController(), reason = new Error("synthetic archive cancellation");
+	const cancelled = projector.reconcileMediaEvents(journal, controller.signal).then(() => undefined, (error: unknown) => error);
+	controller.abort(reason); release(); await initial; assert.equal(await cancelled, reason);
+	expectProjection(await projector.reconcile(journal, session(sessions, entries), append), { projected: 0, unchanged: 2, deferred: 0 });
+});
+
 for (const lifecycle of [false,true]) test(`interruption notices survive projector restart without impersonating Pi entries (lifecycle=${lifecycle})`, async (t) => {
 	const base = await mkdtemp(join(tmpdir(), "telegram-interrupted-reply-"));
 	t.after(() => rm(base, { recursive: true, force: true }));

@@ -428,7 +428,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		};
 
 		const syncMediaEvents = async (): Promise<void> => {
-			if (bridge && runtimeDependencies?.mediaProjector) await runtimeDependencies.mediaProjector.reconcileMediaEvents(bridge.journalRecords);
+			if (bridge && runtimeDependencies?.mediaProjector) await runtimeDependencies.mediaProjector.reconcileMediaEvents(bridge.journalRecords, projectionRefreshController?.signal);
 		};
 
 		const capturePendingInboundMedia = async (): Promise<void> => {

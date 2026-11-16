@@ -735,6 +735,13 @@ export class TelegramMarkdownProjector {
 	readonly #roleSlugs: { user: string; assistant: string; command: string };
 	readonly #bootIdentity: () => BootIdentity | undefined;
 	readonly #pidState: (pid: number) => PidState;
+	#liveWriteTail: Promise<void> = Promise.resolve();
+
+	#liveWrite<T>(work: () => Promise<T>): Promise<T> {
+		const operation = this.#liveWriteTail.then(work);
+		this.#liveWriteTail = operation.then(() => undefined, () => undefined);
+		return operation;
+	}
 
 	constructor(config: TelegramMarkdownProjectorConfig, dependencies: { bootIdentity?: () => BootIdentity | undefined; pidState?: (pid: number) => PidState } = {}) {
 		if (!config.enabled || !isAbsolute(config.root) || (config.sessionRoot !== undefined && !isAbsolute(config.sessionRoot)) || !/^[A-Za-z0-9._:-]{1,128}$/.test(config.rootId)) throw new ArchiveSafetyError("Markdown projection root and rootId must be explicit; a supplied Pi session root must be absolute");
@@ -769,7 +776,11 @@ export class TelegramMarkdownProjector {
 		} finally { await handle.close(); }
 	}
 
-	async reconcileMediaEvents(records: readonly JournalRecord[], signal?: AbortSignal): Promise<number> {
+	reconcileMediaEvents(records: readonly JournalRecord[], signal?: AbortSignal): Promise<number> {
+		return this.#liveWrite(() => this.#reconcileMediaEvents(records, signal));
+	}
+
+	async #reconcileMediaEvents(records: readonly JournalRecord[], signal?: AbortSignal): Promise<number> {
 		signal?.throwIfAborted();
 		await ensureOwnedRoot(this.#root);
 		const stateRoot = await ensureArchiveStateRoot(this.#root);
@@ -896,7 +907,11 @@ export class TelegramMarkdownProjector {
 		return result;
 	}
 
-	async reconcile(records: readonly JournalRecord[], session: ReadonlySessionManager, append: (record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>) => Promise<void>, signal?: AbortSignal): Promise<ProjectionResult> {
+	reconcile(records: readonly JournalRecord[], session: ReadonlySessionManager, append: (record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>) => Promise<void>, signal?: AbortSignal): Promise<ProjectionResult> {
+		return this.#liveWrite(() => this.#reconcile(records, session, append, signal));
+	}
+
+	async #reconcile(records: readonly JournalRecord[], session: ReadonlySessionManager, append: (record: Extract<JournalRecord, { type: "projection_needed" | "projection_committed" | "projection_deferred" }>) => Promise<void>, signal?: AbortSignal): Promise<ProjectionResult> {
 		signal?.throwIfAborted();
 		await ensureOwnedRoot(this.#root);
 		const stateRoot = await ensureArchiveStateRoot(this.#root);
@@ -905,7 +920,7 @@ export class TelegramMarkdownProjector {
 		const sessionFile = session.getSessionFile();
 		const sessionRoot = this.#sessionRoot ?? (sessionFile ? dirname(resolve(sessionFile)) : undefined);
 		if (!sessionRoot) throw new ArchiveSafetyError("Active SessionManager has no persisted session root");
-		await this.reconcileMediaEvents(records, signal);
+		await this.#reconcileMediaEvents(records, signal);
 		const mediaEvents = (await readMediaEvents(join(stateRoot, "media-events.jsonl"))).events;
 		const built = await buildCandidates(records, mediaEvents, session, sessionRoot);
 		for (const item of built.deferred) {

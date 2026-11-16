@@ -83,7 +83,10 @@ for the others.
    session evidence into canonical Markdown on a separate coalesced worker;
    successful publication can request a coalesced datastore refresh. That worker
    snapshots the owning bridge's records and appends projection receipts through
-   its existing journal tail. It does not block new admission, receipt feedback
+   its existing journal tail. Live projection and media-event synchronization on
+   the same projector share one mutation chain, so those cooperating writers do
+   not contend for their own archive lock. Separate projector/process writers
+   still require the existing file lock. It does not block new admission, receipt feedback
    or the next poll. Replacement/shutdown cancel and drain its work; the initial
    startup reconciliation still finishes before polling starts.
 
@@ -293,6 +296,7 @@ is named. This is not an exhaustive inventory of every protocol/library bound.
 | --- | --- |
 | HTTP request deadline 35,000 ms; long-poll parameter 25 seconds. Location: `src/runtime.ts:TelegramApiClient`. | Abort request waits under the existing transport envelope. Specific numeric necessity/approval is not established; a server poll parameter is not proof the whole request completes in that time. |
 | Reconnect backoff: base `min(30000,1000*2**min(failures,5))`, multiplier 0.75-1.25, capped 30,000 ms. Location: `src/runtime.ts:reconnectDelay`. | Current retry scheduling after poll failure. Approval for this policy/formula is not established by its age or tests. |
+| Archive mutation requires the existing exclusive file lock in `TelegramMarkdownProjector` / `PollerLock`; cooperating live projection and media synchronization on one instance queue behind the same mutation chain. No retry timer or new deadline. | Prevents competing manifest/media-event writes and preserves canonical predecessor integrity. Same-instance ordering retains the existing exclusive-write contract without a new admission cap; queued calls check cancellation before starting. The original specific lock-policy approval reference is not established. |
 | Active-step elapsed display: first suffix at 30,000 ms, updated every 30,000 ms. Locations: `TelegramStepClock` / activity worker in `src/runtime.ts` and command phases in `src/index.ts`; fixed by component maintainers. Approved by Sean on 2026-11-16 for visibility of time on an unchanged displayed step. | Shows `[HH:MM:SS]` without a deadline, whole-turn timer, automatic cancellation or new retry policy. Successful substantive status changes reset the clock; timer edits and duplicate statuses do not. Stops with the activity/phase lifecycle. |
 | Election step 2,000 ms and activity edit minimum 1,000 ms by default. Location: group configuration/activity in `src/runtime.ts`. Command workers in `src/index.ts` use 0 ms to retain the existing unthrottled command-phase edits. | These schedule election/activity work. The exact default values and rate-policy approval need evidence; their values are unchanged. Reusing the admission receipt does not add a command-phase throttle. |
 | Selector page 6 entries, retained pickers 32, TTL 600,000 ms. Location: `src/selectors.ts`. | Limits button views/retention and rejects stale controls. Specific pagination/retention values' necessity and approval are not established. |
