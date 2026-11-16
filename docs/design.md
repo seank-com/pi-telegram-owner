@@ -382,6 +382,8 @@ claims, so nothing else can start between the claim and the turn.
 
 Authenticated private model input and ordinary command jobs get an ephemeral receipt immediately after
 minimal durable admission, before quiet-window dispatch or slow housekeeping.
+A busy open batch gets a generic queued receipt; its ready-queue position is
+shown only after sealing, rather than predicting it during collection.
 The same single-flight message progresses through collection/queued status,
 `Thinking (NN%)`, and tool intents. A failed receipt send does not reject input,
 block dispatch, or create an activity journal entry for an unknown message id.

@@ -53,6 +53,16 @@ test("same-date fragments share their canonical batch receipt and duplicate or u
 	assert.equal(h.journal.records.filter((r) => r.type === "activity_started").length, 1);
 });
 
+test("an open busy batch does not falsely promise to start next ahead of an older queued request", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const h = host(); h.setIdle(false); t.after(() => h.emit("session_shutdown", { reason: "test" })); await h.start();
+	await h.batch([input(1)]); await flush(); t.mock.timers.tick(4_000); await flush();
+	assert.equal(recover(h.journal.records).queued.length, 1);
+	await h.batch([input(2, "Synthetic later input", 124)]); await flush();
+	assert.deepEqual(h.calls.filter((call) => call.startsWith("send:20:")), ["send:20:Queued: The agent is busy."]);
+	assert.equal(recover(h.journal.records).queued.length, 1, "the new batch is still being collected, not positioned in the ready queue");
+});
+
 test("early feedback starts only after durable authentication and batch admission", async (t) => {
 	const journal = new MemoryJournal(), entered = gate(), held = gate(), append = journal.append.bind(journal);
 	journal.append = async (record) => { if (record.type === "update" && record.disposition === "accepted") { entered.release(); await held.promise; } await append(record); };

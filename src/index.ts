@@ -354,10 +354,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		const startReceiptFeedback = (job: Job, ctx: ExtensionContext): void => {
 			startReceiptTyping();
-			const position = bridge?.jobsAwaitingQueuedNotice().find((entry) => entry.job.jobId === job.jobId)?.position ?? 0;
-			const text = job.command ? "Received." : !ctx.isIdle() || compacting || switching
-				? queuedNoticeText(agentLabel, position)
-				: job.batchId ? "Collecting..." : "Received.";
+			let text: string;
+			if (job.command) text = "Received.";
+			else if (!ctx.isIdle() || compacting || switching) {
+				const position = bridge?.queuedJobs.findIndex((entry) => entry.jobId === job.jobId) ?? -1;
+				text = position < 0 ? `Queued: ${agentLabel} is busy.` : queuedNoticeText(agentLabel, position);
+			} else text = job.batchId ? "Collecting..." : "Received.";
 			feedbackFor(job, text)?.update(text);
 		};
 
