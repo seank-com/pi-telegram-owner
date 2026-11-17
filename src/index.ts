@@ -1,9 +1,12 @@
+import { LocalSelectors, type SelectorTransport } from "./selectors.ts";
+import { saveProjectPreferences } from "./preferences.ts";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { createDatastoreIntegration, parseDatastorePolicy, type DatastorePolicy } from "./datastore.ts";
+import { createDatastoreIntegration, parseDatastorePolicy, refreshPublishedPaths, refreshPrivatePublishedPaths, type DatastorePolicy } from "./datastore.ts";
 import { formatTelegramToolActivity } from "./activity.ts";
 import { TelegramMarkdownProjector } from "./markdown-projector.ts";
 import {
@@ -44,6 +47,7 @@ import {
 	sanitizeError,
 	TelegramActivityMessage,
 	TelegramReplyAnchorError,
+	TelegramStepClock,
 	TelegramTypingActivity,
 	type GroupChatConfig,
 } from "./runtime.ts";
@@ -69,9 +73,10 @@ export interface PrototypeDependencies {
 	/** Mandatory media-event stream writer, including when note projection is disabled. */
 	mediaProjector?: TelegramMarkdownProjector;
 	/** Enqueues coalesced lexical maintenance after durable Markdown publication. */
-	requestLexicalRefresh?(signal?: AbortSignal): Promise<void>;
+	requestLexicalRefresh?(signal?: AbortSignal, paths?: readonly string[]): Promise<void>;
 	source: PrototypeSource;
 	sendReply(text: string, replyToMessageId?: number, format?: "HTML" | "plain"): Promise<string>;
+	selectorTransport?: SelectorTransport;
 	reconcileCommandMenu?(signal?: AbortSignal): Promise<void>;
 	/** Sends a transient activity or queued notice, as a reply when a message is given. */
 	sendActivity?(text: string, signal: AbortSignal, replyToMessageId?: number): Promise<string>;
@@ -155,6 +160,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		};
 		const projectionRefreshDebounceMs = options.projectionRefreshDebounceMs ?? 250;
 		let bridge: TelegramOwnerBridge | undefined;
+		let selectors: LocalSelectors | undefined;
+		let selectorAnswerController = new AbortController();
+		const selectorAnswers = new Set<Promise<void>>();
+		let hostCompacting = false;
+		let hostTransition = false;
 		let runtimeDependencies: PrototypeDependencies | undefined;
 		let stopSource: (() => Promise<void>) | undefined;
 		let currentContext: ExtensionContext | undefined;
@@ -163,6 +173,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		let receiptTypingInFlight: Promise<void> | undefined;
 		let receiptTypingPending = 0;
 		let activity: TelegramActivityMessage | undefined;
+		const feedbackMessages = new Map<string, TelegramActivityMessage>();
+		let markdownPending: { ctx: ExtensionContext; owner: TelegramOwnerBridge; generation: number } | undefined;
+		let markdownWorker: Promise<void> | undefined;
+		let workPending = false;
+		let workScheduled = false;
+		const touchedFeedbackBatches = new Set<string>();
 		let quietTimer: ReturnType<typeof setTimeout> | undefined;
 		let projectionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 		let projectionRefreshPending = false;
@@ -184,6 +200,20 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		let lastGroupError: string | undefined;
 		let compacting = false;
 		let switching = false;
+		const COMPACTING_TEXT = "Compacting";
+		const commandReceipt = {
+			compact: "Compaction requested...",
+			new: "Starting new session...",
+		} as const;
+		let phaseController = new AbortController();
+		type PhaseNotice = { id: string; jobId: string; commandOwned: boolean; text: string; requestedText: string; suffix?: string; clock: TelegramStepClock; controller: AbortController };
+		let phaseNotice: PhaseNotice | undefined;
+		let phaseFeedback: { jobId: string; message: TelegramActivityMessage; commandOwned: boolean } | undefined;
+		let phaseEditTail: Promise<void> = Promise.resolve();
+		const stopPhaseSends = (): void => {
+			phaseNotice?.clock.stop();
+			phaseController.abort(new Error("Telegram owner bridge stopped"));
+		};
 		let agentLabel = GENERIC_AGENT_LABEL;
 		let disabledReason = "configuration absent";
 
@@ -248,6 +278,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			updateStatus();
 		};
 
+		const cancelSelectorAnswers = (): void => {
+			selectorAnswerController.abort(new Error("Telegram owner bridge stopped"));
+		};
+
 		const startReceiptTyping = (): void => {
 			if (connection.phase === "stopping" || !runtimeDependencies?.sendTyping) return;
 			if (receiptTypingInFlight) { receiptTypingPending += 1; return; }
@@ -289,24 +323,57 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		const stopTyping = (): Promise<void> => typing?.stop() ?? Promise.resolve();
 
-		const startActivity = (job: Job, ctx: ExtensionContext): void => {
+		const feedbackFor = (job: Job, text: string): TelegramActivityMessage | undefined => {
+			const existing = feedbackMessages.get(job.jobId);
+			if (existing) return existing;
 			const transport = transportFor(job.item);
-			if (!bridge || !transport) return;
+			const owner = bridge;
+			if (!owner || !transport) return;
 			lastActivityError = undefined;
-			activity = new TelegramActivityMessage(job.jobId, {
-				send: (text, signal) => transport.sendActivity(text, signal, anchorOf(job)),
-				existingMessageId: bridge.openActivity(job.jobId, 'private'),
+			const feedbackGeneration = generation;
+			const phaseSignal = job.command ? phaseController.signal : undefined;
+			const message = new TelegramActivityMessage(job.jobId, {
+				...(job.command ? { minimumEditIntervalMs: 0 } : {}),
+				send: (text, signal) => transport.sendActivity(text, phaseSignal ?? signal, anchorOf(job)),
+				existingMessageId: owner.openActivity(job.jobId, 'private'),
 				...(activityContext(job.item) ? { prefix: activityContext(job.item) } : {}),
 				edit: (messageId, text, signal) => transport.editActivity(messageId, text, signal),
 				delete: (messageId, signal) => transport.deleteActivity(messageId, signal),
-				onStarted: (startedJobId, messageId) => bridge!.recordActivityStarted(startedJobId, messageId, 'private'),
-				onCleared: (clearedJobId, messageId) => bridge!.recordActivityCleared(clearedJobId, messageId, 'private'),
+				onStarted: (startedJobId, messageId) => owner.recordActivityStarted(startedJobId, messageId, 'private'),
+				onCleared: (clearedJobId, messageId) => owner.recordActivityCleared(clearedJobId, messageId, 'private'),
 				onFailure: (operation, error) => {
+					if (feedbackGeneration !== generation || connection.phase === "stopping") return;
 					lastActivityError = `${operation}: ${sanitizeError(error)}`;
 					updateStatus();
 				},
-			}, initialThinkingText(ctx.getContextUsage?.()?.percent));
-			activity.start();
+			}, text);
+			feedbackMessages.set(job.jobId, message);
+			message.start();
+			return message;
+		};
+
+		const startReceiptFeedback = (job: Job, ctx: ExtensionContext): void => {
+			startReceiptTyping();
+			let text: string;
+			if (job.command) text = "Received.";
+			else if (!ctx.isIdle() || compacting || switching) {
+				const position = bridge?.queuedJobs.findIndex((entry) => entry.jobId === job.jobId) ?? -1;
+				text = position < 0 ? `Queued: ${agentLabel} is busy.` : queuedNoticeText(agentLabel, position);
+			} else text = job.batchId ? "Collecting..." : "Received.";
+			feedbackFor(job, text)?.update(text);
+		};
+
+		const startActivity = (job: Job, ctx: ExtensionContext): void => {
+			// The receipt already exists; context calculation never gates first feedback.
+			const text = initialThinkingText(ctx.getContextUsage?.()?.percent);
+			activity = feedbackFor(job, text);
+			activity?.update(text);
+		};
+
+		const haltFeedbackMessages = async (): Promise<void> => {
+			const messages = [...feedbackMessages.values()];
+			feedbackMessages.clear();
+			await Promise.all(messages.map((message) => message.halt()));
 		};
 
 		/** Stops activity updates; the message stays until its job's reply is sent. */
@@ -314,6 +381,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			const current = activity;
 			activity = undefined;
 			await current?.halt();
+			for (const [id, message] of feedbackMessages) if (message === current) feedbackMessages.delete(id);
 			return current;
 		};
 
@@ -321,10 +389,20 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		/** Deletes activity and queued-notice messages whose job has finished. */
 		const cleanupFinishedActivities = async (): Promise<void> => {
 			if (!bridge) return;
+			for (const id of bridge.finishedFeedbackJobs(feedbackMessages.keys())) {
+				const feedback = feedbackMessages.get(id)!;
+				await feedback.halt();
+				feedbackMessages.delete(id);
+			}
 			for (const finished of bridge.finishedActivities()) {
 				const transport = finished.destination === 'group' ? groupRuntime?.transport : transportFor(bridge.itemFor(finished.jobId));
 				const deletionKey = `${finished.destination}:${finished.messageId}`;
 				if (!transport || failedActivityDeletes.has(deletionKey)) continue;
+				if (finished.destination !== 'group' && phaseNotice?.jobId === finished.jobId && phaseNotice.id === finished.messageId) {
+					phaseNotice.clock.stop();
+					phaseNotice.controller.abort(new Error("Telegram phase finished"));
+					await phaseEditTail;
+				}
 				try {
 					await transport.deleteActivity(finished.messageId, new AbortController().signal);
 				} catch (error) {
@@ -340,25 +418,17 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		/** Tells the owner which accepted requests are waiting behind other work. */
 		const postQueuedNotices = async (): Promise<void> => {
 			if (!bridge || connection.phase === "stopping") return;
+			for (const [position, job] of bridge.queuedJobs.entries()) {
+				if (job.jobId !== bridge.activeJob?.jobId) feedbackMessages.get(job.jobId)?.update(queuedNoticeText(agentLabel, position));
+			}
 			for (const { job, position } of bridge.jobsAwaitingQueuedNotice()) {
-				const transport = transportFor(job.item);
-				if (!transport) continue;
-				let messageId: string;
-				try {
-					const context = activityContext(job.item);
-					messageId = await transport.sendActivity(`${context ? `${context}\n` : ""}${queuedNoticeText(agentLabel, position)}`, new AbortController().signal, anchorOf(job));
-				} catch (error) {
-					// A failed notice does not change the task's final reply routing.
-					lastActivityError = `queued: ${sanitizeError(error)}`;
-					updateStatus();
-					continue;
-				}
-				await bridge.recordActivityStarted(job.jobId, messageId, 'private');
+				const text = queuedNoticeText(agentLabel, position);
+				feedbackFor(job, text)?.update(text);
 			}
 		};
 
 		const syncMediaEvents = async (): Promise<void> => {
-			if (bridge && runtimeDependencies?.mediaProjector) await runtimeDependencies.mediaProjector.reconcileMediaEvents(bridge.journalRecords);
+			if (bridge && runtimeDependencies?.mediaProjector) await runtimeDependencies.mediaProjector.reconcileMediaEvents(bridge.journalRecords, projectionRefreshController?.signal);
 		};
 
 		const capturePendingInboundMedia = async (): Promise<void> => {
@@ -371,7 +441,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			await syncMediaEvents();
 		};
 
+		const rearmPendingBatches = async (): Promise<void> => {
+			if (touchedFeedbackBatches.size) await bridge?.rearmQuietDeadline([...touchedFeedbackBatches]);
+		};
+
 		const dispatchIfIdle = async (ctx: ExtensionContext): Promise<void> => {
+			await rearmPendingBatches();
 			if (!bridge || bridge.pendingReplyCount > 0 || compacting || switching || !ctx.isIdle()) return;
 			await bridge.dispatchNext(
 				ctx.sessionManager.getSessionId(),
@@ -404,13 +479,15 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			if (quietTimer) clearTimeout(quietTimer);
 			quietTimer = undefined;
 			const delay = bridge?.nextBatchReadyDelayMs;
-			if (delay === undefined || (delay === 0 && !ctx.isIdle())) return;
-			quietTimer = setTimeout(() => { quietTimer = undefined; void serialized(async () => { await bridge?.sealReadyBatches(); await dispatchIfIdle(ctx); await postQueuedNotices(); scheduleQuietDispatch(ctx); }); }, delay);
+			if (delay === undefined) return;
+			quietTimer = setTimeout(() => { quietTimer = undefined; void serialized(async () => { await rearmPendingBatches(); await bridge?.sealReadyBatches(); await dispatchIfIdle(ctx); await postQueuedNotices(); scheduleQuietDispatch(ctx); }); }, delay);
 			quietTimer.unref?.();
 		};
 
-		const scheduleProjectionRefresh = (ownGeneration: number): void => {
+		const pendingProjectionPaths = new Set<string>();
+		const scheduleProjectionRefresh = (ownGeneration: number, paths: readonly string[] = []): void => {
 			if (datastorePolicy.mode === "off" || (!integration.available() && !options.dependencies?.requestLexicalRefresh)) return;
+			for (const path of paths) pendingProjectionPaths.add(path);
 			projectionRefreshPending = true;
 			if (projectionRefreshTimer || projectionRefreshInFlight || !runtimeDependencies?.requestLexicalRefresh) return;
 			projectionRefreshTimer = setTimeout(() => {
@@ -419,7 +496,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				projectionRefreshPending = false;
 				const request = runtimeDependencies.requestLexicalRefresh;
 				const signal = projectionRefreshController?.signal;
-				projectionRefreshInFlight = request(signal).then(() => {
+				const noted = [...pendingProjectionPaths];
+				pendingProjectionPaths.clear();
+				projectionRefreshInFlight = request(signal, noted).then(() => {
 					lastIndexError = undefined;
 				}, (error) => {
 					if (!signal?.aborted) lastIndexError = sanitizeError(error);
@@ -432,19 +511,36 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			projectionRefreshTimer.unref?.();
 		};
 
-		const reconcileMarkdown = async (ctx?: ExtensionContext): Promise<void> => {
-			if (!bridge || !runtimeDependencies?.markdownProjector || !ctx) return;
+		const reconcileMarkdown = async (ctx?: ExtensionContext, owner = bridge): Promise<void> => {
+			const projector = runtimeDependencies?.markdownProjector;
+			const ownGeneration = generation;
+			const signal = projectionRefreshController?.signal ?? ctx?.signal;
+			if (!owner || !projector || !ctx) return;
 			try {
-				const result = await runtimeDependencies.markdownProjector.reconcile(
-					bridge.journalRecords,
-					ctx.sessionManager,
-					(record) => bridge!.appendArchiveRecord(record),
-					ctx.signal,
+				const result = await projector.reconcile(
+					[...owner.journalRecords], ctx.sessionManager,
+					(record) => owner.appendArchiveRecord(record), signal,
 				);
-				if (result.projected > 0) scheduleProjectionRefresh(generation);
+				if (result.projected > 0 && generation === ownGeneration) scheduleProjectionRefresh(ownGeneration, result.paths);
 			} catch (error) {
-				noteError(error);
+				if (!signal?.aborted) noteError(error);
 			}
+		};
+
+		const queueMarkdown = (ctx = currentContext): void => {
+			if (!ctx || !bridge || !runtimeDependencies?.markdownProjector || connection.phase === "stopping") return;
+			markdownPending = { ctx, owner: bridge, generation };
+			if (markdownWorker) return;
+			markdownWorker = (async () => {
+				while (markdownPending) {
+					const work = markdownPending;
+					markdownPending = undefined;
+					if (work.generation === generation && bridge === work.owner) await reconcileMarkdown(work.ctx, work.owner);
+				}
+			})().finally(() => {
+				markdownWorker = undefined;
+				if (markdownPending) queueMarkdown(markdownPending.ctx);
+			});
 		};
 
 		const retryPendingReplies = async (): Promise<void> => {
@@ -455,10 +551,40 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			} catch (error) {
 				noteError(error);
 			} finally {
-				await reconcileMarkdown(currentContext);
+				queueMarkdown();
 				await cleanupFinishedActivities().catch((error) => noteError(error));
 				groupRuntime?.notifyReplies();
 			}
+		};
+
+		const scheduleWork = (ctx: ExtensionContext): void => {
+			if (connection.phase === "stopping") return;
+			workPending = true;
+			if (workScheduled) return;
+			workScheduled = true;
+			const ownGeneration = generation;
+			void serialized(async () => {
+				while (workPending && generation === ownGeneration && connection.phase !== "stopping") {
+					const owner = bridge;
+					workPending = false;
+					const touched = [...touchedFeedbackBatches];
+					touchedFeedbackBatches.clear();
+					await processPendingCommands(ctx);
+					if (generation !== ownGeneration || bridge !== owner) break;
+					await capturePendingInboundMedia();
+					if (generation !== ownGeneration || bridge !== owner) break;
+					await retryPendingReplies();
+					if (generation !== ownGeneration || bridge !== owner) break;
+					await bridge?.rearmQuietDeadline(touched);
+					await dispatchIfIdle(ctx);
+					await postQueuedNotices();
+					await bridge?.rearmQuietDeadline(touched);
+					scheduleQuietDispatch(ctx);
+				}
+			}).catch((error) => { if (generation === ownGeneration && connection.phase !== "stopping") noteError(error); }).finally(() => {
+				workScheduled = false;
+				if (workPending && currentContext) scheduleWork(currentContext);
+			});
 		};
 
 		const contextText = (ctx: ExtensionContext): string => {
@@ -488,6 +614,77 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			].join("\n");
 		};
 
+		const showPhase = async (jobId: string, text: string, commandOwned: boolean): Promise<void> => {
+			const shared = feedbackMessages.get(jobId);
+			if (shared) {
+				phaseFeedback = { jobId, message: shared, commandOwned };
+				shared.update(text);
+				await shared.flush();
+				return;
+			}
+			const send = runtimeDependencies?.sendActivity;
+			const signal = phaseController.signal;
+			if (!send || !bridge || signal.aborted) return;
+			try {
+				const id = await send(text, signal);
+				await bridge.recordActivityStarted(jobId, id, "private");
+				phaseNotice?.clock.stop();
+				const notice: PhaseNotice = { id, jobId, commandOwned, text, requestedText: text, controller: new AbortController(),
+					clock: new TelegramStepClock((suffix) => { notice.suffix = suffix; void editPhase(notice, notice.text, suffix); }) };
+				phaseNotice = notice;
+				if (!signal.aborted) notice.clock.reset();
+			} catch (error) {
+				if (signal.aborted) return;
+				lastActivityError = `phase: ${sanitizeError(error)}`;
+				updateStatus();
+			}
+		};
+		// Phase edits have their own short operation chain; stale timer work cannot retitle a newer phase.
+		const editPhase = (notice: PhaseNotice, text: string, suffix?: string): Promise<void> => {
+			if (suffix === undefined) notice.requestedText = text;
+			const edit = phaseEditTail.then(async () => {
+				if (phaseNotice !== notice || !runtimeDependencies?.editActivity) return;
+				const signal = AbortSignal.any([phaseController.signal, notice.controller.signal]);
+				if (signal.aborted || notice.requestedText !== text || (suffix !== undefined ? notice.text !== text || notice.suffix !== suffix : notice.text === text)) return;
+				try {
+					await runtimeDependencies.editActivity(notice.id, text + (suffix ?? ""), signal);
+					if (suffix === undefined && phaseNotice === notice && !signal.aborted) {
+						notice.text = text;
+						notice.suffix = undefined;
+						notice.clock.reset();
+					}
+				} catch (error) {
+					if (signal.aborted) return;
+					if (suffix === undefined && notice.requestedText === text) notice.requestedText = notice.text;
+					lastActivityError = `phase: ${sanitizeError(error)}`;
+					updateStatus();
+				}
+			});
+			phaseEditTail = edit.catch(() => undefined);
+			return phaseEditTail;
+		};
+		const retitlePhase = async (text: string): Promise<void> => {
+			if (phaseFeedback) { phaseFeedback.message.update(text, true); await phaseFeedback.message.flush(); return; }
+			if (!phaseNotice) { await showPhase(randomUUID(), text, false); return; }
+			await editPhase(phaseNotice, text);
+		};
+		const clearPhase = async (): Promise<void> => {
+			if (phaseFeedback) {
+				const shared = phaseFeedback; phaseFeedback = undefined;
+				if (shared.commandOwned) { await shared.message.halt(); await cleanupFinishedActivities(); }
+				return;
+			}
+			const notice = phaseNotice;
+			if (!notice || !bridge) return;
+			notice.clock.stop();
+			notice.controller.abort(new Error("Telegram phase finished"));
+			await phaseEditTail;
+			if (!notice.commandOwned) await bridge.appendPhaseRelease(notice.jobId);
+			await cleanupFinishedActivities();
+			if (phaseNotice === notice && !bridge.openActivity(notice.jobId, "private")) phaseNotice = undefined;
+		};
+		const phaseStillOwned = (owned: number): boolean => owned === generation && connection.phase !== "stopping" && !phaseController.signal.aborted;
+
 		const completeCommand = async (job: Job, text: string): Promise<void> => {
 			if (!bridge) return;
 			await bridge.completeCommand(job, text);
@@ -505,6 +702,22 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				case "status":
 					await completeCommand(job, ownerStatusText(ctx));
 					return "continue";
+				case "save": {
+					if (!ctx.model || typeof pi.getThinkingLevel !== "function") {
+						await completeCommand(job, "Current model/thinking is unavailable; nothing was saved.");
+						return "continue";
+					}
+					const preferences = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
+					let reply: string;
+					try {
+						const path = await saveProjectPreferences(projectRoot, CONFIG_DIR_NAME, preferences);
+						reply = `Saved project defaults to ${path}\nModel: ${preferences.provider}/${preferences.model}\nThinking: ${preferences.thinking}\nDefaults are read on the next Pi start; resuming still restores session choices.`;
+					} catch (error) {
+						reply = `Save failed: ${sanitizeError(error)}`;
+					}
+					await completeCommand(job, reply);
+					return "continue";
+				}
 				case "unknown":
 					await completeCommand(job, unsupportedTelegramCommandText());
 					return "continue";
@@ -531,24 +744,38 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					compacting = true;
 					updateStatus();
-					ctx.compact({
-						onComplete: () => {
-							void serialized(async () => {
-								compacting = false;
-								await completeCommand(job, `Compaction complete.\n${contextText(ctx)}`);
-								await processPendingCommands(ctx);
-								await dispatchIfIdle(ctx);
-							});
-						},
-						onError: (error) => {
-							void serialized(async () => {
-								compacting = false;
-								await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
-								await processPendingCommands(ctx);
-								await dispatchIfIdle(ctx);
-							});
-						},
-					});
+					const owned = generation;
+					await showPhase(job.jobId, commandReceipt.compact, true);
+					if (!phaseStillOwned(owned)) {
+						compacting = false;
+						return "continue";
+					}
+					try {
+						ctx.compact({
+							onComplete: () => {
+								void serialized(async () => {
+									compacting = false;
+									await completeCommand(job, `Compaction complete.\n${contextText(ctx)}`);
+									await clearPhase();
+									await processPendingCommands(ctx);
+									await dispatchIfIdle(ctx);
+								});
+							},
+							onError: (error) => {
+								void serialized(async () => {
+									compacting = false;
+									await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
+									await clearPhase();
+									await processPendingCommands(ctx);
+									await dispatchIfIdle(ctx);
+								});
+							},
+						});
+					} catch (error) {
+						compacting = false;
+						await completeCommand(job, `Compaction failed: ${sanitizeError(error)}`);
+						await clearPhase();
+					}
 					return "continue";
 				}
 				case "new":
@@ -558,6 +785,12 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					}
 					switching = true;
 					updateStatus();
+					const owned = generation;
+					await showPhase(job.jobId, commandReceipt.new, true);
+					if (!phaseStillOwned(owned)) {
+						switching = false;
+						return "continue";
+					}
 					try {
 						await Promise.resolve(
 							pi.sendUserMessage(`/telegram-status __new-session__:${job.jobId}`, { expandPromptTemplates: true }),
@@ -566,6 +799,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					} catch (error) {
 						switching = false;
 						await bridge.interruptCommand(job, "Session replacement command dispatch failed", `/new failed: ${sanitizeError(error)}`);
+						await clearPhase();
 						await retryPendingReplies();
 						return "continue";
 					}
@@ -651,12 +885,17 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		let groupRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 		/** Coalesces lexical refreshes of the group store; never queued against an absent integration. */
-		const scheduleGroupRefresh = (): void => {
-			if (groupRefreshTimer || groupPolicy.mode === "off" || !groupIntegration.available()) return;
+		const pendingGroupPaths = new Set<string>();
+		const scheduleGroupRefresh = (paths?: readonly string[]): void => {
+			if (groupPolicy.mode === "off" || !groupIntegration.available()) return;
+			for (const path of paths ?? []) pendingGroupPaths.add(path);
+			if (groupRefreshTimer) return;
 			groupRefreshTimer = setTimeout(() => {
 				groupRefreshTimer = undefined;
 				if (!groupIntegration.available()) return;
-				void groupIntegration.service.refresh({ action: "start", store: groupPolicy.store, mode: "lexical" }).catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
+				const noted = [...pendingGroupPaths];
+				pendingGroupPaths.clear();
+				void refreshPublishedPaths(groupIntegration.service, groupPolicy.store, noted, undefined, true).catch((error) => { lastGroupError = sanitizeError(error); updateStatus(); });
 			}, projectionRefreshDebounceMs);
 			groupRefreshTimer.unref?.();
 		};
@@ -740,7 +979,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				connection = { phase: "disabled", lastError: disabledReason };
 				return undefined;
 			}
-			const groupUpdates = ["message", "chat_member", "my_chat_member"];
+			const groupUpdates = ["message", "callback_query", "chat_member", "my_chat_member"];
 			const api = config.createApiClient(config.groupChat ? { allowedUpdates: groupUpdates } : {});
 			const groupApi = config.groupChat ? config.createApiClient({ chatId: config.groupChat.chatId }) : undefined;
 			const requests = new AbortController();
@@ -760,7 +999,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				...(config.groupChat && groupApi ? { groupChat: { config: config.groupChat, api: groupApi } } : {}),
 				markdownProjector: config.markdownProjection ? mediaProjector : undefined,
 				mediaProjector,
-				requestLexicalRefresh: async (signal) => { if (integration.available()) await datastoreClient.refresh({ action: "start", store: datastorePolicy.store, mode: "lexical" }, signal); },
+				requestLexicalRefresh: (signal, paths) => refreshPrivatePublishedPaths(datastoreClient, datastorePolicy.store, paths, signal, integration.available()),
 				resolveAgentLabel: config.agentLabel === undefined
 					? (signal) => api.getBotFirstName(signal ?? requests.signal)
 					: undefined,
@@ -771,6 +1010,11 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					},
 				},
 				sendReply: (text, replyTo, format) => api.sendMessage(text, replyTo, requests.signal, format),
+				selectorTransport: {
+					send: (text, keyboard, replyTo) => api.sendMessage(text, replyTo, requests.signal, "plain", keyboard),
+					edit: (messageId, text, keyboard) => api.editMessageText(messageId, text, requests.signal, keyboard),
+					answer: (callbackId, text, signal) => api.answerCallbackQuery(callbackId, signal ? AbortSignal.any([requests.signal, signal]) : requests.signal, text),
+				},
 				reconcileCommandMenu: (signal) => api.setOwnerCommandMenu(signal ?? requests.signal),
 				sendActivity: async (text, signal, replyTo) => {
 					try {
@@ -830,7 +1074,9 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 				return {content:[{type:'text' as const,text:`Published ${result.kind} as group message ${result.messageId}. Publication is not completion of requested work.`}],details:result};
 			},
 		});
-		pi.on("resources_discover", () => { updateRecall(); updateStatus(); });
+		pi.on("resources_discover", () => { selectors?.invalidate(); updateRecall(); updateStatus(); });
+		pi.on("model_select", () => { selectors?.invalidate(); });
+		pi.on("thinking_level_select", () => { selectors?.invalidate(); });
 		registerTelegramTimelineTool(pi, () => runtimeDependencies?.markdownProjector);
 
 		pi.registerTool({
@@ -889,6 +1135,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 						await serialized(async () => {
 							switching = false;
 							await bridge?.interruptCommand(job, "Session replacement was cancelled", "/new was cancelled; the current session is unchanged.");
+							await clearPhase();
 							await retryPendingReplies();
 							await processPendingCommands(ctx);
 							await dispatchIfIdle(ctx);
@@ -898,6 +1145,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					await serialized(async () => {
 						switching = false;
 						await bridge?.interruptCommand(job, "Session replacement failed", `/new failed: ${sanitizeError(error)}`);
+						await clearPhase();
 						await retryPendingReplies();
 						await processPendingCommands(ctx);
 						await dispatchIfIdle(ctx);
@@ -908,9 +1156,21 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 
 		pi.on("session_start", async (event, ctx) => {
 			currentContext = ctx;
+			hostCompacting = false;
+			hostTransition = false;
+			compacting = false;
+			switching = false;
+			selectors?.invalidate();
 			integration.start();
 			updateRecall();
 			generation += 1;
+			workPending = false;
+			touchedFeedbackBatches.clear();
+			phaseNotice?.clock.stop();
+			phaseController.abort(new Error("Telegram owner session replaced"));
+			phaseController = new AbortController();
+			phaseNotice = undefined;
+			phaseFeedback = undefined;
 			await stopReceiptTyping();
 			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
 			projectionRefreshTimer = undefined;
@@ -918,6 +1178,10 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			projectionRefreshController?.abort(new Error("Telegram owner session replaced"));
 			await projectionRefreshInFlight;
 			projectionRefreshInFlight = undefined;
+			markdownPending = undefined;
+			await markdownWorker;
+			await haltFeedbackMessages();
+			activity = undefined;
 			projectionRefreshController = new AbortController();
 			lastIndexError = undefined;
 			const ownGeneration = generation;
@@ -952,6 +1216,26 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					})
 					: undefined;
 				const recovered = await bridge.initialize();
+				const selectorBridge = bridge;
+
+				selectors = new LocalSelectors({
+					owner: runtimeDependencies.ownerUserId, chat: runtimeDependencies.privateChatId,
+					journal: {
+						get records() { return selectorBridge.journalRecords.filter((record) => record.type === "selector"); },
+						append: (record) => selectorBridge.appendSelectorRecord(record),
+					},
+					transport: runtimeDependencies.selectorTransport,
+					pi, context: () => currentContext!,
+					idle: () => generation === ownGeneration && !compacting && !switching && !hostCompacting && !hostTransition &&
+						Boolean(currentContext?.isIdle()) && !currentContext?.hasPendingMessages?.() && !selectorBridge.activeJob &&
+						selectorBridge.queueDepth === 0 && selectorBridge.pendingCommands.length === 0 &&
+						selectorBridge.uncertainCommands.length === 0 && selectorBridge.pendingReplyCount === 0 &&
+						selectorBridge.nextBatchReadyDelayMs === undefined,
+				});
+				await selectors.initialize();
+				const localSelectors = selectors;
+				const answerController = new AbortController();
+				selectorAnswerController = answerController;
 				await capturePendingInboundMedia();
 				await reconcileMarkdown(ctx);
 				if (runtimeDependencies.reconcileCommandMenu) {
@@ -969,21 +1253,36 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					"Previous request was interrupted by Pi restart; please resend.",
 				);
 				await recoverUncertainCommands(event.reason, ctx);
-				stopSource = await runtimeDependencies.source.start(async (updates) =>
-					serialized(async () => {
-						if (generation !== ownGeneration || !bridge) return bridge?.cursor;
-						const state = await bridge.ingestBatch(updates);
-						groupRuntime?.notifyUpdates();
-						groupRuntime?.notifyIdle();
-						for (let index = 0; index < state.acceptedModelInputCount; index++) startReceiptTyping();
-						await capturePendingInboundMedia();
-						await retryPendingReplies();
-						await processPendingCommands(ctx);
-						await dispatchIfIdle(ctx);
-						await postQueuedNotices();
-						scheduleQuietDispatch(ctx);
-						return state.cursor;
-					}),
+				await cleanupFinishedActivities();
+				stopSource = await runtimeDependencies.source.start(async (updates) => {
+					if (generation !== ownGeneration || !bridge) return bridge?.cursor;
+					// Start answers immediately, but never gate update admission or /stop
+					// on their network completion. Shutdown cancels and drains them.
+					for (const update of updates) {
+						if (!update.callback_query) continue;
+						const pending = localSelectors.answer(update.callback_query, answerController.signal).catch(error => noteError(error));
+						selectorAnswers.add(pending);
+						void pending.then(() => selectorAnswers.delete(pending));
+					}
+					// A callback-answer transport may synchronously initiate teardown.
+					if (generation !== ownGeneration || !bridge) return bridge?.cursor;
+					const owner = bridge;
+					const state = await owner.ingestBatch(updates, (update) => localSelectors.handle(update, true), (job) => {
+						if (generation === ownGeneration && bridge === owner) {
+							if (job.batchId) touchedFeedbackBatches.add(job.batchId);
+							startReceiptFeedback(job, ctx);
+						}
+					});
+					if (generation !== ownGeneration || bridge !== owner) return state.cursor;
+					groupRuntime?.notifyUpdates();
+					groupRuntime?.notifyIdle();
+					await owner.rearmQuietDeadline(state.touchedBatchIds);
+					if (generation !== ownGeneration || bridge !== owner) return state.cursor;
+					for (const id of state.touchedBatchIds) touchedFeedbackBatches.add(id);
+					if (state.acceptedModelInput || state.pendingCommands.length || state.repliesToRetry.length || state.queued.length) scheduleWork(ctx);
+					else if (updates.length === 0) queueMarkdown(ctx);
+					return state.cursor;
+				},
 					recovered.cursor,
 				);
 				await startGroup(runtimeDependencies, ownGeneration);
@@ -1006,12 +1305,14 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			} catch (error) {
 				noteError(error);
 				await stopEndpoint().catch((endpointError) => noteError(endpointError));
+				cancelSelectorAnswers();
 				await stopReceiptTyping();
 				await stopTyping();
 				typing = undefined;
 				const stop = stopSource;
 				stopSource = undefined;
 				if (stop) await stop().catch((stopError) => noteError(stopError));
+				await Promise.all([...selectorAnswers]);
 				await stopGroup();
 				const close = runtimeDependencies.close;
 				runtimeDependencies = undefined;
@@ -1030,6 +1331,8 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 		});
 
 		pi.on("before_agent_start", async (event, ctx) => {
+			// Custom triggerTurn runs have no prompt property. They are not queued owner work.
+			if (!("prompt" in event)) return;
 			updateRecall();
 			await serialized(async () => {
 				if (!bridge) return;
@@ -1065,7 +1368,7 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 					try {
 						const sent = await bridge.settle(runtimeDependencies.sendReply, routeItemReply);
 						if (sent) lastOperationError = undefined;
-						await reconcileMarkdown(ctx);
+						queueMarkdown(ctx);
 					} catch (error) {
 						noteError(error);
 						await halted?.annotate("Reply delivery failed; it will be retried.");
@@ -1080,13 +1383,43 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			groupRuntime?.notifyIdle();
 		});
 
-		pi.on("session_before_switch", () => (bridge?.activeJob ? { cancel: true } : undefined));
-		pi.on("session_before_fork", () => (bridge?.activeJob ? { cancel: true } : undefined));
+		// An external switch/fork can be cancelled by another extension. Fail closed until session_start.
+		const beforeTransition = () => {
+			if (bridge?.activeJob || selectors?.mutating) return { cancel: true };
+			hostTransition = true;
+			selectors?.invalidate();
+		};
+		pi.on("session_before_switch", beforeTransition);
+		pi.on("session_before_fork", beforeTransition);
+		pi.on("session_before_tree", beforeTransition);
+		pi.on("session_tree", () => { hostTransition = false; selectors?.invalidate(); });
+		pi.on("session_before_compact", async () => {
+			// This hook is too late to prevent Pi manual compaction's earlier turn abort.
+			// Cancelling only an in-flight selector mutation is safe and helps that case.
+			// Other queued work may remain blocked by this extension's busy admission gate.
+			if (selectors?.mutating) return { cancel: true };
+			hostCompacting = true;
+			// Public start boundary, before summary completion and before_agent_start.
+			if (phaseNotice || phaseFeedback) await retitlePhase(COMPACTING_TEXT);
+			else await showPhase(bridge?.activeJob?.jobId ?? randomUUID(), COMPACTING_TEXT, false);
+		});
+		const endHostCompaction = async (): Promise<void> => {
+			hostCompacting = false;
+			if ((phaseNotice && !phaseNotice.commandOwned) || (phaseFeedback && !phaseFeedback.commandOwned)) await clearPhase();
+		};
+		pi.on("session_compact", endHostCompaction);
+		pi.on("session_compact_failed", endHostCompaction);
 
 		pi.on("session_shutdown", async (event, ctx) => {
+			stopPhaseSends();
+			connection = { phase: "stopping" };
 			integration.stop();
 			pi.setActiveTools?.((pi.getActiveTools?.() ?? []).filter(name => name !== "telegram_recall"));
 			generation += 1;
+			workPending = false;
+			touchedFeedbackBatches.clear();
+			selectors?.invalidate();
+			cancelSelectorAnswers();
 			if (quietTimer) clearTimeout(quietTimer);
 			quietTimer = undefined;
 			if (projectionRefreshTimer) clearTimeout(projectionRefreshTimer);
@@ -1104,11 +1437,17 @@ export function createTelegramOwnerExtension(options: ExtensionOptions = {}) {
 			const stop = stopSource;
 			stopSource = undefined;
 			if (stop) await stop();
+			// The source is quiescent: include answers registered during cancellation.
+			await Promise.all([...selectorAnswers]);
 			await receiptTypingStopped;
 			await typingStopped;
 			await operationTail;
+			markdownPending = undefined;
+			await markdownWorker;
 			await stopTyping();
 			await haltActivity();
+			await haltFeedbackMessages();
+			await clearPhase();
 			await stopGroup();
 			if (bridge) {
 				await bridge.shutdown(event.reason);

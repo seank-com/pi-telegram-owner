@@ -39,11 +39,26 @@ export interface SearchResult {
 }
 export interface MarkdownDatastoreServiceV1 {
 	search(input: { store: string; query: string; mode: "hybrid"; limit: number; includeContent: true }, signal?: AbortSignal): Promise<SearchResult>;
-	refresh(input: { action: "start"; store: string; mode: "lexical" }, signal?: AbortSignal): Promise<unknown>;
+	refresh(input: { action: "start"; store: string; mode: "lexical" | "metadata"; paths?: string[] }, signal?: AbortSignal): Promise<unknown>;
 }
 export class IntegrationError extends Error {
 	readonly code: "CAPABILITY_UNAVAILABLE" | "TIMEOUT" | "CANCELLED" | "BACKEND_OUTPUT_INVALID";
 	constructor(code: IntegrationError["code"]) { super(code); this.code = code; }
+}
+export async function refreshPublishedPaths(client: Pick<MarkdownDatastoreServiceV1, "refresh">, store: string, paths: readonly string[] | undefined, signal?: AbortSignal, available = true): Promise<void> {
+	if (!available) return;
+	if (paths?.length) await client.refresh({ action: "start", store, mode: "metadata", paths: [...paths] }, signal);
+	await client.refresh({ action: "start", store, mode: "lexical" }, signal);
+}
+export async function refreshPrivatePublishedPaths(client: Pick<MarkdownDatastoreServiceV1, "refresh">, store: string, paths: readonly string[] | undefined, signal?: AbortSignal, available = true): Promise<void> {
+	if (!available) return;
+	// Canonical private archive paths include messages/; the datastore root is that directory.
+	const prefix = "messages/";
+	const relative = paths?.map((path) => {
+		if (!path.startsWith(prefix) || path.length === prefix.length) throw new IntegrationError("BACKEND_OUTPUT_INVALID");
+		return path.slice(prefix.length);
+	});
+	await refreshPublishedPaths(client, store, relative, signal);
 }
 export function createDatastoreIntegration(bus: Bus, getPolicy: () => DatastorePolicy, timeoutMs = 900_000) {
 	if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900_000) throw new RangeError("datastore timeout must be 1..900000 ms");

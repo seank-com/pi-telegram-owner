@@ -50,6 +50,7 @@
     "hooks:install": "git config core.hooksPath .githooks"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.87.1",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },

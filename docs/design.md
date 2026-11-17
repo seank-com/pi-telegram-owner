@@ -10,6 +10,205 @@ input, dispatched jobs, replies, commands, photos and transient activity without
 resending uncertain outcomes. Source evidence is retained. Work lifecycle
 transitions append records without rewriting messages, journal history or cursors.
 
+## Module map
+
+`createTelegramOwnerExtension()` in `src/index.ts` is the composition root. It
+connects the transport, durable bridge, local controls, optional integrations and
+Pi lifecycle hooks. The major responsibilities are:
+
+| Module | Responsibility |
+| --- | --- |
+| [`index.ts`](../src/index.ts) | Starts and stops resources, serializes bridge operations, dispatches Pi turns and connects delivery to lifecycle events. |
+| [`runtime.ts`](../src/runtime.ts) | Validates configuration, owns the poller lock, calls Telegram and manages polling, typing and ephemeral activity. |
+| [`core.ts`](../src/core.ts), [`work.ts`](../src/work.ts) | Classify updates, append/recover the private transport journal and track queues, tasks, dependencies and delivery outcomes. |
+| [`commands.ts`](../src/commands.ts), [`selectors.ts`](../src/selectors.ts) | Own shared menu/help metadata, parse ordinary commands and implement local model/thinking pickers without model turns. `index.ts` executes ordinary commands. |
+| [`preferences.ts`](../src/preferences.ts) | Merge the current model/thinking defaults into Pi's public project settings file and publish the replacement atomically. |
+| [`group-runtime.ts`](../src/group-runtime.ts), [`endpoint.ts`](../src/endpoint.ts), [`group-tools.ts`](../src/group-tools.ts) | Coordinate group membership, routing, elections and peer delivery; accept local work and expose group tools. |
+| [`group-journal.ts`](../src/group-journal.ts) | Own the shared group's locked event log and canonical Markdown projection. |
+| [`markdown-projector.ts`](../src/markdown-projector.ts), [`importer.ts`](../src/importer.ts), `src/cli/` | Publish and validate private conversation notes/media, read their timeline and import reviewed Telegram Desktop exports. |
+| [`datastore.ts`](../src/datastore.ts), [`recall.ts`](../src/recall.ts), [`timeline.ts`](../src/timeline.ts) | Consume the public datastore contract for recall/refresh and expose direct canonical-history reads. |
+| [`format.ts`](../src/format.ts), [`activity.ts`](../src/activity.ts), [`observability.ts`](../src/observability.ts) | Format terminal replies and render tool activity from the persisted public audit contract. |
+
+The private transport journal owns update classifications, queue/task state,
+selector receipts and delivery evidence. Canonical Markdown owns the conversation
+history exposed by private retrieval. The group event log owns shared room
+messages and work metadata; its Markdown is the searchable projection. Pi owns
+its session and model state. Datastore owns its derived indexes. Recovery uses
+these distinct authorities rather than treating any one of them as a substitute
+for the others.
+
+## Main flows
+
+### Private owner request
+
+1. `LongPollSource` receives updates through `TelegramApiClient`.
+   `TelegramOwnerBridge.ingestBatch()` authenticates/classifies updates on its
+   dedicated batch-operation tail and records them before the cursor advances.
+   Its non-awaiting accepted-input hook starts receipt typing and one private
+   feedback worker after the update and any text batch are durable. The worker
+   is keyed by the canonical batch/job id, so fragments reuse its in-flight send
+   and message rather than creating more receipts. Initial text is `Collecting...`
+   for text collection, `Received.` for commands and unbatched input, or the
+   queued status for conversation input when already busy. Context percentage is
+   not calculated on this receipt path. Commands retain truthful eligibility
+   checks: their receipt acknowledges durable input, not permission to run.
+2. Local selectors and ordinary commands take their control paths. Accepted
+   conversation input joins the owner's queue; text fragments are collected
+   through the configured quiet window. A batch created or extended by a poll
+   receives that full window after deferred media, reply, command, and
+   queued-notice work. The poll callback returns the durable cursor without
+   awaiting that work or feedback HTTP. Local model/thinking selectors retain
+   their separate durable control path and picker feedback. A coalesced serial
+   work pump owns ordinary command and conversation work;
+   pending touched batches are rearmed before seal/dispatch and after the pump's
+   notices, so housekeeping cannot consume the collection budget. Admission's
+   initial deadline and rearm are one batch operation, preventing another lane
+   from sealing an intermediate revision.
+   Empty polls and polls that do not create or extend the batch do not move an
+   existing deadline. Once that deadline has passed, the batch is durably sealed
+   even while Pi is busy; dispatch still waits for idle. Restart uses the latest
+   durable deadline. A crash before the post-maintenance revision leaves the
+   admission-time deadline. Photos are captured before dispatch.
+3. When Pi and delivery state permit, `dispatchNext()` records the work and sends
+   its envelope/input to the existing Pi session. Lifecycle hooks start private
+   activity, promote the existing receipt to `Thinking (NN%)`, update it from
+   tool intents and capture the model's outcome. Context is calculated only at
+   this later start, never before first receipt feedback. A
+   `before_agent_start` event with no prompt property is not owner work and is
+   ignored. A user or queued `sendUserMessage` run still carries a prompt and
+   remains claimable.
+4. At `agent_settled`, `settle()` records and delivers the task's output to its
+   pinned destination, or records its waiting/informational disposition. Activity
+   cleanup follows the durable outcome. Projection reconciles the journal and
+   session evidence into canonical Markdown on a separate coalesced worker;
+   successful publication can request a coalesced datastore refresh. That worker
+   snapshots the owning bridge's records and appends projection receipts through
+   its existing journal tail. Live projection and media-event synchronization on
+   the same projector share one mutation chain, so those cooperating writers do
+   not contend for their own archive lock. Separate projector/process writers
+   still require the existing file lock. It does not block new admission, receipt feedback
+   or the next poll. Replacement/shutdown cancel and drain its work; the initial
+   startup reconciliation still finishes before polling starts.
+
+A failed or uncertain send retains its evidence instead of being treated as an
+accepted reply. Restart reconciliation distinguishes accepted, unsent and
+uncertain work; it does not replay an interrupted model turn or blindly resend
+an uncertain message. The detailed delivery rules are in
+[Activity and queued notices](#activity-and-queued-notices) and
+[Failure and recovery](#failure-and-recovery).
+
+### Local selector
+
+The shared advertised command list includes `/model` and `/thinking` in the
+private-chat menu and `/help`. Their updates open pickers through `LocalSelectors`
+before ordinary command-job admission, not through Pi inference. The transport starts a button callback answer at receipt
+without waiting for its network completion before admitting the batch. A
+successful acknowledgment clears Telegram's spinner; it does not create a model
+turn or confirm a mutation. The selector then checks ownership, button and
+session/catalog identity. A mutation also requires idle admission. It records
+the request and mutation start, rechecks admission after journal I/O, invokes the
+public Pi setter and records the confirmed result before editing the picker.
+Restart expires buttons and diagnoses unfinished operations instead of repeating
+setters. The controls and recovery contract are detailed below.
+
+### Group and local automation
+
+`GroupRuntime` records/routes owner group updates and receives peer wake-ups
+through `endpoint.ts`; local automation enters through the same endpoint's
+instruction route. Admitted work joins the same bridge and Pi session as private
+work. Group messages also enter `GroupJournal`, which owns room history and
+claim coordination. Task authority, priority, dependency state and the pinned
+reply destination determine execution and output; sharing a session does not
+change the audience. See [Group chat](#group-chat) and
+[Queue endpoint](#queue-endpoint).
+
+## Local model and thinking controls
+
+Local model/thinking selectors use a separate `selector` v1 control-record
+stream in the same forward-only journal. The bridge records their updates as
+`local`, without job IDs, queue admission, receipt typing, session messages or
+archive projections. Callback answers start at receipt independently of serialized
+admission. An outstanding answer does not block `/stop` or subsequent polling.
+The extension tracks answer work and observes failures. Session shutdown aborts
+answers, stops the poll source, then drains answer work before releasing
+journal/transport state. Stopping the source closes receipt admission before
+taking the drain snapshot. Authorization checks
+both the sender and original private chat; a button is additionally bound to its
+sent message ID. Unknown buttons never authorize edits to arbitrary messages.
+
+Each keyboard button has a random 128-bit opaque token (26 ASCII bytes including
+its prefix), mapped only in memory to an action, picker, expiry and catalog/session
+fingerprint. Tokens contain no model IDs, commands, endpoints or credentials.
+The fingerprint includes effective available models, public model capabilities,
+session scope, current model/thinking level, session ID and local lifecycle epoch;
+only hashes of routing metadata are compared, never displayed or journaled.
+Model choices always come from the available registry objects, not callback
+strings. Pi's built-in providers can become available from inherited environment
+credentials without a custom provider entry, for example GEMINI_API_KEY for the
+google provider. This is Pi's native availability decision, not a separate
+Telegram provider allowlist or evidence of a successful inference/entitlement test. Limits are six model rows per page, a navigation row, 32 retained
+pickers and a ten-minute TTL. Display text is bounded plain text; model labels
+use public `provider/model-id` identities rather than potentially shared friendly
+names.
+
+For a model/thinking mutation, the durable ordering is receipt, requested
+selection, mutation start, terminal outcome, then message edit. Opening a picker
+or navigating a page instead records `shown` after its send/edit succeeds.
+Callback-query identity is hashed for deduplication; raw payloads and host errors
+are not retained. Duplicate receipt never repeats
+a mutation. Startup records incomplete requests as `interrupted` without
+replay, since Pi setters and the local journal cannot form an atomic transaction.
+A failed edit records `delivery_failed` after the durable mutation outcome; a
+failed callback answer records `answer_failed`. Both succeed and reject paths
+attempt callback answers. Display delivery is intentionally at-most-once, unlike
+ordinary command-response retry; inspect `/status` after an uncertain result.
+
+The extension tracks public compaction and session transition hooks in addition
+to local command flags. Idle also excludes queued work, pending/uncertain ordinary
+commands, open quiet-window batches and undelivered private replies. It rejects
+mutations while those guards are active and
+cancels compaction/switch/fork/tree admission during a selector mutation. It
+rechecks idle state and fingerprints after journal I/O, immediately before
+invoking a public setter. External UI activity is not serialized by this
+extension; the public host API provides no cross-UI atomic mutation primitive.
+Pi manual compaction aborts an active turn before `session_before_compact`, so
+that hook cannot prevent the earlier abort of accepted Telegram work.
+The compaction guard begins at `session_before_compact` and clears on
+`session_compact` or `session_compact_failed`. A skip before the before hook does
+not set that guard. The local `/compact` flag separately tracks its command
+completion/error callbacks; it does not cancel its own compaction admission.
+A cancelled external switch/fork/tree transition has no public cancellation
+notification and can leave selector admission blocked until `session_start` or
+a completed tree navigation. See [operator guidance](setup.md#local-model-and-thinking-selectors).
+
+## Project preference save
+
+`/save` is an authenticated, argument-free private owner command in the ordinary
+durable command lifecycle, not a model turn. `index.ts` snapshots the public
+current model and thinking getter, then delegates to `preferences.ts` using the
+transport's captured project root and Pi's CONFIG_DIR_NAME. The target is the
+receiving project's settings.json, never the shared platform profile or a
+message-specified path.
+
+The writer reads the existing JSON object and preserves unrelated fields. It
+sets defaultProvider/defaultModel/defaultThinkingLevel and merges only the current
+provider/model-id entry in modelThinkingLevels, because that entry overrides an
+ordinary thinking default. It retains existing permissions and publishes a synced
+temporary file by atomic rename. Invalid JSON, invalid override structure or I/O
+failure produces an ordinary command failure reply. Confirmation follows file
+publication; the existing durable command result/delivery path owns the reply.
+Incomplete commands retain their ordinary uncertain/interrupted recovery semantics
+rather than automatically repeating a filesystem write.
+
+Saving does not set a model, request inference, change another project's defaults
+or reload native settings. Pi's documented file configuration is the interface;
+no private settings-manager internals are used. A fresh Pi start reads the saved
+project defaults, subject to the native catalog, model scope and capabilities.
+Resuming an existing session instead restores its native session choices. Pi's
+already-loaded settings cache is not forcibly refreshed by this command.
+
+## Canonical archive and import
+
 Canonical Markdown is authoritative. The projector joins exact Telegram text
 segments by owner, conversation and timestamp, preserves individual membership
 and provenance, and atomically publishes identified notes. Transport chunks are
@@ -32,6 +231,8 @@ to exact inputs. Commit requires that plan, protected output and atomic idempote
 publication. Unsupported markup, changed source, corrupt state or cancellation
 fails explicitly. Source files, session JSONL and journals are not indexed.
 
+## Datastore integration and recall
+
 Datastore integration is a narrow consumer of v1 capability/RPC wire shapes.
 `auto` discovers synchronously on Pi's existing event bus, requiring ready=true,
 contractVersion=1 and the exact configured store. `off` does no discovery or RPC.
@@ -41,25 +242,24 @@ failure. No installed module is taken as proof of an active extension.
 
 Recall registers during initialization. The supported active-tool API disables
 it at session start when optional integration is absent and re-evaluates at
-resources_discover, after all session-start handlers. Real-host tests establish
-this timing and both load orders. Required recall remains visible for an explicit
+resources_discover, after all session-start handlers. Required recall remains
+visible for an explicit
 bounded failure. Invocation rechecks readiness and store identity; a stale active
 tool cannot silently gain a different store. Reload/teardown aborts the consumer's
 RPC lifetime and disables recall; restart creates a new lifetime.
 
 Recall fixes hybrid retrieval, content inclusion and a 1–10 result limit; the
-result text retains the 50 KiB/2000-line ceiling. Requests retain the accepted 15-minute default
-consumer deadline (factory-injectable for tests), propagate caller cancellation,
+result text has a 50 KiB/2000-line ceiling. Requests use a 15-minute default
+consumer deadline (factory-injectable), propagate caller cancellation,
 and send a parent-owned AbortSignal plus deadline through the RPC envelope.
 Timeout and shutdown abort owned backend work, reject the caller, and discard
 late replies. The datastore still owns search/index validation and atomic refresh.
 
-After successful Markdown publication, lexical refresh requests are coalesced.
-They are sent only while the exact optional integration is active, never queued
-against an absent service. Accepted datastore semantic-refresh scheduling remains
+After successful Markdown publication, the written relative paths are sent as a metadata refresh and then a lexical refresh. Private projector paths remain relative to the projection parent, including `messages/`; the private consumer removes that prefix because its datastore root is the messages directory itself. Group publication paths are already relative to their dedicated store root. This translation changes notification scope, not canonical notes, manifest paths or citations. Requests are coalesced. They are sent only while the exact optional integration is active, never queued against an absent service. An absent datastore does not block transport or the timeline. Accepted datastore semantic-refresh scheduling remains
 owned by datastore; Telegram does not add workers, model downloads or semantic
-refresh loops. Injected transport fixture callbacks exercise coalescing without
-starting real services.
+refresh loops.
+
+## Tool-intent rendering
 
 Activity consumes only structurally valid versioned persisted audit data for
 the matching call ID. Validation checks entry kind/version, field types and the
@@ -72,8 +272,43 @@ Intents are displayed unchanged in full. Activity sends/edits use plain text
 without parse_mode; JSON.stringify handles transport escaping, so apostrophes,
 quotes, Markdown and redaction markers are ordinary text. Missing or malformed
 audit evidence falls back to the established bounded tool name, never raw tool
-arguments. Persisted identifiers/types are checked against the owner's actual
-packed contract.
+arguments. Persisted identifiers/types are checked against the versioned
+observability contract.
+
+## Restrictions register
+
+Review this register in every PR against code, tests and dependencies. It records
+current constraints, not automatic approval. Missing evidence remains explicit;
+configuration owners are component/fixture maintainers unless a project setting
+is named. This is not an exhaustive inventory of every protocol/library bound.
+
+### Collection and qualification
+
+| Restriction | Why (what failure does it prevent) |
+| --- | --- |
+| Private text quiet window: default 4,000 ms, runtime configuration 100-5,000 ms (`inboundQuietWindowMs`); fixture bridge 0 disables batching. Location: core/runtime configuration and the admission/work-pump paths. A touched open batch gets the full window after deferred maintenance, including notices, with a pre-dispatch revision; unrelated polls do not move it. | The origin move prevents internal processing from consuming the four-second collection budget. Explicit approval: issue #13, 2026-11-10. That narrow approval does not establish approval of the older numeric configuration range. Polls remain sequential and dispatched history stays closed. Sean's 2026-11-16 feedback change separates their durable-admission return from deferred housekeeping, without changing the collection value. |
+| Private text fragments must also have exactly equal Telegram `message.date` values. Location: `src/core.ts:addTextToBatch`; fixed matcher. | Different whole-second timestamps immediately seal an open batch even inside the quiet window. This is a known cross-second paste limitation, not timestamp rewriting. The intended long-term rationale/approval for that restriction is not established; retaining the deadline improvement does not authorize a broader grouping rule. |
+| tests/core.test.ts quiet-timer fixture: 600,000 ms outer test timeout across its busy-expiry cases. Component test maintainers own this fixed value. Explicit owner approval: ten-minute test-only cap and expired-timer correction, recorded in the release review. | Bounds a stalled qualification run. Cancellation is checked at fixture boundaries and teardown shuts down the fake transport. The scenarios use a controlled clock and observable journal state, not elapsed-time performance assertions; production quiet-window values are unchanged. |
+
+### Other effective bounds and policies
+
+| Restriction | Why (what failure does it prevent) |
+| --- | --- |
+| HTTP request deadline 35,000 ms; long-poll parameter 25 seconds. Location: `src/runtime.ts:TelegramApiClient`. | Abort request waits under the existing transport envelope. Specific numeric necessity/approval is not established; a server poll parameter is not proof the whole request completes in that time. |
+| Reconnect backoff: base `min(30000,1000*2**min(failures,5))`, multiplier 0.75-1.25, capped 30,000 ms. Location: `src/runtime.ts:reconnectDelay`. | Current retry scheduling after poll failure. Approval for this policy/formula is not established by its age or tests. |
+| Archive mutation requires the existing exclusive file lock in `TelegramMarkdownProjector` / `PollerLock`; cooperating live projection and media synchronization on one instance queue behind the same mutation chain. No retry timer or new deadline. | Prevents competing manifest/media-event writes and preserves canonical predecessor integrity. Same-instance ordering retains the existing exclusive-write contract without a new admission cap; queued calls check cancellation before starting. The original specific lock-policy approval reference is not established. |
+| Active-step elapsed display: first suffix at 30,000 ms, updated every 30,000 ms. Locations: `TelegramStepClock` / activity worker in `src/runtime.ts` and command phases in `src/index.ts`; fixed by component maintainers. Approved by Sean on 2026-11-16 for visibility of time on an unchanged displayed step. | Shows `[HH:MM:SS]` without a deadline, whole-turn timer, automatic cancellation or new retry policy. Successful substantive status changes reset the clock; timer edits and duplicate statuses do not. Stops with the activity/phase lifecycle. |
+| Election step 2,000 ms and activity edit minimum 1,000 ms by default. Location: group configuration/activity in `src/runtime.ts`. Command workers in `src/index.ts` use 0 ms to retain the existing unthrottled command-phase edits. | These schedule election/activity work. The exact default values and rate-policy approval need evidence; their values are unchanged. Reusing the admission receipt does not add a command-phase throttle. |
+| Selector page 6 entries, retained pickers 32, TTL 600,000 ms. Location: `src/selectors.ts`. | Limits button views/retention and rejects stale controls. Specific pagination/retention values' necessity and approval are not established. |
+| Label 1-64 single-line safe characters, configured username and safe-ID regexes. Location: `src/runtime.ts`. | Current configuration/identity validation can reject otherwise supplied identifiers. Exact exclusion/length-policy approval is not established; do not invent a broader content filter. |
+| Image 10 MiB and JPEG/PNG/WebP validation. Location: `src/core.ts`, `src/runtime.ts`; fixed component handling. | Bounds accepted media and formats. Distinguish our exact binary size/validation choices from Telegram protocol constraints; their owner-approval references are not established by this inventory. |
+| Markdown 256 KiB, AST 10,000 nodes/depth 32, rendered HTML 512 KiB, chunk 4,000 units and maximum 128 chunks. Location: `src/format.ts`. | Bounds rendering/transport output and can reject/truncate content. Specific numeric values are not approved merely because Telegram has separate protocol limits. |
+| Recall 1-10 results, 50 KiB/2,000-line display envelope and default 15-minute consumer deadline. Location: tools/datastore client consumption. | Current retrieval/display limits and cancellation envelope, owned by this consumer rather than implied by datastore implementation. Approval of numeric choices remains unestablished. |
+| Publication content matching uses the README registry rules. Location: `scripts/check-private-terms.ts`; registry paths are configurable with `PRIVATE_TERMS_FILE`/`PRIVATE_SECRETS_FILE`. | Rejects matching private terms and credential values; its approval evidence is separate from revision selection or capture limits. |
+| Existing-branch publication scans exclude `origin/main` ancestry; new branches exclude known remote history. Location: `.githooks/pre-push`. | Main exclusion approved in PR #15's guard correction; feature message/added-line checks remain. |
+| Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Its specific necessity/approval is not established by the other publication controls. |
+
+## Package boundary
 
 Native CLIs/archive helpers import no Pi runtime values. The extension supplies
 Pi's CONFIG_DIR_NAME; the menu CLI defaults to .pi with an explicit override.
@@ -82,22 +317,20 @@ peers for extension loading. Compiled ESM/declarations and every executable CLI
 shebang ship. No tests, private operational content or sibling source imports
 are included in the package.
 
-The operation event is `pi-markdown-datastore:v1:request`; discovery remains
+Datastore operations use `pi-markdown-datastore:v1:request`; discovery uses
 `pi-markdown-datastore:v1:capability-request` and
-`pi-markdown-datastore:v1:capability-reply`. Pre-release datastore and consumer
-candidates must be rebuilt together: the earlier request-event name has no
-compatibility alias. Protocol version and envelope fields are unchanged.
+`pi-markdown-datastore:v1:capability-reply`.
 
 ## Archive schema ownership
 
 Archive and importer schemas are package-owned `pi-telegram-owner/<kind>/v1`
 identifiers. The boundary has one strict shape: explicit `admittedPiSessionIds`
 and `firstPi.matchKind` are required. Both semantic Markdown and raw-source
-matching remain supported; omitting the match mode or session list is invalid.
-No former names or boundary versions are accepted. Reports and checkpoints also
-start at v1 in this namespace, retaining the current plan-binding and restart
-semantics. Group work lifecycle metadata is separate from archive/importer schema
-identity; adding lifecycle records never rewrites source evidence or cursors.
+matching are supported; the match mode and session list are required.
+Reports and checkpoints use the same package namespace and bind publication to
+reviewed source inputs. Group work lifecycle metadata is separate from
+archive/importer schema identity; adding lifecycle records never rewrites source
+evidence or cursors.
 Existing export files can be reused for a fresh import with regenerated controls
 and a separate output archive; see [setup](setup.md).
 
@@ -151,10 +384,17 @@ claims, so nothing else can start between the claim and the turn.
 
 ## Activity and queued notices
 
-When an item is accepted while the agent is busy, the agent immediately sends
-a short queued notice in that agent's private owner chat. When the item starts,
-the same private message is edited into the activity display (`Thinking (NN%)`
-and tool intents). This private-only destination also applies to work whose
+Authenticated private model input and ordinary command jobs get an ephemeral receipt immediately after
+minimal durable admission, before quiet-window dispatch or slow housekeeping.
+A busy open batch gets a generic queued receipt; its ready-queue position is
+shown only after sealing, rather than predicting it during collection.
+The same single-flight message progresses through collection/queued status,
+`Thinking (NN%)`, and tool intents. A failed receipt send does not reject input,
+block dispatch, or create an activity journal entry for an unknown message id.
+An unchanged queued poll does not retry a failed send. A later substantive phase
+may attempt its current text, including when that phase arrived while the earlier
+send was pending. No feedback retry timer is added. Non-private queued items retain their private
+owner-chat notice, also reused as their activity when they start. This private-only destination also applies to work whose
 final reply goes to the group, and to queue endpoint work with a reply target.
 Items with no reply target do not create activity. Typing remains private.
 
@@ -165,6 +405,10 @@ you check…". Actual Request/Reply/Notify messages and terminal answers retain
 their intended destinations; only ephemeral status is private. Queued notices
 and activity are transient: they are not recorded in either archive and never
 wake another agent.
+
+Active Thinking/tool activity and command/compaction phases show a per-step age suffix after 30 seconds without a substantive displayed status change, for example `Read: notes.md [00:15:00]`. The suffix advances in 30-second increments as `[HH:MM:SS]`; hours do not wrap at a day. A successful send or substantive edit starts a fresh step clock and removes the previous suffix. Repeated identical statuses and the clock's own edits do not reset it. Receipt, collection and queued phases also measure only their current displayed step; moving to Thinking or a tool resets the clock, rather than carrying the queue age into execution. Elapsed edits use the activity's existing edit worker or an ordered phase edit chain, so an old timer update cannot overwrite a newer status. Completion, halt, session replacement and shutdown stop the clock and cancel pending elapsed work before cleanup. This is display-only observation, not evidence of a hang, a whole-turn timer or permission to cancel work. The collection-window value and repeating typing cadence are unchanged; receipt typing and feedback start after durable admission without waiting for housekeeping or model dispatch.
+
+Authenticated ordinary commands receive `Received.` after durable admission, before deferred housekeeping. Actionable `/new` and `/compact` promote that same worker/message to `Starting new session...` or `Compaction requested...` before the slow host call. These phases are not proof that a new session exists or that compaction has started. A busy refusal retains only the generic receipt until its durable reply; an unauthorized request gets no receipt. When Pi emits public `session_before_compact`, before summary completion and before `before_agent_start`, the same command or active-input receipt becomes `Compacting`; when no request owns a receipt, a standalone notice is sent. Automatic threshold and overflow compaction use that same public start event. `session_compact` and `session_compact_failed` remove a standalone automatic notice; a shared input receipt remains available for Thinking. A command-owned worker stays until the durable command result is delivered, then existing activity cleanup deletes it. A successful send is recorded as `activity_started`; that journal receipt owns restart cleanup. A failed delete leaves that record, so the next startup retries the delete instead of forgetting the message. The receipt send uses the session's phase signal. Shutdown aborts that signal before waiting for in-flight command work, and a host call is not started after teardown has begun. The next `session_start` replaces that signal, drops the previous in-memory notice pointer, and clears the previous generation's compact and switch flags. The journal, not that pointer, remains the recovery path for a notice the previous generation did not clear. A failed activity send, edit, or delete during a live session does not cancel the command, suppress its durable reply, or change an automatic compaction outcome.
 
 Activity receipts include their destination, so cleanup does not confuse equal
 message IDs in different chats. Retained unscoped activity receipts resolve to
@@ -236,7 +480,7 @@ command text in the group is an ordinary message.
 
 Every agent bot is a group administrator. Administrator bots receive all group
 messages, and Telegram reports membership changes to them. The poller requests
-`message`, `chat_member` and `my_chat_member` updates. Edits are not requested:
+`message`, `callback_query`, `chat_member` and `my_chat_member` updates. Edits are not requested:
 each message is recorded and routed as first sent.
 
 At startup, and on every membership update, an agent checks that its

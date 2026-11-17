@@ -1,3 +1,4 @@
+import type { InlineKeyboard } from "./selectors.ts";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, readFileSync } from "node:fs";
@@ -363,7 +364,7 @@ export class TelegramApiClient {
 		chatId: number,
 		fetchImpl: FetchLike = fetch as unknown as FetchLike,
 		requestDeadlineMs = 35_000,
-		allowedUpdates: readonly string[] = ["message"],
+		allowedUpdates: readonly string[] = ["message", "callback_query"],
 	) {
 		this.#token = token;
 		this.chatId = chatId;
@@ -564,7 +565,7 @@ export class TelegramApiClient {
 		}
 	}
 
-	async editMessageText(messageId: string, text: string, signal?: AbortSignal): Promise<void> {
+	async editMessageText(messageId: string, text: string, signal?: AbortSignal, keyboard?: InlineKeyboard): Promise<void> {
 		const numericMessageId = Number(messageId);
 		if (!Number.isSafeInteger(numericMessageId) || numericMessageId <= 0) throw new Error("Invalid Telegram message ID");
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
@@ -572,7 +573,7 @@ export class TelegramApiClient {
 			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/editMessageText`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ chat_id: this.chatId, message_id: numericMessageId, text }),
+				body: JSON.stringify({ chat_id: this.chatId, message_id: numericMessageId, text, reply_markup: keyboard }),
 				signal: deadline.signal,
 			});
 			const payload = (await response.json()) as { ok?: boolean };
@@ -584,6 +585,21 @@ export class TelegramApiClient {
 		} finally {
 			deadline.close();
 		}
+	}
+
+	async answerCallbackQuery(callbackQueryId: string, signal?: AbortSignal, text?: string): Promise<void> {
+		if (typeof callbackQueryId !== "string" || callbackQueryId.length === 0 || callbackQueryId.length > 256) throw new Error("Invalid Telegram callback query ID");
+		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
+		try {
+			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/answerCallbackQuery`, {
+				method: "POST", headers: { "content-type": "application/json" },
+				body: JSON.stringify({ callback_query_id: callbackQueryId, text: text?.slice(0, 200) }), signal: deadline.signal,
+			});
+			const payload = await response.json() as { ok?: boolean };
+			if (!response.ok || payload.ok !== true) throw new Error(`Telegram answerCallbackQuery failed (HTTP ${response.status ?? "unknown"})`);
+		} catch (error) {
+			throw new Error(sanitizeError(error, this.#token));
+		} finally { deadline.close(); }
 	}
 
 	async deleteMessage(messageId: string, signal?: AbortSignal): Promise<void> {
@@ -608,7 +624,7 @@ export class TelegramApiClient {
 		}
 	}
 
-	async sendMessage(text: string, replyToMessageId?: number, signal?: AbortSignal, format: "HTML" | "plain" = "plain"): Promise<string> {
+	async sendMessage(text: string, replyToMessageId?: number, signal?: AbortSignal, format: "HTML" | "plain" = "plain", keyboard?: InlineKeyboard): Promise<string> {
 		const deadline = deadlineSignal(signal, this.requestDeadlineMs);
 		try {
 			const response = await this.fetchImpl(`https://api.telegram.org/bot${this.#token}/sendMessage`, {
@@ -618,6 +634,7 @@ export class TelegramApiClient {
 					chat_id: this.chatId,
 					text,
 					reply_to_message_id: replyToMessageId,
+					reply_markup: keyboard,
 					parse_mode: format === "HTML" ? "HTML" : undefined,
 				}),
 				signal: deadline.signal,
@@ -727,6 +744,41 @@ export class TelegramTypingActivity {
 	}
 }
 
+/** Display-only age of one visible step; never a deadline or a whole-turn timer. */
+export class TelegramStepClock {
+	private timer?: ReturnType<typeof setTimeout>;
+	private startedAt?: number;
+	private readonly onTick: (suffix: string) => void;
+	private readonly now: () => number;
+	constructor(onTick: (suffix: string) => void, now: () => number = () => Date.now()) {
+		this.onTick = onTick;
+		this.now = now;
+	}
+	reset(): void {
+		this.stop();
+		this.startedAt = this.now();
+		this.arm();
+	}
+	stop(): void {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		this.startedAt = undefined;
+	}
+	private arm(): void {
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			if (this.startedAt === undefined) return;
+			const seconds = Math.floor(Math.max(0, this.now() - this.startedAt) / 30_000) * 30;
+			const hours = String(Math.floor(seconds / 3_600)).padStart(2, "0");
+			const minutes = String(Math.floor(seconds / 60) % 60).padStart(2, "0");
+			const remainder = String(seconds % 60).padStart(2, "0");
+			this.onTick(` [${hours}:${minutes}:${remainder}]`);
+			if (this.startedAt !== undefined) this.arm();
+		}, 30_000);
+		this.timer.unref?.();
+	}
+}
+
 export interface TelegramActivityMessageOptions {
 	send(text: string, signal: AbortSignal): Promise<string>;
 	edit(messageId: string, text: string, signal: AbortSignal): Promise<void>;
@@ -743,7 +795,7 @@ export interface TelegramActivityMessageOptions {
 	prefix?: string;
 }
 
-/** Owns the single ephemeral activity message for one confirmed Telegram job. */
+/** Owns the single ephemeral activity message for one durably admitted Telegram job. */
 export class TelegramActivityMessage {
 	private readonly jobId: string;
 	private readonly options: TelegramActivityMessageOptions;
@@ -751,7 +803,12 @@ export class TelegramActivityMessage {
 	private readonly controller = new AbortController();
 	private worker?: Promise<void>;
 	private messageId?: string;
+	private startRecorded = false;
 	private desired: string;
+	private step: string;
+	private renderStep: string;
+	private displayedStep?: string;
+	private readonly stepClock: TelegramStepClock;
 	private attempted = "";
 	private lastChangeAt = 0;
 	private acceptingUpdates = true;
@@ -761,7 +818,16 @@ export class TelegramActivityMessage {
 		this.options = options;
 		this.initialText = this.withPrefix(initialText);
 		this.desired = this.initialText;
+		this.step = this.initialText;
+		this.renderStep = this.initialText;
 		this.messageId = options.existingMessageId;
+		this.startRecorded = this.messageId !== undefined;
+		this.stepClock = new TelegramStepClock((suffix) => {
+			if (!this.acceptingUpdates || this.displayedStep === undefined || (this.worker && this.step !== this.displayedStep)) return;
+			this.renderStep = this.displayedStep;
+			this.desired = this.displayedStep + suffix;
+			this.ensureWorker();
+		}, () => (this.options.now ?? Date.now)());
 	}
 
 	start(): void {
@@ -772,17 +838,29 @@ export class TelegramActivityMessage {
 		return this.options.prefix ? `${this.options.prefix}\n${text}` : text;
 	}
 
-	update(text: string): void {
+	update(text: string, retryFailed = false): void {
 		if (!this.acceptingUpdates || !text) return;
 		const desired = this.withPrefix(text);
-		if (desired === this.desired) return;
+		if (desired === this.step) {
+			if (!retryFailed || desired === this.displayedStep || (this.worker && this.renderStep === desired)) return;
+			if (!this.worker) this.attempted = "";
+		}
+		this.step = desired;
+		this.renderStep = desired;
 		this.desired = desired;
 		this.ensureWorker();
+	}
+
+	/** Waits for this substantive step's display attempt, not unrelated elapsed-only edits. */
+	async flush(): Promise<void> {
+		const step = this.step;
+		while (this.worker && this.step === step && (this.displayedStep !== step || !this.startRecorded)) await this.worker;
 	}
 
 	/** Stops further updates and leaves the message in place. Returns its ID, if one was sent. */
 	async halt(): Promise<string | undefined> {
 		this.acceptingUpdates = false;
+		this.stepClock.stop();
 		this.controller.abort(new Error("Telegram activity stopped"));
 		await this.worker?.catch(() => undefined);
 		this.worker = undefined;
@@ -823,18 +901,21 @@ export class TelegramActivityMessage {
 		this.worker = worker;
 		void worker.finally(() => {
 			if (this.worker === worker) this.worker = undefined;
-			if (this.acceptingUpdates && this.messageId && this.desired !== this.attempted) this.ensureWorker();
+			if (this.acceptingUpdates && this.desired !== this.attempted) this.ensureWorker();
 		}).catch(() => undefined);
 	}
 
 	private async run(): Promise<void> {
 		if (!this.messageId) {
-			this.attempted = this.initialText;
+			const text = this.desired, step = this.renderStep;
+			this.attempted = text;
 			try {
-				// Never abort the first send: once Telegram may have posted it, its ID is needed to delete it later.
-				this.messageId = await this.options.send(this.initialText, new AbortController().signal);
+				// Ordinary first sends retain their IDs for cleanup; command sends use their phase signal.
+				this.messageId = await this.options.send(text, new AbortController().signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
+				this.markDisplayed(step);
 				await this.options.onStarted(this.jobId, this.messageId);
+				this.startRecorded = true;
 			} catch (error) {
 				this.fail(this.messageId ? "journal" : "send", error);
 				return;
@@ -852,14 +933,22 @@ export class TelegramActivityMessage {
 			}
 			if (!this.acceptingUpdates) return;
 			const text = this.desired;
+			const step = this.renderStep;
 			this.attempted = text;
 			try {
 				await this.options.edit(this.messageId, text, this.controller.signal);
 				this.lastChangeAt = (this.options.now ?? Date.now)();
+				this.markDisplayed(step);
 			} catch (error) {
 				if (!this.controller.signal.aborted) this.fail("edit", error);
 			}
 		}
+	}
+
+	private markDisplayed(step: string): void {
+		if (!this.acceptingUpdates || this.displayedStep === step) return;
+		this.displayedStep = step;
+		this.stepClock.reset();
 	}
 
 	private fail(operation: "send" | "edit" | "delete" | "journal", error: unknown): void {

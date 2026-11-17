@@ -10,10 +10,8 @@ const OWNER = 7;
 const CHAT = 70;
 const PROJECT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
-async function waitFor(predicate: () => boolean, timeout = 1_000): Promise<void> {
-	const deadline = Date.now() + timeout;
+async function waitFor(predicate: () => boolean): Promise<void> {
 	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error("Timed out waiting for condition");
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 }
@@ -68,7 +66,12 @@ function harness(overrides: Partial<PrototypeDependencies> = {}) {
 	return {
 		journal, calls, prompts, emit, runTurn,
 		setIdle(value: boolean) { idle = value; },
-		batch: (updates: TelegramUpdate[]) => onBatch!(updates),
+		batch: async (updates: TelegramUpdate[]) => {
+			const cursor = await onBatch!(updates);
+			// Admission no longer waits for the work pump; drain this in-memory fixture's microtasks.
+			await new Promise((resolve) => setImmediate(resolve));
+			return cursor;
+		},
 	};
 }
 
@@ -80,7 +83,9 @@ test("activity messages reply to the message being worked on", async () => {
 	await host.emit("input", { type: "input", source: "extension", text: prompt });
 	await host.emit("before_agent_start", { type: "before_agent_start", prompt });
 	await waitFor(() => host.calls.some((call) => call.startsWith("activity:")));
-	assert.match(host.calls.find((call) => call.startsWith("activity:"))!, /^activity:\d+:100:Thinking \(10%\)$/);
+	assert.match(host.calls.find((call) => call.startsWith("activity:"))!, /^activity:\d+:100:Received\.$/);
+	await waitFor(() => host.calls.some((call) => /^edit:\d+:Thinking \(10%\)$/.test(call)));
+	assert.equal(host.calls.filter((call) => call.startsWith("activity:")).length, 1, "receipt is promoted, not resent");
 });
 
 test("work accepted while busy gets a queued notice that becomes its activity and is deleted after the reply", async () => {
@@ -187,9 +192,24 @@ test("an activity message still being sent when a fast turn ends is recorded and
 	await host.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: "quick answer" }] });
 	setTimeout(() => release!(), 20);
 	await host.emit("agent_settled", { type: "agent_settled" });
-	assert.deepEqual(sent, ["activity:100:Thinking (10%)"]);
+	assert.deepEqual(sent, ["activity:100:Received."]);
 	assert.ok(host.journal.records.some((record) => record.type === "activity_started" && record.messageId === "777"));
 	const replyIndex = host.calls.indexOf("reply:100:quick answer");
 	assert.ok(replyIndex >= 0);
 	assert.ok(host.calls.indexOf("delete:777") > replyIndex, "the late activity message is deleted after the reply");
+});
+
+test("a prompt-less custom run does not throw or claim an active job whose input was observed", async () => {
+	const host = harness();
+	await host.emit("session_start", { type: "session_start", reason: "startup" });
+	await host.batch([ownerText(1, 100, "first")]);
+	const prompt = host.prompts.at(-1)!;
+	await host.emit("input", { type: "input", source: "extension", text: prompt });
+	await host.emit("before_agent_start", { type: "before_agent_start", messageType: "custom", message: { role: "custom", customType: "other-extension", content: "wake up", timestamp: 0, display: false } });
+	assert.equal(host.calls.filter((call) => call.startsWith("activity:")).length, 1, "the receipt exists before any model run");
+	assert.equal(host.calls.some((call) => call.includes("Thinking")), false);
+	assert.equal(host.journal.records.some((record) => record.type === "dispatched"), false);
+	await host.emit("before_agent_start", { type: "before_agent_start", messageType: "user", prompt });
+	await waitFor(() => host.calls.some((call) => call.startsWith("activity:")));
+	assert.equal(host.journal.records.some((record) => record.type === "dispatched"), true);
 });

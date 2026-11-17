@@ -73,6 +73,7 @@ export interface GroupJournalOptions {
 export interface RecordResult {
 	outcome: "recorded" | "duplicate" | "conflict";
 	event: GroupEvent;
+	paths?: string[];
 }
 
 /** Identity used to decide whether two observations describe the same message. */
@@ -254,8 +255,8 @@ export class GroupJournal {
 			const existing = latestMessages(events, message.chatId).get(key(message.chatId, message.messageId));
 			if (!existing || (existing.source === "reply-copy" && message.source !== "reply-copy")) {
 				const event = await append({ kind: "message", message, recordedBy });
-				await this.project(message);
-				return { outcome: "recorded", event };
+				const written = await this.project(message);
+				return { outcome: "recorded", event, paths: written ? [written] : [] };
 			}
 			const recorded = events.findLast((event) => event.kind === "message" && event.message.chatId === message.chatId && event.message.messageId === message.messageId)!;
 			if (fingerprint(existing) === fingerprint(message) || message.source === "reply-copy") return { outcome: "duplicate", event: recorded };
@@ -328,13 +329,14 @@ export class GroupJournal {
 		return written;
 	}
 
-	private async project(message: GroupMessage): Promise<boolean> {
-		const path = join(this.root, groupNotePath(message));
+	private async project(message: GroupMessage): Promise<string | undefined> {
+		const relativePath = groupNotePath(message);
+		const path = join(this.root, relativePath);
 		const content = renderGroupNote(message);
 		const current = await readFile(path, "utf8").catch(() => undefined);
-		if (current === content) return false;
+		if (current === content) return undefined;
 		await atomicWrite(path, content);
-		return true;
+		return relativePath;
 	}
 
 	private withLock<T>(work: (events: GroupEvent[], append: (input: GroupEventInput) => Promise<GroupEvent>) => Promise<T>): Promise<T> {

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	initialThinkingText,
@@ -34,11 +37,20 @@ function update(updateId: number, text: string, userId = owner, chatId = private
 function createHarness(
 	journal = new MemoryJournal(),
 	identity: { agentLabel?: string; resolveAgentLabel?: () => Promise<string> } = {},
+	projectRoot = "/tmp/telegram-owner-command-test",
 ) {
 	const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
 	const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
 	const replies: Array<{ text: string; replyTo?: number }> = [];
+	const replyWaiters: Array<{ count: number; resolve: () => void }> = [];
 	const sentMessages: Array<{ content: any; options: any }> = [];
+	const activityEvents: string[] = [];
+	let activitySends = 0;
+	let failActivity = false;
+	let failEdits = 0;
+	let failDeletes = 0;
+	let holdSend: ((text: string, signal: AbortSignal) => Promise<string>) | undefined;
+	let holdEdit: ((text: string, signal: AbortSignal) => Promise<void>) | undefined;
 	let onBatch: ((updates: TelegramUpdate[]) => Promise<number | undefined>) | undefined;
 	let activePollers = 0;
 	let maxActivePollers = 0;
@@ -46,6 +58,7 @@ function createHarness(
 	let idle = true;
 	let aborts = 0;
 	let compactOptions: any;
+	let compactCalls = 0;
 	const statuses: string[] = [];
 
 	const api = {
@@ -56,6 +69,7 @@ function createHarness(
 			commands.set(name, definition.handler);
 		},
 		registerTool() {},
+		getThinkingLevel() { return ctx.thinkingLevel; },
 		sendUserMessage(content: any, options: any) {
 			sentMessages.push({ content, options });
 		},
@@ -82,7 +96,31 @@ function createHarness(
 		},
 		async sendReply(text: string, replyTo?: number) {
 			replies.push({ text, replyTo });
+			for (const waiter of replyWaiters) if (replies.length >= waiter.count) waiter.resolve();
 			return String(replies.length);
+		},
+		async sendActivity(text: string, signal: AbortSignal = new AbortController().signal) {
+			if (holdSend) return holdSend(text, signal);
+			if (failActivity) throw new Error("activity transport down");
+			activitySends += 1;
+			activityEvents.push(`send:${text}`);
+			return `activity-${activitySends}`;
+		},
+		async editActivity(_id: string, text: string, signal: AbortSignal) {
+			if (holdEdit) { const held = holdEdit; holdEdit = undefined; await held(text, signal); }
+			if (failEdits > 0) {
+				failEdits -= 1;
+				throw new Error("activity edit down");
+			}
+			activityEvents.push(`edit:${text}`);
+		},
+		async deleteActivity(id: string) {
+			if (failDeletes > 0) {
+				failDeletes -= 1;
+				activityEvents.push(`delete-failed:${id}`);
+				throw new Error("activity delete down");
+			}
+			activityEvents.push(`delete:${id}`);
 		},
 		async resolveImages(images: Array<{ mimeType: string }>, attachments: Array<{ sha256: string; mimeType: string }>) {
 			if (attachments.length > 0) return attachments.map((attachment) => ({ data: "aW1hZ2U=", mimeType: attachment.mimeType, attachment }));
@@ -120,25 +158,36 @@ function createHarness(
 			aborts += 1;
 		},
 		compact: (options: any) => {
+			compactCalls += 1;
 			compactOptions = options;
 		},
 	};
 
-	createTelegramOwnerExtension({ dependencies: dependencies as any, projectRoot: "/tmp/telegram-owner-command-test" })(api as any);
+	createTelegramOwnerExtension({ dependencies: dependencies as any, projectRoot })(api as any);
 
 	return {
 		journal,
 		commands,
 		replies,
+		whenReplies(count: number): Promise<void> {
+			return replies.length >= count ? Promise.resolve() : new Promise((resolve) => { replyWaiters.push({ count, resolve }); });
+		},
 		sentMessages,
+		activityEvents,
 		ctx,
 		statuses,
 		get aborts() { return aborts; },
 		get compactOptions() { return compactOptions; },
+		get compactCalls() { return compactCalls; },
 		get activePollers() { return activePollers; },
 		get maxActivePollers() { return maxActivePollers; },
 		get stops() { return stops; },
 		setIdle(value: boolean) { idle = value; },
+		failNextActivity() { failActivity = true; },
+		failNextEdits(count: number) { failEdits = count; },
+		failNextDeletes(count: number) { failDeletes = count; },
+		holdNextSend(wait: (text: string, signal: AbortSignal) => Promise<string>) { holdSend = wait; },
+		holdNextEdit(wait: (text: string, signal: AbortSignal) => Promise<void>) { holdEdit = wait; },
 		async emit(name: string, event: any, context = ctx) {
 			let result: any;
 			for (const handler of handlers.get(name) ?? []) result = await handler(event, context);
@@ -146,16 +195,67 @@ function createHarness(
 		},
 		async poll(updates: TelegramUpdate[]) {
 			assert.ok(onBatch, "source callback is installed");
-			return onBatch(updates);
+			const cursor = await onBatch(updates);
+			// Polling confirms admission; command execution now runs on the separate work pump.
+			await new Promise((resolve) => setImmediate(resolve));
+			return cursor;
 		},
 	};
 }
 
-test("the owner command registry is exact and parsing rejects arguments locally", () => {
-	assert.deepEqual(TELEGRAM_OWNER_COMMANDS.map(({ name }) => name), ["help", "status", "stop", "compact", "new"]);
+async function saveHarness(t: { after(fn: () => Promise<unknown>): void }, body = '{"sessionDir":"native-sessions"}') {
+	const root = await mkdtemp(join(tmpdir(), "telegram-save-command-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await mkdir(join(root, ".pi"));
+	const path = join(root, ".pi/settings.json"); await writeFile(path, body);
+	const h = createHarness(new MemoryJournal(), {}, root);
+	await h.emit("session_start", { reason: "startup" });
+	t.after(() => h.emit("session_shutdown", { reason: "test" }));
+	return { h, path, body, root };
+}
+
+test("save snapshots this project's current preferences without inference, even while the agent is busy", async t => {
+	const { h, path, root } = await saveHarness(t); h.setIdle(false); h.ctx.thinkingLevel = "off";
+	const other = join(root, "other"); await mkdir(join(other, ".pi"), { recursive: true });
+	const otherSettings = join(other, ".pi/settings.json"); await writeFile(otherSettings, '{"unchanged":true}'); h.ctx.cwd = other;
+	await h.poll([update(1, "/save")]); await h.whenReplies(1);
+	const settings = JSON.parse(await readFile(path, "utf8"));
+	assert.equal(settings.defaultProvider, "test-provider"); assert.equal(settings.defaultModel, "test-model"); assert.equal(settings.defaultThinkingLevel, "off"); assert.equal(settings.sessionDir, "native-sessions");
+	assert.equal(settings.modelThinkingLevels["test-provider/test-model"], "off");
+	assert.equal(await readFile(otherSettings, "utf8"), '{"unchanged":true}');
+	assert.match(h.replies[0].text, /Saved project defaults/); assert.ok(h.replies[0].text.includes(path));
+	assert.equal(h.sentMessages.length, 0); assert.equal(h.journal.records.some(r => r.type === "dispatch_requested"), false);
+	await h.poll([update(1, "/save")]); assert.equal(h.replies.length, 1);
+});
+
+test("save rejects other senders, other chats and command arguments without changing settings", async t => {
+	const { h, path, body } = await saveHarness(t);
+	await h.poll([update(1, "/save", owner + 1), update(2, "/save", owner, privateChat + 1), update(3, "/save extra")]); await h.whenReplies(1);
+	assert.equal(await readFile(path, "utf8"), body); assert.equal(h.sentMessages.length, 0);
+	assert.equal(h.replies.length, 1); assert.match(h.replies[0].text, /Unsupported command/);
+});
+
+test("save reports invalid project JSON without overwriting it or starting a model turn", async t => {
+	const { h, path, body } = await saveHarness(t, "{invalid");
+	await h.poll([update(1, "/save")]); await h.whenReplies(1);
+	assert.equal(await readFile(path, "utf8"), body); assert.match(h.replies[0].text, /^Save failed:/); assert.equal(h.sentMessages.length, 0);
+});
+
+test("save with no current model leaves project settings untouched", async t => {
+	const { h, path, body } = await saveHarness(t); h.ctx.model = undefined;
+	await h.poll([update(1, "/save")]); await h.whenReplies(1);
+	assert.equal(await readFile(path, "utf8"), body); assert.match(h.replies[0].text, /nothing was saved/); assert.equal(h.sentMessages.length, 0);
+});
+
+test("ordinary command parsing stays separate from advertised local selectors", () => {
+	assert.deepEqual(TELEGRAM_OWNER_COMMANDS.map(({ name }) => name), ["help", "status", "stop", "compact", "new", "save"]);
+	assert.deepEqual(parseTelegramOwnerCommand("/save"), { kind: "known", name: "save" });
+	assert.deepEqual(parseTelegramOwnerCommand("/save extra"), { kind: "unknown", token: "/save" });
 	assert.deepEqual(parseTelegramOwnerCommand(" /status "), { kind: "known", name: "status" });
 	assert.deepEqual(parseTelegramOwnerCommand("/status extra"), { kind: "unknown", token: "/status" });
 	assert.deepEqual(parseTelegramOwnerCommand("/session"), { kind: "unknown", token: "/session" });
+	assert.deepEqual(parseTelegramOwnerCommand("/model"), { kind: "unknown", token: "/model" });
+	assert.deepEqual(parseTelegramOwnerCommand("/thinking"), { kind: "unknown", token: "/thinking" });
 	assert.equal(parseTelegramOwnerCommand("ordinary text"), undefined);
 	assert.equal(telegramOwnerHelpText(), [
 		"Available commands:",
@@ -164,6 +264,9 @@ test("the owner command registry is exact and parsing rejects arguments locally"
 		"/stop - Stop the current run.",
 		"/compact - Compact the current session context.",
 		"/new - Start a fresh session.",
+		"/save - Save this project's model and thinking defaults.",
+		"/model - Choose the active model.",
+		"/thinking - Choose the thinking level.",
 	].join("\n"));
 	assert.equal(initialThinkingText(24.6), "Thinking (25%)");
 	assert.equal(initialThinkingText(null), "Thinking (context recalculating)");
@@ -226,7 +329,7 @@ test("slash captions on authorized images are handled locally and never dispatch
 test("help, status, and unknown commands bypass model dispatch and reply in update order", async () => {
 	const harness = createHarness();
 	await harness.emit("session_start", { reason: "startup" });
-	await harness.poll([update(10, "/help"), update(11, "/status"), update(12, "/model")]);
+	await harness.poll([update(10, "/help"), update(11, "/status"), update(12, "/future")]);
 
 	assert.equal(harness.sentMessages.length, 0);
 	assert.equal(harness.replies.length, 3);
@@ -277,6 +380,285 @@ test("compact is idle-only, coalesces overlap, and completes through its callbac
 		"Compaction complete.\nContext: 25% of 100k",
 	]);
 	assert.equal(harness.sentMessages.length, 1);
+});
+
+test("commands receive feedback before host work, while refused commands never claim an actionable phase", async () => {
+	const order: string[] = [];
+	const compacting = createHarness();
+	const recordCompact = compacting.ctx.compact;
+	compacting.ctx.compact = (options: any) => {
+		order.push(...compacting.activityEvents, "compact");
+		recordCompact(options);
+	};
+	await compacting.emit("session_start", { reason: "startup" });
+	await compacting.poll([update(70, "/compact")]);
+	assert.deepEqual(order, ["send:Received.", "edit:Compaction requested...", "compact"]);
+	assert.ok(compacting.compactOptions);
+	compacting.setIdle(false);
+	const beforeRefusal = compacting.activityEvents.length;
+	await compacting.poll([update(71, "/compact")]);
+	assert.deepEqual(compacting.activityEvents.slice(beforeRefusal), ["send:Received.", "delete:activity-2"]);
+	assert.equal(compacting.replies.at(-1)?.text, "The agent is busy; /compact was not started.");
+
+	const replacing = createHarness();
+	let releaseNew: ((value: { cancelled: boolean }) => void) | undefined;
+	const started = new Promise<{ cancelled: boolean }>((resolve) => { releaseNew = resolve; });
+	await replacing.emit("session_start", { reason: "startup" });
+	await replacing.poll([update(72, "/new")]);
+	assert.deepEqual(replacing.activityEvents.slice(0, 2), ["send:Received.", "edit:Starting new session..."]);
+	const jobId = String(replacing.sentMessages[0].content).split(":")[1];
+	const pending = replacing.commands.get("telegram-status")?.(`__new-session__:${jobId}`, {
+		...replacing.ctx,
+		newSession: () => {
+			assert.ok(replacing.activityEvents.includes("edit:Starting new session..."));
+			return started;
+		},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(replacing.replies.length, 0, "receipt is not the durable new-session result");
+	releaseNew?.({ cancelled: false });
+	await pending;
+});
+
+test("automatic compaction ages one displayed step and stops editing after completion", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: true });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: true });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:01:00]");
+	await harness.emit("session_compact", {});
+	const edits = harness.activityEvents.filter((event) => event.startsWith("edit:")).length;
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.filter((event) => event.startsWith("edit:")).length, edits);
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")));
+});
+
+test("command receipt age resets when Compacting is displayed and session replacement stops its clock", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(79, "/compact")]);
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compaction requested... [00:00:30]");
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting");
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+	await harness.emit("session_start", { reason: "switch" });
+	const edits = harness.activityEvents.filter((event) => event.startsWith("edit:")).length;
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.filter((event) => event.startsWith("edit:")).length, edits);
+});
+
+test("a newer Compacting phase skips queued old timer edits behind an in-flight edit", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	let release!: () => void; const held = new Promise<void>((resolve) => { release = resolve; });
+	t.after(async () => { release(); await harness.emit("session_shutdown", { reason: "test" }); });
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(81, "/compact")]);
+	harness.holdNextEdit(async () => { await held; });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	const retitling = harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	t.mock.timers.tick(90_000); await new Promise((resolve) => setImmediate(resolve));
+	release(); await retitling; await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), [
+		"edit:Compaction requested...", "edit:Compaction requested... [00:00:30]", "edit:Compacting",
+	]);
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+});
+
+test("a repeated displayed Compacting event does not wait for an elapsed-only edit", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness(); let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	t.after(async () => { release(); await harness.emit("session_shutdown", { reason: "test" }); });
+	await harness.emit("session_start", { reason: "startup" }); await harness.poll([update(810, "/compact")]);
+	await harness.emit("session_before_compact", { reason: "manual" });
+	harness.holdNextEdit(async () => { await held; }); t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	let finished = false; const duplicate = harness.emit("session_before_compact", { reason: "manual" }).then(() => { finished = true; });
+	await new Promise((resolve) => setImmediate(resolve)); assert.equal(finished, true);
+	release(); await duplicate;
+});
+
+test("finishing an automatic phase cancels its in-flight timer edit before deletion", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: true });
+	let aborted = false;
+	harness.holdNextEdit(async (_text, signal) => { await new Promise<void>((_resolve, reject) => {
+		const stop = () => { aborted = true; reject(signal.reason); };
+		if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true });
+	}); });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	await harness.emit("session_compact", {});
+	assert.equal(aborted, true);
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")));
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), []);
+});
+
+test("a completed compact command drains its timer edit before generic activity cleanup", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(82, "/compact")]);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	let aborted = false;
+	harness.holdNextEdit(async (_text, signal) => {
+		await new Promise<void>((_resolve, reject) => { signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true }); });
+	});
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	harness.compactOptions.onComplete({ tokensBefore: 100 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(aborted, true);
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")));
+	const count = harness.activityEvents.length;
+	t.mock.timers.tick(60_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.length, count);
+});
+
+test("a failed compaction retitle keeps aging the actual visible receipt", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+	const harness = createHarness();
+	t.after(() => harness.emit("session_shutdown", { reason: "test" }));
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(83, "/compact")]);
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	harness.failNextEdits(1);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compaction requested... [00:01:00]");
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting");
+	t.mock.timers.tick(30_000); await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.activityEvents.at(-1), "edit:Compacting [00:00:30]");
+});
+
+test("session_before_compact shows Compacting before agent start and edits an existing command receipt once", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(80, "/compact")]);
+	assert.deepEqual(harness.activityEvents, ["send:Received.", "edit:Compaction requested..."]);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.deepEqual(harness.activityEvents, ["send:Received.", "edit:Compaction requested...", "edit:Compacting"]);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.equal(harness.activityEvents.length, 3, "a repeated start does not send a second indicator");
+
+	const automatic = createHarness();
+	await automatic.emit("session_start", { reason: "startup" });
+	await automatic.emit("session_before_compact", { reason: "threshold", willRetry: false });
+	assert.deepEqual(automatic.activityEvents, ["send:Compacting"]);
+	await automatic.emit("session_compact", { reason: "threshold", willRetry: false });
+	assert.equal(automatic.activityEvents.at(-1), "delete:activity-1");
+});
+
+test("a failed phase delete remains recoverable through the activity journal", async () => {
+	const journal = new MemoryJournal();
+	const first = createHarness(journal);
+	await first.emit("session_start", { reason: "startup" });
+	await first.poll([update(86, "/compact")]);
+	first.failNextDeletes(5);
+	first.compactOptions.onComplete({});
+	await new Promise((resolve) => setImmediate(resolve));
+	await first.emit("session_shutdown", { reason: "test" });
+	assert.equal(journal.records.filter((record) => record.type === "activity_started").length, 1);
+	assert.equal(journal.records.some((record) => record.type === "activity_cleared"), false);
+	assert.ok(first.activityEvents.some((event) => event.startsWith("delete-failed:")));
+	const second = createHarness(journal);
+	await second.emit("session_start", { reason: "startup" });
+	assert.equal(second.activityEvents.some((event) => event.startsWith("delete:")), true);
+	assert.equal(journal.records.some((record) => record.type === "activity_cleared"), true);
+});
+
+test("shutdown aborts a held receipt send and does not start compaction afterward", async () => {
+	const harness = createHarness();
+	let release: ((id: string) => void) | undefined;
+	let signal: AbortSignal | undefined;
+	const held = new Promise<string>((resolve) => { release = resolve; });
+	harness.holdNextSend((_text, next) => {
+		signal = next;
+		next.addEventListener("abort", () => release?.("aborted"), { once: true });
+		return held;
+	});
+	await harness.emit("session_start", { reason: "startup" });
+	const pending = harness.poll([update(87, "/compact")]);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(signal);
+	const stopping = harness.emit("session_shutdown", { reason: "test" });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(signal!.aborted, true);
+	release?.("late");
+	await pending;
+	await stopping;
+	assert.equal(harness.compactOptions, undefined);
+});
+
+test("a reused extension accepts compact and automatic compaction after shutdown", async () => {
+	const journal = new MemoryJournal();
+	const harness = createHarness(journal);
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(88, "/compact")]);
+	harness.compactOptions.onComplete({});
+	const callsBeforeReuse = harness.compactCalls;
+	await harness.emit("session_shutdown", { reason: "new" });
+	await harness.emit("session_start", { reason: "new" });
+	await harness.poll([update(89, "/compact")]);
+	assert.equal(harness.compactCalls, callsBeforeReuse + 1);
+	assert.equal(harness.activityEvents.filter((event) => event === "send:Received.").length, 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "edit:Compaction requested...").length, 2);
+	harness.compactOptions.onComplete({});
+	await harness.emit("session_before_compact", { reason: "threshold", willRetry: false });
+	assert.ok(harness.activityEvents.some((event) => event === "send:Compacting" || event === "edit:Compacting"));
+	await harness.emit("session_compact", { reason: "threshold", willRetry: false });
+});
+
+test("a preceding generation's receipt does not block the next session", async () => {
+	const journal = new MemoryJournal();
+	const harness = createHarness(journal);
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(90, "/compact")]);
+	assert.equal(journal.records.filter((record) => record.type === "activity_started").length, 1);
+	await harness.emit("session_shutdown", { reason: "reload" });
+	await harness.emit("session_start", { reason: "reload" });
+	assert.ok(harness.activityEvents.some((event) => event.startsWith("delete:")), "preceding receipt is cleaned from the journal");
+	await harness.poll([update(91, "/compact")]);
+	assert.equal(harness.compactCalls, 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "send:Received.").length, 2);
+	assert.equal(harness.activityEvents.filter((event) => event === "edit:Compaction requested...").length, 2);
+});
+
+test("a failed compaction retitle is retried while the receipt is still the visible text", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(85, "/compact")]);
+	harness.failNextEdits(1);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), ["edit:Compaction requested..."]);
+	await harness.emit("session_before_compact", { reason: "manual", willRetry: false });
+	assert.deepEqual(harness.activityEvents.filter((event) => event.startsWith("edit:")), ["edit:Compaction requested...", "edit:Compacting"]);
+});
+
+test("a failed activity send does not suppress compaction or its durable result", async () => {
+	const harness = createHarness();
+	harness.failNextActivity();
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.poll([update(90, "/compact")]);
+	assert.equal(harness.activityEvents.length, 0);
+	assert.ok(harness.compactOptions);
+	harness.compactOptions.onError(new Error("provider unavailable"));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(harness.replies.at(-1)?.text ?? "", /Compaction failed/);
 });
 
 test("compact rejects an active run and reports provider failure without replay", async () => {
